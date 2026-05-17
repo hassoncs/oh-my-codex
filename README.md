@@ -58,14 +58,18 @@ It keeps Codex as the execution engine and makes it easier to:
 
 If you want the default OMX experience, start here:
 
+Choose one install path. If Codex CLI is already installed (Homebrew, npm, or another supported method):
+
 ```bash
-# If Codex CLI is already installed (Homebrew, npm, or another supported method):
 codex --version
 npm install -g oh-my-codex
 omx setup
 omx --madmax --high
+```
 
-# If you do not have Codex CLI yet and want npm to manage it:
+If you do not have Codex CLI yet and want npm to manage it:
+
+```bash
 npm install -g @openai/codex
 npm install -g oh-my-codex
 omx setup

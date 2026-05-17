@@ -26,14 +26,18 @@ Codex vẫn là engine chính, OMX giúp bạn:
 
 Nếu bạn muốn trải nghiệm OMX nhanh nhất, bắt đầu từ đây:
 
+Choose one install path. If Codex CLI is already installed (for example with Homebrew):
+
 ```bash
-# If Codex CLI is already installed (for example with Homebrew):
 codex --version
 npm install -g oh-my-codex
 omx setup
 omx --madmax --high
+```
 
-# If Codex CLI is not installed and you want npm to manage it:
+If Codex CLI is not installed and you want npm to manage it:
+
+```bash
 npm install -g @openai/codex
 npm install -g oh-my-codex
 omx setup
