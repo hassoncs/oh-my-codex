@@ -6,15 +6,76 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
-function runDispatcher(metadataPath: string): void {
+function runDispatcher(metadataPath: string, payload: Record<string, unknown> = { type: "test" }): void {
 	const dispatcherScript = join(process.cwd(), "dist", "scripts", "notify-dispatcher.js");
 	const result = spawnSync(
 		process.execPath,
-		[dispatcherScript, "--metadata", metadataPath, JSON.stringify({ type: "test" })],
+		[dispatcherScript, "--metadata", metadataPath, JSON.stringify(payload)],
 		{ encoding: "utf-8", windowsHide: true },
 	);
 	assert.equal(result.status, 0, result.stderr || result.stdout);
 }
+
+describe("notify dispatcher turn-ended storm guard", () => {
+	it("coalesces rapid turn-ended dispatcher callbacks to one OMX notify run", () => {
+		const wd = mkdtempSync(join(tmpdir(), "omx-notify-dispatcher-rapid-"));
+		try {
+			const omxMarker = join(wd, "omx-ran");
+			const omxHook = join(wd, "current-notify-hook.js");
+			writeFileSync(omxHook, `import { appendFileSync } from "node:fs"; appendFileSync(${JSON.stringify(omxMarker)}, "omx|");\n`);
+			const metadataPath = join(wd, "notify-dispatch.json");
+			writeFileSync(metadataPath, JSON.stringify({ managedBy: "oh-my-codex", version: 1, omxNotify: [process.execPath, omxHook] }));
+
+			for (let index = 0; index < 10; index += 1) {
+				runDispatcher(metadataPath, { type: "agent-turn-complete", thread_id: "desktop-thread", turn_id: `queued-${index}` });
+			}
+
+			assert.equal(readFileSync(omxMarker, "utf-8"), "omx|");
+		} finally {
+			rmSync(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("drops stale turn-ended dispatcher callbacks before spawning notify hooks", () => {
+		const wd = mkdtempSync(join(tmpdir(), "omx-notify-dispatcher-stale-event-"));
+		try {
+			const omxMarker = join(wd, "omx-ran");
+			const omxHook = join(wd, "current-notify-hook.js");
+			writeFileSync(omxHook, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(omxMarker)}, "ran");\n`);
+			const metadataPath = join(wd, "notify-dispatch.json");
+			writeFileSync(metadataPath, JSON.stringify({ managedBy: "oh-my-codex", version: 1, omxNotify: [process.execPath, omxHook] }));
+
+			runDispatcher(metadataPath, {
+				type: "agent-turn-complete",
+				timestamp: new Date(Date.now() - 10 * 60_000).toISOString(),
+				thread_id: "desktop-thread",
+				turn_id: "stale-turn",
+			});
+
+			assert.equal(existsSync(omxMarker), false);
+		} finally {
+			rmSync(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves normal non-turn notify dispatches", () => {
+		const wd = mkdtempSync(join(tmpdir(), "omx-notify-dispatcher-normal-"));
+		try {
+			const omxMarker = join(wd, "omx-ran");
+			const omxHook = join(wd, "current-notify-hook.js");
+			writeFileSync(omxHook, `import { appendFileSync } from "node:fs"; appendFileSync(${JSON.stringify(omxMarker)}, "omx|");\n`);
+			const metadataPath = join(wd, "notify-dispatch.json");
+			writeFileSync(metadataPath, JSON.stringify({ managedBy: "oh-my-codex", version: 1, omxNotify: [process.execPath, omxHook] }));
+
+			runDispatcher(metadataPath, { type: "test", id: 1 });
+			runDispatcher(metadataPath, { type: "test", id: 2 });
+
+			assert.equal(readFileSync(omxMarker, "utf-8"), "omx|omx|");
+		} finally {
+			rmSync(wd, { recursive: true, force: true });
+		}
+	});
+});
 
 describe("notify dispatcher previousNotify guard", () => {
 	it("skips stale OMX-managed previousNotify dispatcher entries", () => {
