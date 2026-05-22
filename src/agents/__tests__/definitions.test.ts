@@ -49,6 +49,12 @@ describe('agents/definitions', () => {
     }
   });
 
+  it('does not define Prometheus Strict prompt-backed native agents', () => {
+    assert.equal(AGENT_DEFINITIONS['prometheus-strict-metis'], undefined);
+    assert.equal(AGENT_DEFINITIONS['prometheus-strict-momus'], undefined);
+    assert.equal(AGENT_DEFINITIONS['prometheus-strict-oracle'], undefined);
+  });
+
   it('keeps the installable agent model split aligned with the OMX subagent matrix', () => {
     assert.equal(AGENT_DEFINITIONS.architect.modelClass, 'frontier');
     assert.equal(AGENT_DEFINITIONS['security-reviewer'].modelClass, 'frontier');

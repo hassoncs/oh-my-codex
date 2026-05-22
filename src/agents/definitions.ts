@@ -311,6 +311,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
   },
 
   // Coordination
+
   'critic': {
     name: 'critic',
     description: 'Plan/design critical challenge and review',

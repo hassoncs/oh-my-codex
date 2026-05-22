@@ -14,11 +14,11 @@ describe('HUD resize hook helpers', () => {
     assert.equal(buildHudResizeHookName('$7', '@3'), 'omx_hud_resize_7_3');
   });
 
-  it('builds a bounded numeric window-resized slot', () => {
+  it('builds a bounded numeric client-resized slot', () => {
     const slot = buildHudResizeHookSlot('omx_hud_resize_7_3');
-    assert.match(slot, /^window-resized\[\d+\]$/);
+    assert.match(slot, /^client-resized\[\d+\]$/);
 
-    const index = Number.parseInt(slot.replace(/^window-resized\[|\]$/g, ''), 10);
+    const index = Number.parseInt(slot.replace(/^client-resized\[|\]$/g, ''), 10);
     assert.ok(index >= 0);
     assert.ok(index < 2147483647);
   });
@@ -34,7 +34,7 @@ describe('HUD resize hook helpers', () => {
     });
   });
 
-  it('registers a window-resized hook at window scope with exact HUD pane targeting', () => {
+  it('registers a client-resized hook at session scope with exact HUD pane targeting', () => {
     const calls: string[][] = [];
 
     const result = registerHudResizeHook('%9', '%1', 3, (args) => {
@@ -47,17 +47,15 @@ describe('HUD resize hook helpers', () => {
     assert.equal(result, true);
     assert.deepEqual(calls[0], ['display-message', '-p', '-t', '%1', '#{session_id}\t#{window_id}']);
     assert.equal(calls[1]?.[0], 'set-hook');
-    assert.equal(calls[1]?.[1], '-w');
-    assert.equal(calls[1]?.[2], '-t');
-    assert.equal(calls[1]?.[3], '@3');
-    assert.equal(calls[1]?.[4], hookSlot);
-    assert.notEqual(calls[1]?.[4], 'client-resized[99]');
-    assert.match(calls[1]?.[5] ?? '', /^run-shell -b /);
-    assert.match(calls[1]?.[5] ?? '', /resize-pane/);
-    assert.match(calls[1]?.[5] ?? '', /set-hook/);
-    assert.match(calls[1]?.[5] ?? '', /'-w'/);
-    assert.match(calls[1]?.[5] ?? '', new RegExp(`sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}`));
-    assert.match(calls[1]?.[5] ?? '', new RegExp(hookSlot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.equal(calls[1]?.[1], '-t');
+    assert.equal(calls[1]?.[2], '$7');
+    assert.equal(calls[1]?.[3], hookSlot);
+    assert.match(calls[1]?.[4] ?? '', /^run-shell -b /);
+    assert.match(calls[1]?.[4] ?? '', /resize-pane/);
+    assert.match(calls[1]?.[4] ?? '', /set-hook/);
+    assert.doesNotMatch(calls[1]?.[4] ?? '', /'-w'/);
+    assert.match(calls[1]?.[4] ?? '', new RegExp(`sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}`));
+    assert.match(calls[1]?.[4] ?? '', new RegExp(hookSlot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   });
 
   it('unregisters the same per-window hook slot', () => {
@@ -74,9 +72,8 @@ describe('HUD resize hook helpers', () => {
     assert.deepEqual(calls[1], [
       'set-hook',
       '-u',
-      '-w',
       '-t',
-      '@3',
+      '$7',
       buildHudResizeHookSlot('omx_hud_resize_7_3'),
     ]);
   });
@@ -93,10 +90,10 @@ describe('HUD resize hook helpers', () => {
     assert.equal(registerHudResizeHook('%9', '%1', 3, execFor('@3')), true);
     assert.equal(registerHudResizeHook('%10', '%2', 3, execFor('@4')), true);
 
-    const firstSlot = registered[0]?.[4];
-    const secondSlot = registered[1]?.[4];
-    assert.match(firstSlot ?? '', /^window-resized\[\d+\]$/);
-    assert.match(secondSlot ?? '', /^window-resized\[\d+\]$/);
+    const firstSlot = registered[0]?.[3];
+    const secondSlot = registered[1]?.[3];
+    assert.match(firstSlot ?? '', /^client-resized\[\d+\]$/);
+    assert.match(secondSlot ?? '', /^client-resized\[\d+\]$/);
     assert.notEqual(firstSlot, secondSlot);
   });
 
@@ -111,6 +108,6 @@ describe('HUD resize hook helpers', () => {
     assert.equal(registerHudResizeHook('%9', '%1', 3, execTmuxSync), true);
     assert.equal(registerHudResizeHook('%10', '%1', 3, execTmuxSync), true);
 
-    assert.equal(registered[0]?.[4], registered[1]?.[4]);
+    assert.equal(registered[0]?.[3], registered[1]?.[3]);
   });
 });

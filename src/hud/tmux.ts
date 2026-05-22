@@ -82,7 +82,7 @@ export function buildHudResizeHookSlot(hookName: string): string {
   for (let i = 0; i < hookName.length; i++) {
     hash = (hash * 31 + hookName.charCodeAt(i)) | 0;
   }
-  return `window-resized[${Math.abs(hash) % TMUX_HOOK_INDEX_MAX}]`;
+  return `client-resized[${Math.abs(hash) % TMUX_HOOK_INDEX_MAX}]`;
 }
 
 export interface HudResizeHookContext {
@@ -138,17 +138,34 @@ function buildHudResizeHookCommand(
   context: HudResizeHookContext,
 ): string {
   const resize = buildNestedTmuxCommand(tmuxBin, ['resize-pane', '-t', hudPaneId, '-y', height]);
-  const unregister = buildNestedTmuxCommand(tmuxBin, ['set-hook', '-u', '-w', '-t', context.windowId, context.hookSlot]);
+  const unregister = buildNestedTmuxCommand(tmuxBin, ['set-hook', '-u', '-t', context.sessionId, context.hookSlot]);
   const resizeOrUnregister = `${resize} >/dev/null 2>&1 || ${unregister} >/dev/null 2>&1 || true`;
   return `${resizeOrUnregister}; sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; ${resizeOrUnregister}`;
 }
 
-export function buildHudWatchCommand(omxBin: string, preset?: string, sessionId?: string): string {
+function buildEnvPrefix(env: Record<string, string | undefined>): string {
+  const assignments = Object.entries(env)
+    .map(([key, value]) => [key, typeof value === 'string' ? value : ''] as const)
+    .filter(([, value]) => value.trim() !== '')
+    .map(([key, value]) => `${key}=${shellEscapeSingle(value)}`);
+  return assignments.length > 0 ? `env ${assignments.join(' ')} ` : '';
+}
+
+export function buildHudWatchCommand(
+  omxBin: string,
+  preset?: string,
+  sessionId?: string,
+  omxRoot?: string,
+): string {
   const safePreset = preset === 'minimal' || preset === 'focused' || preset === 'full'
     ? ` --preset=${preset}`
     : '';
   const safeSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
-  const envPrefix = safeSessionId ? `env OMX_SESSION_ID=${shellEscapeSingle(safeSessionId)} ` : '';
+  const safeOmxRoot = typeof omxRoot === 'string' ? omxRoot : '';
+  const envPrefix = buildEnvPrefix({
+    OMX_SESSION_ID: safeSessionId,
+    OMX_ROOT: safeOmxRoot,
+  });
   return `exec ${envPrefix}${shellEscapeSingle(process.execPath)} ${shellEscapeSingle(omxBin)} hud --watch${safePreset}`;
 }
 
@@ -278,7 +295,7 @@ export function registerHudResizeHook(
   const height = String(Math.max(1, Math.floor(heightLines)));
   const resizeCmd = shellEscapeSingle(buildHudResizeHookCommand(tmuxBin, hudPaneId, height, context));
   try {
-    execTmuxSync(['set-hook', '-w', '-t', context.windowId, context.hookSlot, `run-shell -b ${resizeCmd}`]);
+    execTmuxSync(['set-hook', '-t', context.sessionId, context.hookSlot, `run-shell -b ${resizeCmd}`]);
     return true;
   } catch {
     return false;
@@ -292,7 +309,7 @@ export function unregisterHudResizeHook(
   const context = readHudResizeHookContext(currentPaneId, execTmuxSync);
   if (!context) return false;
   try {
-    execTmuxSync(['set-hook', '-u', '-w', '-t', context.windowId, context.hookSlot]);
+    execTmuxSync(['set-hook', '-u', '-t', context.sessionId, context.hookSlot]);
     return true;
   } catch {
     return false;

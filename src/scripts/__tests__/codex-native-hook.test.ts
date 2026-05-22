@@ -29,6 +29,7 @@ import { readAllState } from "../../hud/state.js";
 import { getLegacyWikiDir, serializePage, writePage } from "../../wiki/storage.js";
 import { WIKI_SCHEMA_VERSION } from "../../wiki/types.js";
 import { createUltragoalPlan, readUltragoalPlan } from "../../ultragoal/artifacts.js";
+import { getBaseStateDir } from "../../state/paths.js";
 
 function nativeHookScriptPath(): string {
   return join(process.cwd(), "dist", "scripts", "codex-native-hook.js");
@@ -2228,6 +2229,36 @@ describe("codex native hook dispatch", () => {
       assert.match(message, /\$oh-my-codex:ralplan" -> ralplan/);
       assert.match(message, /use CLI-first state updates via `omx state write\/read\/clear --input '<json>' --json`/);
       assert.equal(existsSync(join(cwd, ".omx", "state", "sessions", "sess-plugin-1", "ralplan-state.json")), true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("injects autopilot ralplan consensus gate guidance on prompt activation", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-autopilot-ralplan-gate-"));
+    try {
+      await mkdir(join(cwd, ".omx", "state"), { recursive: true });
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          session_id: "sess-autopilot-ralplan-gate",
+          thread_id: "thread-autopilot-ralplan-gate",
+          turn_id: "turn-autopilot-ralplan-gate",
+          prompt: "$autopilot implement issue #2430",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "keyword-detector");
+      assert.equal(result.skillState?.skill, "autopilot");
+      const message = String(
+        (result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext || "",
+      );
+      assert.match(message, /Autopilot protocol:/);
+      assert.match(message, /deep-interview -> ralplan -> ultragoal -> code-review -> ultraqa/);
+      assert.match(message, /Planner output has been reviewed sequentially by Architect and then Critic/);
+      assert.match(message, /do not hand off to Ultragoal or implementation until .*ralplan_architect_review.*ralplan_critic_review/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6834,6 +6865,7 @@ exit 0
         active: true,
         current_phase: "team-exec",
         team_name: "review-team",
+        session_id: "sess-stop-team",
       });
       await writeJson(join(stateDir, "team", "review-team", "phase.json"), {
         current_phase: "team-verify",
@@ -7721,6 +7753,90 @@ exit 0
     }
   });
 
+  it("does not block Stop from canonical team state owned by another thread", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-team-canonical-other-thread-"));
+    try {
+      await initTeamState(
+        "canonical-other-thread-team",
+        "canonical other-thread stop fallback",
+        "executor",
+        1,
+        cwd,
+        undefined,
+        { ...process.env, OMX_SESSION_ID: "sess-stop-team-canonical-thread" },
+      );
+      const manifestPath = join(cwd, ".omx", "state", "team", "canonical-other-thread-team", "manifest.v2.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf-8")) as Record<string, unknown>;
+      await writeJson(manifestPath, {
+        ...manifest,
+        leader: {
+          ...(manifest.leader as Record<string, unknown> | undefined),
+          thread_id: "thread-other",
+        },
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "sess-stop-team-canonical-thread",
+          thread_id: "thread-current",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks Stop from canonical team state owned by the current thread", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-team-canonical-current-thread-"));
+    try {
+      await initTeamState(
+        "canonical-current-thread-team",
+        "canonical current-thread stop fallback",
+        "executor",
+        1,
+        cwd,
+        undefined,
+        { ...process.env, OMX_SESSION_ID: "sess-stop-team-canonical-current-thread" },
+      );
+      const manifestPath = join(cwd, ".omx", "state", "team", "canonical-current-thread-team", "manifest.v2.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf-8")) as Record<string, unknown>;
+      await writeJson(manifestPath, {
+        ...manifest,
+        leader: {
+          ...(manifest.leader as Record<string, unknown> | undefined),
+          thread_id: "thread-current",
+        },
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "sess-stop-team-canonical-current-thread",
+          thread_id: "thread-current",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason:
+          `OMX team pipeline is still active (canonical-current-thread-team) at phase team-exec; continue coordinating until the team reaches a terminal phase.${TEAM_STOP_COMMIT_GUIDANCE}`,
+        stopReason: "team_team-exec",
+        systemMessage: "OMX team pipeline is still active at phase team-exec.",
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("emits one concise final decision summary and auto-finalize guidance when release-readiness already has a stable final recommendation and no active worker tasks", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-release-readiness-finalize-"));
     try {
@@ -7995,7 +8111,7 @@ exit 0
     const sharedRoot = join(cwd, "shared-root");
     const priorTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     try {
-      process.env.OMX_TEAM_STATE_ROOT = "shared-root";
+      process.env.OMX_TEAM_STATE_ROOT = sharedRoot;
       await initTeamState(
         "canonical-root-team",
         "canonical stop root fallback",
@@ -8003,7 +8119,7 @@ exit 0
         1,
         cwd,
         undefined,
-        { ...process.env, OMX_SESSION_ID: "sess-stop-team-root", OMX_TEAM_STATE_ROOT: "shared-root" },
+        { ...process.env, OMX_SESSION_ID: "sess-stop-team-root", OMX_TEAM_STATE_ROOT: sharedRoot },
       );
 
       const result = await dispatchCodexNativeHook(
@@ -8068,9 +8184,10 @@ exit 0
 
   it("returns Stop continuation output from canonical team state rooted via OMX_TEAM_STATE_ROOT", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-team-env-root-"));
+    const teamStateRoot = join(cwd, "shared-team-state");
     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     try {
-      process.env.OMX_TEAM_STATE_ROOT = "shared-team-state";
+      process.env.OMX_TEAM_STATE_ROOT = teamStateRoot;
       await initTeamState(
         "env-root-team",
         "env root stop fallback",
@@ -8081,7 +8198,7 @@ exit 0
         {
           ...process.env,
           OMX_SESSION_ID: "sess-stop-team-env-root",
-          OMX_TEAM_STATE_ROOT: "shared-team-state",
+          OMX_TEAM_STATE_ROOT: teamStateRoot,
         },
       );
 
@@ -11305,6 +11422,8 @@ exit 0
         active: true,
         current_phase: "team-exec",
         team_name: "review-team",
+        session_id: "sess-stop-team-refire",
+        thread_id: "thread-stop-team-refire",
       });
       await writeJson(join(stateDir, "team", "review-team", "phase.json"), {
         current_phase: "team-verify",
@@ -11544,6 +11663,250 @@ exit 0
     }
   });
 
+  it("does not block Stop from root team state without team_name when no session is known", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-root-team-no-session-no-name-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      await mkdir(stateDir, { recursive: true });
+      await writeJson(join(stateDir, "team-state.json"), {
+        active: true,
+        mode: "team",
+        current_phase: "starting",
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not block Stop from root team state without team_name for a foreign session", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-root-team-foreign-no-name-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      await mkdir(join(stateDir, "sessions", "sess-current"), { recursive: true });
+      await writeJson(join(stateDir, "session.json"), { session_id: "sess-current" });
+      await writeJson(join(stateDir, "team-state.json"), {
+        active: true,
+        mode: "team",
+        current_phase: "starting",
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "sess-current",
+          thread_id: "thread-current",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not block Stop from another thread's stale root team state when no scoped team state exists", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-stale-root-team-thread-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      await mkdir(join(stateDir, "sessions", "sess-current"), { recursive: true });
+      await writeJson(join(stateDir, "session.json"), { session_id: "sess-current" });
+      await writeJson(join(stateDir, "team-state.json"), {
+        active: true,
+        current_phase: "starting",
+        team_name: "stale-root-thread-team",
+        session_id: "sess-current",
+        thread_id: "thread-other",
+      });
+      await writeJson(join(stateDir, "team", "stale-root-thread-team", "phase.json"), {
+        current_phase: "team-exec",
+        max_fix_attempts: 3,
+        current_fix_attempt: 0,
+        transitions: [],
+        updated_at: new Date().toISOString(),
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "sess-current",
+          thread_id: "thread-current",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not block Stop from root team state with matching session but missing thread ownership", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-root-team-missing-thread-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      await mkdir(join(stateDir, "sessions", "sess-current"), { recursive: true });
+      await writeJson(join(stateDir, "session.json"), { session_id: "sess-current" });
+      await writeJson(join(stateDir, "team-state.json"), {
+        active: true,
+        current_phase: "starting",
+        team_name: "root-missing-thread-team",
+        session_id: "sess-current",
+      });
+      await writeJson(join(stateDir, "team", "root-missing-thread-team", "phase.json"), {
+        current_phase: "team-exec",
+        max_fix_attempts: 3,
+        current_fix_attempt: 0,
+        transitions: [],
+        updated_at: new Date().toISOString(),
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "sess-current",
+          thread_id: "thread-current",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not block Stop from root team state when canonical phase is missing", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-root-team-missing-phase-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      await mkdir(join(stateDir, "sessions", "sess-current"), { recursive: true });
+      await mkdir(join(stateDir, "team", "root-missing-phase-team"), { recursive: true });
+      await writeJson(join(stateDir, "session.json"), { session_id: "sess-current" });
+      await writeJson(join(stateDir, "team-state.json"), {
+        active: true,
+        current_phase: "starting",
+        team_name: "root-missing-phase-team",
+        session_id: "sess-current",
+        thread_id: "thread-current",
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "sess-current",
+          thread_id: "thread-current",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not block Stop from session-scoped team state owned by another thread", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-scoped-team-other-thread-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      await mkdir(join(stateDir, "sessions", "sess-current"), { recursive: true });
+      await writeJson(join(stateDir, "session.json"), { session_id: "sess-current" });
+      await writeJson(join(stateDir, "sessions", "sess-current", "team-state.json"), {
+        active: true,
+        current_phase: "starting",
+        team_name: "scoped-other-thread-team",
+        session_id: "sess-current",
+        thread_id: "thread-other",
+      });
+      await writeJson(join(stateDir, "team", "scoped-other-thread-team", "phase.json"), {
+        current_phase: "team-exec",
+        max_fix_attempts: 3,
+        current_fix_attempt: 0,
+        transitions: [],
+        updated_at: new Date().toISOString(),
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "sess-current",
+          thread_id: "thread-current",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks Stop from session-scoped team state owned by the current session and thread", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-scoped-team-current-thread-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      await mkdir(join(stateDir, "sessions", "sess-current"), { recursive: true });
+      await writeJson(join(stateDir, "session.json"), { session_id: "sess-current" });
+      await writeJson(join(stateDir, "sessions", "sess-current", "team-state.json"), {
+        active: true,
+        current_phase: "starting",
+        team_name: "scoped-current-team",
+        session_id: "sess-current",
+        thread_id: "thread-current",
+      });
+      await writeJson(join(stateDir, "team", "scoped-current-team", "phase.json"), {
+        current_phase: "team-exec",
+        max_fix_attempts: 3,
+        current_fix_attempt: 0,
+        transitions: [],
+        updated_at: new Date().toISOString(),
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "sess-current",
+          thread_id: "thread-current",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason:
+          `OMX team pipeline is still active (scoped-current-team) at phase team-exec; continue coordinating until the team reaches a terminal phase.${TEAM_STOP_COMMIT_GUIDANCE}`,
+        stopReason: "team_team-exec",
+        systemMessage: "OMX team pipeline is still active at phase team-exec.",
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("does not block Stop from another session's stale root team state when no scoped team state exists", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-stale-root-team-"));
     try {
@@ -11754,6 +12117,91 @@ describe("codex native hook triage integration", () => {
       assert.equal(existsSync(stateFile), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+
+  it("does not activate workflow state for native subagent prompts even when canonical id is the child session", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-subagent-keyword-"));
+    const boxedRoot = await mkdtemp(join(tmpdir(), "omx-native-subagent-keyword-boxed-"));
+    const originalOmxRoot = process.env.OMX_ROOT;
+    const originalOmxStateRoot = process.env.OMX_STATE_ROOT;
+    const originalTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
+    try {
+      process.env.OMX_ROOT = boxedRoot;
+      delete process.env.OMX_STATE_ROOT;
+      delete process.env.OMX_TEAM_STATE_ROOT;
+      const boxedStateDir = getBaseStateDir(cwd);
+      await mkdir(boxedStateDir, { recursive: true });
+      await writeJson(join(boxedStateDir, "subagent-tracking.json"), {
+        schemaVersion: 1,
+        sessions: {
+          "omx-parent-session": {
+            session_id: "omx-parent-session",
+            leader_thread_id: "parent-native-thread",
+            updated_at: "2026-05-21T19:04:40.000Z",
+            threads: {
+              "parent-native-thread": {
+                thread_id: "parent-native-thread",
+                kind: "leader",
+                first_seen_at: "2026-05-21T19:04:40.000Z",
+                last_seen_at: "2026-05-21T19:04:40.000Z",
+                turn_count: 1,
+              },
+              "child-native-session": {
+                thread_id: "child-native-session",
+                kind: "subagent",
+                first_seen_at: "2026-05-21T19:04:41.000Z",
+                last_seen_at: "2026-05-21T19:04:41.000Z",
+                turn_count: 1,
+                mode: "review",
+              },
+            },
+          },
+        },
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          session_id: "child-native-session",
+          thread_id: "child-native-session",
+          turn_id: "turn-subagent-review",
+          prompt: [
+            "Read-only review only. Do not edit files. Do not inspect/mutate OMX state/hooks.",
+            "Context: The user asked for $autopilot, and this subagent must only review the patch.",
+          ].join("\n\n"),
+        },
+        { cwd },
+      );
+
+      const additionalContext = String(
+        (result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "",
+      );
+      assert.equal(additionalContext, "");
+      assert.equal(
+        existsSync(join(boxedStateDir, "sessions", "child-native-session", "skill-active-state.json")),
+        false,
+      );
+      assert.equal(
+        existsSync(join(boxedStateDir, "sessions", "child-native-session", "autopilot-state.json")),
+        false,
+      );
+      assert.equal(
+        existsSync(join(cwd, ".omx", "state", "subagent-tracking.json")),
+        false,
+        "subagent tracking must not leak into the source worktree when OMX_ROOT is boxed",
+      );
+    } finally {
+      if (originalOmxRoot === undefined) delete process.env.OMX_ROOT;
+      else process.env.OMX_ROOT = originalOmxRoot;
+      if (originalOmxStateRoot === undefined) delete process.env.OMX_STATE_ROOT;
+      else process.env.OMX_STATE_ROOT = originalOmxStateRoot;
+      if (originalTeamStateRoot === undefined) delete process.env.OMX_TEAM_STATE_ROOT;
+      else process.env.OMX_TEAM_STATE_ROOT = originalTeamStateRoot;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(boxedRoot, { recursive: true, force: true });
     }
   });
 
