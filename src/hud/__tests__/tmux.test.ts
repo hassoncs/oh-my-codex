@@ -3,6 +3,12 @@ import assert from 'node:assert/strict';
 import {
   buildHudResizeHookName,
   buildHudResizeHookSlot,
+  buildHudWatchCommand,
+  findHudWatchPaneIds,
+  hudPaneMatchesOwner,
+  OMX_TMUX_HUD_LEADER_PANE_ENV,
+  parseTmuxPaneSnapshot,
+  readHudPaneOwner,
   parseHudResizeHookContext,
   registerHudResizeHook,
   unregisterHudResizeHook,
@@ -109,5 +115,76 @@ describe('HUD resize hook helpers', () => {
     assert.equal(registerHudResizeHook('%10', '%1', 3, execTmuxSync), true);
 
     assert.equal(registered[0]?.[3], registered[1]?.[3]);
+  });
+});
+
+describe('HUD pane ownership helpers', () => {
+  it('reads session and leader ownership from env-prefixed HUD commands', () => {
+    const [pane] = parseTmuxPaneSnapshot(
+      `%9\tnode\texec env OMX_SESSION_ID='sess-a' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' /node /omx.js hud --watch`,
+    );
+
+    assert.deepEqual(readHudPaneOwner(pane!), {
+      sessionId: 'sess-a',
+      leaderPaneId: '%1',
+    });
+    assert.equal(hudPaneMatchesOwner(pane!, { sessionId: 'sess-a', leaderPaneId: '%1' }), true);
+    assert.equal(hudPaneMatchesOwner(pane!, { sessionId: 'sess-b', leaderPaneId: '%2' }), false);
+  });
+
+  it('reads ownership from quoted tmux shell env arguments used by inside-tmux launch', () => {
+    const [pane] = parseTmuxPaneSnapshot(
+      `%9\tnode\t/bin/zsh -c 'exec '\\''env'\\'' '\\''OMX_SESSION_ID=sess-a'\\'' '\\''${OMX_TMUX_HUD_LEADER_PANE_ENV}=%1'\\'' '\\''node'\\'' '\\''/omx.js'\\'' '\\''hud'\\'' '\\''--watch'\\'''`,
+    );
+
+    assert.deepEqual(readHudPaneOwner(pane!), {
+      sessionId: 'sess-a',
+      leaderPaneId: '%1',
+    });
+  });
+
+  it('keeps independent leaders in one tmux window from matching each other HUD panes', () => {
+    const panes = parseTmuxPaneSnapshot(
+      [
+        '%1\tcodex\tcodex',
+        `%2\tnode\texec env OMX_SESSION_ID='sess-a' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' /node /omx.js hud --watch`,
+        '%3\tcodex\tcodex',
+        `%4\tnode\texec env OMX_SESSION_ID='sess-b' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%3' /node /omx.js hud --watch`,
+      ].join('\n'),
+    );
+
+    assert.deepEqual(findHudWatchPaneIds(panes, '%3', { sessionId: 'sess-b', leaderPaneId: '%3' }), ['%4']);
+    assert.deepEqual(findHudWatchPaneIds(panes, '%3', { sessionId: 'sess-a', leaderPaneId: '%1' }), ['%2']);
+  });
+
+  it('does not owner-match untagged HUD panes when an owner scope is requested', () => {
+    const panes = parseTmuxPaneSnapshot(
+      [
+        '%1\tcodex\tcodex',
+        '%2\tnode\tnode /tmp/bin/omx.js hud --watch',
+      ].join('\n'),
+    );
+
+    assert.deepEqual(findHudWatchPaneIds(panes, '%1', { sessionId: 'sess-a', leaderPaneId: '%1' }), []);
+    assert.deepEqual(findHudWatchPaneIds(panes, '%1'), ['%2']);
+  });
+
+  it('matches session-owned legacy HUD panes without leader tags for same-session cleanup', () => {
+    const panes = parseTmuxPaneSnapshot(
+      [
+        '%1\tcodex\tcodex',
+        "%2\tnode\texec env OMX_SESSION_ID='sess-a' /node /omx.js hud --watch",
+        "%3\tnode\texec env OMX_SESSION_ID='sess-b' /node /omx.js hud --watch",
+      ].join('\n'),
+    );
+
+    assert.deepEqual(findHudWatchPaneIds(panes, '%1', { sessionId: 'sess-a', leaderPaneId: '%1' }), ['%2']);
+  });
+
+  it('tags reconciled HUD watch commands with the leader pane owner', () => {
+    const cmd = buildHudWatchCommand('/usr/bin/omx.js', undefined, 'sess-a', undefined, '%1');
+
+    assert.match(cmd, /OMX_SESSION_ID='sess-a'/);
+    assert.match(cmd, new RegExp(`${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1'`));
   });
 });

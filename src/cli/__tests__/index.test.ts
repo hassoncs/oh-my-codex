@@ -268,6 +268,9 @@ describe("madmax state isolation", () => {
           assert.match(err.message, /timed out waiting for madmax detached launch context lock/);
           assert.match(err.message, new RegExp(`holder pid ${process.pid} is still running`));
           assert.match(err.message, /owner context live-context/);
+          assert.match(err.message, /Another madmax detached launch is active for this directory/);
+          assert.match(err.message, /close the existing madmax session or use --worktree for concurrent work/);
+          assert.match(err.message, /Multiple madmax sessions in one directory are unsafe/);
           return true;
         },
       );
@@ -2910,7 +2913,7 @@ describe("detached tmux new-session sequencing", () => {
     const source = await readFile(join(repoRoot, 'src', 'cli', 'index.ts'), 'utf-8');
     assert.match(
       source,
-      /const hudEnvArgs = \[\s*`OMX_SESSION_ID=\$\{sessionId\}`,\s*`\$\{OMX_TMUX_HUD_OWNER_ENV\}=1`,\s*\.\.\.\(omxRootOverride \? \[`OMX_ROOT=\$\{omxRootOverride\}`\] : \[\]\),\s*\]/,
+      /const hudEnvArgs = \[\s*`OMX_SESSION_ID=\$\{sessionId\}`,\s*`\$\{OMX_TMUX_HUD_OWNER_ENV\}=1`,\s*\.\.\.\(currentPaneId \? \[`\$\{OMX_TMUX_HUD_LEADER_PANE_ENV\}=\$\{currentPaneId\}`\] : \[\]\),\s*\.\.\.\(omxRootOverride \? \[`OMX_ROOT=\$\{omxRootOverride\}`\] : \[\]\),\s*\]/,
     );
     assert.match(
       source,
