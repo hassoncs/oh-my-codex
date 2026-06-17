@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -111,16 +111,20 @@ describe('omx session search', () => {
 
       const result = runOmx(cwd, ['session', 'search', 'generated project search', '--json'], {
         HOME: home,
+        CODEX_HOME: '',
+        OMX_ROOT: '',
+        OMX_STATE_ROOT: '',
       });
 
       assert.equal(result.status, 0, result.stderr || result.stdout);
+      const expectedRuntimeCodexHome = await realpath(runtimeCodexHome);
       const parsed = JSON.parse(result.stdout) as {
         results: Array<{ session_id: string }>;
         sources: Array<{ codex_home: string }>;
       };
       assert.deepEqual(parsed.results.map((result) => result.session_id).sort(), ['default-session', 'runtime-session']);
       assert.ok(parsed.sources.some((source) => source.codex_home === defaultCodexHome));
-      assert.ok(parsed.sources.some((source) => source.codex_home === runtimeCodexHome));
+      assert.ok(parsed.sources.some((source) => source.codex_home === runtimeCodexHome || source.codex_home === expectedRuntimeCodexHome));
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
