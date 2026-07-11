@@ -132,7 +132,7 @@ function normalizeCodexGoalMode(raw: string | undefined): 'aggregate' | 'per_sto
 
 function printStatus(plan: Awaited<ReturnType<typeof readUltragoalPlan>>): void {
   const summary = summarizeUltragoalPlan(plan);
-  if (summary.aggregateComplete) {
+  if (summary.aggregateCompletionRecorded) {
     console.log('ultragoal aggregate product: complete');
     console.log(`microgoal ledger bookkeeping (progress-only): ${summary.complete}/${summary.total} complete, ${summary.pending} pending, ${summary.inProgress} in progress, ${summary.failed} failed, ${summary.reviewBlocked} review-blocked, ${summary.needsUserDecision} needs-user-decision`);
   } else if (summary.artifactComplete) {

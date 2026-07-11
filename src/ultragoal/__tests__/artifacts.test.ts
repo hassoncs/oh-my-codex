@@ -117,6 +117,28 @@ function toSteeringProposal(proposal: SteeringFixtureProposal): UltragoalSteerin
 }
 
 describe('ultragoal artifacts', () => {
+  it('backfills aggregate completion from a fully resolved superseded plan', () => {
+    const timestamp = '2026-07-11T00:00:00.000Z';
+    const plan: UltragoalPlan = {
+      version: 1,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      briefPath: '.omx/ultragoal/brief.md',
+      goalsPath: '.omx/ultragoal/goals.json',
+      ledgerPath: '.omx/ultragoal/ledger.jsonl',
+      codexGoalMode: 'aggregate',
+      goals: [
+        { id: 'G019', title: 'Original', objective: 'Original work.', status: 'failed', steeringStatus: 'superseded', supersededBy: ['G021'], attempt: 1, createdAt: timestamp, updatedAt: timestamp },
+        { id: 'G021', title: 'Replacement', objective: 'Replacement work.', status: 'complete', attempt: 1, createdAt: timestamp, updatedAt: timestamp },
+      ],
+    };
+
+    const summary = summarizeUltragoalPlan(plan);
+    assert.equal(summary.artifactComplete, true);
+    assert.equal(summary.aggregateComplete, true);
+    assert.equal(summary.aggregateCompletionRecorded, false);
+  });
+
   it('creates brief, goals, and ledger artifacts from a brief', async () => {
     await withTempRepo(async (cwd) => {
       const plan = await createUltragoalPlan(cwd, {

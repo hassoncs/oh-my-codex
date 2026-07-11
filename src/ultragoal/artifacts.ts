@@ -913,8 +913,10 @@ export async function createUltragoalPlan(cwd: string, options: CreateUltragoalO
   });
 }
 
-export function summarizeUltragoalPlan(plan: UltragoalPlan): { total: number; pending: number; inProgress: number; complete: number; failed: number; reviewBlocked: number; historicalReviewBlocked: number; needsUserDecision: number; superseded: number; steeringBlocked: number; aggregateComplete: boolean; artifactComplete: boolean; activeGoalId?: string } {
+export function summarizeUltragoalPlan(plan: UltragoalPlan): { total: number; pending: number; inProgress: number; complete: number; failed: number; reviewBlocked: number; historicalReviewBlocked: number; needsUserDecision: number; superseded: number; steeringBlocked: number; aggregateComplete: boolean; aggregateCompletionRecorded: boolean; artifactComplete: boolean; activeGoalId?: string } {
   const activeReviewBlocked = plan.goals.filter((goal) => goal.status === 'review_blocked' && !isReviewBlockedResolved(goal, plan)).length;
+  const artifactComplete = isUltragoalDone(plan);
+  const aggregateCompletionRecorded = plan.aggregateCompletion?.status === 'complete';
   return {
     total: plan.goals.length,
     pending: plan.goals.filter((goal) => goal.status === 'pending').length,
@@ -926,8 +928,10 @@ export function summarizeUltragoalPlan(plan: UltragoalPlan): { total: number; pe
     needsUserDecision: plan.goals.filter((goal) => goal.status === 'needs_user_decision').length,
     superseded: plan.goals.filter((goal) => goal.steeringStatus === 'superseded').length,
     steeringBlocked: plan.goals.filter((goal) => goal.steeringStatus === 'blocked').length,
-    aggregateComplete: plan.aggregateCompletion?.status === 'complete',
-    artifactComplete: isUltragoalDone(plan),
+    // Completed artifacts are authoritative when legacy plans lack the aggregate marker.
+    aggregateComplete: aggregateCompletionRecorded || artifactComplete,
+    aggregateCompletionRecorded,
+    artifactComplete,
     activeGoalId: plan.activeGoalId,
   };
 }

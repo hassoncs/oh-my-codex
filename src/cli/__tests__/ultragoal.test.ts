@@ -246,12 +246,13 @@ describe('cli/ultragoal', () => {
       ]));
       assert.equal(status.exitCode, undefined);
       const parsed = JSON.parse(status.stdout.join('\n')) as {
-        summary: { complete: number; aggregateComplete: boolean; artifactComplete: boolean };
+        summary: { complete: number; aggregateComplete: boolean; aggregateCompletionRecorded: boolean; artifactComplete: boolean };
         codexGoalFallback?: { status: string; reason: string; message: string };
         reconciliation?: { ok: boolean; warnings: string[]; snapshot: { unavailableReason?: string } };
       };
       assert.equal(parsed.summary.complete, 1);
-      assert.equal(parsed.summary.aggregateComplete, false);
+      assert.equal(parsed.summary.aggregateComplete, true);
+      assert.equal(parsed.summary.aggregateCompletionRecorded, false);
       assert.equal(parsed.summary.artifactComplete, true);
       assert.equal(parsed.codexGoalFallback?.status, 'codex_goal_reconciliation_unavailable');
       assert.equal(parsed.codexGoalFallback?.reason, 'db_schema_context_error');
