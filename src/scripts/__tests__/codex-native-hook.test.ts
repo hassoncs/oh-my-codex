@@ -502,7 +502,7 @@ describe("codex native hook config", () => {
 			matcher?: string;
 			hooks?: Array<Record<string, unknown>>;
 		};
-		assert.equal(sessionStart.matcher, "startup|resume|clear");
+		assert.equal(sessionStart.matcher, "startup|resume|clear|subagent");
 		assert.equal(sessionStart.hooks?.[0]?.statusMessage, undefined);
 
 		const preToolUse = config.hooks.PreToolUse[0] as {
@@ -18367,7 +18367,6 @@ PY`,
       await rm(cwd, { recursive: true, force: true });
     }
   });
-
   it("records unsupported native subagent support blocker from spawn_agent PostToolUse output", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-subagent-support-record-"));
     try {

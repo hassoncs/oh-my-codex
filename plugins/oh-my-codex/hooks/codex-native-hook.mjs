@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
 import { extname } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -158,6 +158,30 @@ function hookPayloadSessionId(input, payload) {
   return extractTopLevelStringField(input.toString('utf8'), ['session_id', 'sessionId'])?.trim() ?? '';
 }
 
+function readSubagentParentSessionId(payload) {
+  const directParent = payload?.source?.subagent?.thread_spawn?.parent_thread_id;
+  if (typeof directParent === 'string' && directParent.trim()) return directParent.trim();
+
+  const transcriptPath = typeof payload.transcript_path === 'string' ? payload.transcript_path.trim() : '';
+  if (!transcriptPath) return '';
+  let fd;
+  try {
+    fd = openSync(transcriptPath, 'r');
+    const buffer = Buffer.alloc(1024 * 1024);
+    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
+    const firstLine = buffer.toString('utf8', 0, bytesRead).split(/\r?\n/, 1)[0]?.trim();
+    if (!firstLine) return '';
+    const record = JSON.parse(firstLine);
+    const parent = record?.payload?.source?.subagent?.thread_spawn?.parent_thread_id
+      ?? record?.payload?.parent_thread_id;
+    return typeof parent === 'string' ? parent.trim() : '';
+  } catch {
+    return '';
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
 function isOmxLauncherSession(input, payload) {
   const launchId = process.env.OMX_CODEX_LAUNCH_ID?.trim();
   const entryPath = process.env.OMX_ENTRY_PATH?.trim();
@@ -169,7 +193,14 @@ function isOmxLauncherSession(input, payload) {
   try {
     if (existsSync(claimPath)) {
       const claimed = JSON.parse(readFileSync(claimPath, 'utf8'));
-      return claimed?.sessionId === sessionId;
+      if (claimed?.sessionId === sessionId || claimed?.childSessionIds?.includes(sessionId)) return true;
+      if (extractTopLevelHookEventName(input.toString('utf8')) !== 'SessionStart') return false;
+      const parentSessionId = readSubagentParentSessionId(payload);
+      const allowedParents = new Set([claimed?.sessionId, ...(claimed?.childSessionIds ?? [])].filter(Boolean));
+      if (!parentSessionId || !allowedParents.has(parentSessionId)) return false;
+      const childSessionIds = [...new Set([...(claimed?.childSessionIds ?? []), sessionId])];
+      writeFileSync(claimPath, `${JSON.stringify({ ...claimed, childSessionIds })}\n`, { encoding: 'utf8', mode: 0o600 });
+      return true;
     }
     mkdirSync(dirname(claimPath), { recursive: true });
     writeFileSync(claimPath, `${JSON.stringify({ sessionId })}\n`, { encoding: 'utf8', mode: 0o600 });

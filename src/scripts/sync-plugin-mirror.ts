@@ -89,7 +89,7 @@ function pluginHookEntry(eventName: PluginHookEventName): JsonValue {
 		hooks: [commandHook(eventName === "Stop" ? 30 : undefined)],
 	};
 	if (eventName === "SessionStart") {
-		return { ...base, matcher: "startup|resume|clear" };
+		return { ...base, matcher: "startup|resume|clear|subagent" };
 	}
 	return base;
 }

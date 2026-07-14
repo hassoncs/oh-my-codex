@@ -604,6 +604,62 @@ describe('official Codex plugin layout', () => {
     });
   });
 
+  it('delegates claimed OMX child SessionStart hooks and authorizes later child hooks', async () => {
+    await withPluginCacheCopy(async (cachePluginRoot, cacheRoot) => {
+      const calledPath = join(cacheRoot, 'called.txt');
+      const commandPath = join(cacheRoot, process.platform === 'win32' ? 'record-child-called.cmd' : 'record-child-called.sh');
+      if (process.platform === 'win32') {
+        await writeFile(commandPath, `@echo off\r\necho %* > "${calledPath}"\r\necho {}\r\n`, 'utf-8');
+      } else {
+        await writeFile(commandPath, `#!/bin/sh\necho "$@" > "${calledPath}"\nprintf '{}\\n'\n`, 'utf-8');
+        await chmod(commandPath, 0o755);
+      }
+
+      const env = {
+        OMX_ROOT: join(cacheRoot, '.omx-root'),
+        OMX_NATIVE_HOOK_COMMAND: commandPath,
+      };
+      const ownerSessionId = 'owner-codex-session';
+      const childSessionId = 'child-codex-session';
+      runPluginNativeHook(
+        cachePluginRoot,
+        JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: ownerSessionId, prompt: '$ralplan smoke' }),
+        env,
+      );
+      await rm(calledPath, { force: true });
+
+      const transcriptPath = join(cacheRoot, 'child-rollout.jsonl');
+      await writeFile(transcriptPath, `${JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: childSessionId,
+          source: { subagent: { thread_spawn: { parent_thread_id: ownerSessionId, agent_role: 'architect' } } },
+        },
+      })}\n`, 'utf-8');
+      const childStart = runPluginNativeHook(
+        cachePluginRoot,
+        JSON.stringify({
+          hook_event_name: 'SessionStart',
+          source: 'subagent',
+          session_id: childSessionId,
+          transcript_path: transcriptPath,
+        }),
+        env,
+      );
+      assert.equal(childStart.status, 0, childStart.stderr || childStart.stdout);
+      assert.equal((await readFile(calledPath, 'utf-8')).trim(), 'codex-native-hook');
+      await rm(calledPath, { force: true });
+
+      const childPrompt = runPluginNativeHook(
+        cachePluginRoot,
+        JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: childSessionId, prompt: 'review' }),
+        env,
+      );
+      assert.equal(childPrompt.status, 0, childPrompt.stderr || childPrompt.stdout);
+      assert.equal((await readFile(calledPath, 'utf-8')).trim(), 'codex-native-hook');
+    });
+  });
+
   it('emits Stop JSON when the plugin hook pinned launcher is invalid', async () => {
     await withPluginCacheCopy(async (cachePluginRoot) => {
       await writeFile(join(cachePluginRoot, 'hooks', 'omx-command.json'), '{"command":', 'utf-8');

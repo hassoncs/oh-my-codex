@@ -366,6 +366,22 @@ describe('session lifecycle manager', () => {
     }
   });
 
+  it('refuses to replace a live session pointer from a second OMX launch', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-live-conflict-'));
+    try {
+      await writeSessionStart(cwd, 'omx-live-owner', { pid: process.pid });
+
+      await assert.rejects(
+        writeSessionStart(cwd, 'omx-competing-owner', { pid: process.pid }),
+        /OMX session omx-live-owner is already live.*isolated worktree or OMX_ROOT/,
+      );
+
+      assert.equal((await readSessionState(cwd))?.session_id, 'omx-live-owner');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('lets an owner OMX launch session end the fresh native session it spawned', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-native-owner-end-'));
     try {
