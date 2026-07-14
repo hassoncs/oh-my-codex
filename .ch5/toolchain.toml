@@ -1,0 +1,14 @@
+schemaVersion = 1
+
+[repo]
+id = "oh-my-codex"
+kind = "node"
+packageManager = "npm"
+
+[deps]
+install = "npm ci"
+lockfiles = ["package-lock.json", "package.json"]
+
+[[verify]]
+name = "TypeScript typecheck"
+command = "node_modules/.bin/tsc --noEmit"
