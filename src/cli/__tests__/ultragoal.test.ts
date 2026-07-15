@@ -329,6 +329,79 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  it('preserves directive-json replacement and blocker fields through normalization', async () => {
+    await withCwd(async (cwd) => {
+      await capture(() => ultragoalCommand([
+        'create-goals',
+        '--brief', 'Steering normalization',
+        '--goal', 'Original::Complete original work with tests.',
+        '--goal', 'Blocked::Complete blocked work with tests.',
+      ]));
+
+      const multipleTargets = await capture(() => ultragoalCommand([
+        'steer',
+        '--directive-json', JSON.stringify({
+          kind: 'mark_blocked_superseded',
+          source: 'finding',
+          targetGoalIds: ['G001-original', 'G002-blocked'],
+          childGoals: [{ title: 'Replacement', objective: 'Complete replacement work with tests.' }],
+          evidence: 'Multiple-target evidence.',
+          rationale: 'Multiple targets must fail instead of mutating only the first.',
+        }),
+        '--json',
+      ]));
+      assert.equal(multipleTargets.exitCode, 1);
+      const multipleTargetResult = JSON.parse(multipleTargets.stdout.join('\n')) as {
+        audit: { targetGoalIds: string[] };
+        rejectedReasons: string[];
+      };
+      assert.deepEqual(multipleTargetResult.audit.targetGoalIds, ['G001-original', 'G002-blocked']);
+      assert.match(multipleTargetResult.rejectedReasons.join(' | '), /exactly one target goal id/);
+
+      const superseded = await capture(() => ultragoalCommand([
+        'steer',
+        '--directive-json', JSON.stringify({
+          kind: 'mark_blocked_superseded',
+          source: 'finding',
+          targetGoalIds: ['G001-original'],
+          childGoals: [{ title: 'Replacement', objective: 'Complete replacement work with tests.' }],
+          evidence: 'Replacement evidence.',
+          rationale: 'Replacement preserves required work.',
+        }),
+        '--json',
+      ]));
+      assert.equal(superseded.exitCode, undefined);
+      const supersededResult = JSON.parse(superseded.stdout.join('\n')) as {
+        audit: { targetGoalIds: string[] };
+        plan: { goals: Array<{ id: string; steeringStatus?: string; supersededBy?: string[]; supersedes?: string[] }> };
+      };
+      assert.deepEqual(supersededResult.audit.targetGoalIds, ['G001-original']);
+      assert.equal(supersededResult.plan.goals[0]?.steeringStatus, 'superseded');
+      assert.deepEqual(supersededResult.plan.goals[0]?.supersededBy, ['G003-replacement']);
+      assert.deepEqual(supersededResult.plan.goals[1]?.supersedes, ['G001-original']);
+
+      const blocked = await capture(() => ultragoalCommand([
+        'steer',
+        '--directive-json', JSON.stringify({
+          kind: 'mark_blocked_superseded',
+          source: 'finding',
+          targetGoalIds: ['G002-blocked'],
+          blockedReason: 'Waiting on exact external evidence.',
+          evidence: 'Blocker evidence.',
+          rationale: 'Block without claiming completion.',
+        }),
+        '--json',
+      ]));
+      assert.equal(blocked.exitCode, undefined);
+      const plan = JSON.parse(await readFile(join(cwd, '.omx/ultragoal/goals.json'), 'utf-8')) as {
+        goals: Array<{ id: string; steeringStatus?: string; blockedReason?: string }>;
+      };
+      const blockedGoal = plan.goals.find((goal) => goal.id === 'G002-blocked');
+      assert.equal(blockedGoal?.steeringStatus, 'blocked');
+      assert.equal(blockedGoal?.blockedReason, 'Waiting on exact external evidence.');
+    });
+  });
+
   it('dedupes structured CLI steering by idempotency key', async () => {
     await withCwd(async () => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- CLI bridge']));

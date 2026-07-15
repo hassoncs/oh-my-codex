@@ -1123,6 +1123,9 @@ export function validateUltragoalSteeringProposal(plan: UltragoalPlan, proposal:
     rejectedReasons.push(message.replace(/^Unknown ultragoal id:/, 'unknown ultragoal id:'));
   }
   const target = targets[0];
+  if ((proposal.kind === 'split_subgoal' || proposal.kind === 'revise_pending_wording' || proposal.kind === 'mark_blocked_superseded') && targets.length > 1) {
+    rejectedReasons.push(`${proposal.kind} accepts exactly one target goal id.`);
+  }
   if ((proposal.kind === 'split_subgoal' || proposal.kind === 'revise_pending_wording' || proposal.kind === 'mark_blocked_superseded') && !target) {
     rejectedReasons.push(`${proposal.kind} requires a target goal id.`);
   }

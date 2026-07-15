@@ -204,9 +204,12 @@ function normalizeTargetGoalId(raw: Record<string, unknown>): string | undefined
   return undefined;
 }
 
-function normalizeSteeringProposal(raw: Record<string, unknown>, _fallbackDirectiveText?: string): UltragoalSteeringProposal {
+function normalizeSteeringProposal(raw: Record<string, unknown>, fallbackDirectiveText?: string): UltragoalSteeringProposal {
   const kind = parseSteeringKind(typeof raw.kind === 'string' ? raw.kind : undefined);
   const source = parseSteeringSource(typeof raw.source === 'string' ? raw.source : undefined);
+  const targetGoalIds = Array.isArray(raw.targetGoalIds)
+    ? raw.targetGoalIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0).map((id) => id.trim())
+    : undefined;
   const after = raw.after && typeof raw.after === 'object' && !Array.isArray(raw.after)
     ? raw.after as UltragoalSteeringAfterPayload
     : undefined;
@@ -216,10 +219,17 @@ function normalizeSteeringProposal(raw: Record<string, unknown>, _fallbackDirect
     evidence: typeof raw.evidence === 'string' ? raw.evidence : '',
     rationale: typeof raw.rationale === 'string' ? raw.rationale : '',
     targetGoalId: normalizeTargetGoalId(raw),
+    targetGoalIds,
     title: typeof raw.title === 'string' ? raw.title : undefined,
     objective: typeof raw.objective === 'string' ? raw.objective : undefined,
+    childGoals: Array.isArray(raw.childGoals) ? raw.childGoals as UltragoalSteeringProposal['childGoals'] : undefined,
+    revisedTitle: typeof raw.revisedTitle === 'string' ? raw.revisedTitle : undefined,
+    revisedObjective: typeof raw.revisedObjective === 'string' ? raw.revisedObjective : undefined,
     after,
     pendingOrder: Array.isArray(raw.pendingOrder) ? raw.pendingOrder.filter((id): id is string => typeof id === 'string') : undefined,
+    blockedReason: typeof raw.blockedReason === 'string' ? raw.blockedReason : undefined,
+    directiveText: typeof raw.directiveText === 'string' ? raw.directiveText : fallbackDirectiveText,
+    promptSignature: typeof raw.promptSignature === 'string' ? raw.promptSignature : undefined,
     idempotencyKey: typeof raw.idempotencyKey === 'string' ? raw.idempotencyKey : undefined,
   };
 }
