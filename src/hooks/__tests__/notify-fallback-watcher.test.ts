@@ -862,6 +862,82 @@ describe('notify-fallback watcher', () => {
     }
   });
 
+  it('uses the launch thread id when a concurrent exec removes the cwd session pointer', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-missing-session-pointer-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
+    const watcherSessionId = `watcher-${randomUUID()}`;
+    const leaderThreadId = `leader-${randomUUID()}`;
+    const childThreadId = `child-${randomUUID()}`;
+    const turnId = `turn-${randomUUID()}`;
+    const sessionDir = todaySessionDir(tempHome);
+    const rolloutPath = join(
+      sessionDir,
+      `rollout-test-fallback-missing-session-pointer-${childThreadId}.jsonl`,
+    );
+    try {
+      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+      const nowIso = new Date(Date.now() + 2_000).toISOString();
+      await writeFile(rolloutPath, `${[
+        {
+          timestamp: nowIso,
+          type: 'session_meta',
+          payload: {
+            id: childThreadId,
+            cwd: wd,
+            parent_thread_id: leaderThreadId,
+            thread_source: 'subagent',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: leaderThreadId,
+                  depth: 1,
+                  agent_role: 'architect',
+                },
+              },
+            },
+          },
+        },
+        {
+          timestamp: nowIso,
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: turnId },
+        },
+      ].map((value) => JSON.stringify(value)).join('\n')}\n`);
+
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
+        {
+          encoding: 'utf-8',
+          env: buildCleanNotifyEnv({
+            HOME: tempHome,
+            OMX_SESSION_ID: watcherSessionId,
+            CODEX_THREAD_ID: leaderThreadId,
+          }),
+        },
+      );
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const tracking = JSON.parse(
+        await readFile(join(wd, '.omx', 'state', 'subagent-tracking.json'), 'utf-8'),
+      );
+      const session = tracking.sessions?.[watcherSessionId];
+      assert.equal(session?.leader_thread_id, leaderThreadId);
+      assert.equal(session?.threads?.[leaderThreadId]?.kind, 'leader');
+      assert.equal(session?.threads?.[childThreadId]?.kind, 'subagent');
+      assert.equal(session?.threads?.[childThreadId]?.parent_thread_id, leaderThreadId);
+      assert.equal(session?.threads?.[childThreadId]?.last_completed_turn_id, turnId);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+      await rm(rolloutPath, { force: true });
+    }
+  });
+
   it('switches cached native leader after /new through the original OMX owner alias', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-new-session-'));
     const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
@@ -870,9 +946,14 @@ describe('notify-fallback watcher', () => {
     const newLeaderThreadId = `new-${randomUUID()}`;
     const oldChildThreadId = `old-child-${randomUUID()}`;
     const newChildThreadId = `new-child-${randomUUID()}`;
+    const postDeleteChildThreadId = `post-delete-child-${randomUUID()}`;
     const sessionDir = todaySessionDir(tempHome);
     const oldRolloutPath = join(sessionDir, `rollout-test-fallback-new-session-10-${oldChildThreadId}.jsonl`);
     const newRolloutPath = join(sessionDir, `rollout-test-fallback-new-session-20-${newChildThreadId}.jsonl`);
+    const postDeleteRolloutPath = join(
+      sessionDir,
+      `rollout-test-fallback-new-session-30-${postDeleteChildThreadId}.jsonl`,
+    );
     let child: ReturnType<typeof spawn> | undefined;
     try {
       const stateDir = join(wd, '.omx', 'state');
@@ -908,7 +989,11 @@ describe('notify-fallback watcher', () => {
         {
           cwd: wd,
           stdio: 'ignore',
-          env: buildCleanNotifyEnv({ HOME: tempHome, OMX_SESSION_ID: ownerSessionId }),
+          env: buildCleanNotifyEnv({
+            HOME: tempHome,
+            OMX_SESSION_ID: ownerSessionId,
+            CODEX_THREAD_ID: oldLeaderThreadId,
+          }),
         },
       );
 
@@ -954,11 +1039,32 @@ describe('notify-fallback watcher', () => {
           await readFile(join(stateDir, 'subagent-tracking.json'), 'utf-8').catch(() => '{"sessions":{}}'),
         );
         return tracking.sessions?.[newLeaderThreadId]?.leader_thread_id === newLeaderThreadId;
-      }, 4000, 75);
-      await appendLine(newRolloutPath, {
+      }, 8000, 75);
+      await rm(join(stateDir, 'session.json'), { force: true });
+      await writeFile(postDeleteRolloutPath, `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        type: 'session_meta',
+        payload: {
+          id: postDeleteChildThreadId,
+          cwd: wd,
+          parent_thread_id: newLeaderThreadId,
+          thread_source: 'subagent',
+          source: {
+            subagent: {
+              thread_spawn: {
+                parent_thread_id: newLeaderThreadId,
+                depth: 1,
+                agent_role: 'architect',
+              },
+            },
+          },
+        },
+      })}\n`);
+      await sleep(250);
+      await appendLine(postDeleteRolloutPath, {
         timestamp: new Date(Date.now() + 500).toISOString(),
         type: 'event_msg',
-        payload: { type: 'task_complete', turn_id: `turn-${newChildThreadId}` },
+        payload: { type: 'task_complete', turn_id: `turn-${postDeleteChildThreadId}` },
       });
 
       await waitFor(async () => {
@@ -967,9 +1073,9 @@ describe('notify-fallback watcher', () => {
         );
         const session = tracking.sessions?.[newLeaderThreadId];
         return session?.leader_thread_id === newLeaderThreadId
-          && session?.threads?.[newChildThreadId]?.parent_thread_id === newLeaderThreadId
-          && Boolean(session?.threads?.[newChildThreadId]?.completed_at);
-      }, 4000, 75);
+          && session?.threads?.[postDeleteChildThreadId]?.parent_thread_id === newLeaderThreadId
+          && Boolean(session?.threads?.[postDeleteChildThreadId]?.completed_at);
+      }, 8000, 75);
     } finally {
       if (child) {
         child.kill('SIGTERM');
@@ -979,6 +1085,7 @@ describe('notify-fallback watcher', () => {
       await rm(tempHome, { recursive: true, force: true });
       await rm(oldRolloutPath, { force: true });
       await rm(newRolloutPath, { force: true });
+      await rm(postDeleteRolloutPath, { force: true });
     }
   });
 

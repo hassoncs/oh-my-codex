@@ -1748,25 +1748,34 @@ function sessionStateMatchesWatcherSession(sessionId: string, sessionState: Awai
 
 async function resolveTrustedLeader(sessionMetas: WatcherSessionMeta[]): Promise<void> {
   const sessionId = await readCurrentSessionId(stateDir).catch(() => '');
-  if (sessionId && trustedLeaderSessionId && sessionId !== trustedLeaderSessionId) {
+  const sessionState = await readSessionState(cwd);
+  if (!sessionId) return;
+
+  const matchingSessionState = sessionState
+    && isSessionStateAuthoritativeForCwd(sessionState, cwd)
+    && sessionStateMatchesWatcherSession(sessionId, sessionState)
+    ? sessionState
+    : null;
+  if (!matchingSessionState && trustedLeaderSessionId && trustedLeaderThreadId) return;
+  if (matchingSessionState && trustedLeaderSessionId && sessionId !== trustedLeaderSessionId) {
     trustedLeaderSessionId = '';
     trustedLeaderThreadId = '';
   }
-  const sessionState = await readSessionState(cwd);
-  if (
-    !sessionId
-    || !sessionState
-    || !isSessionStateAuthoritativeForCwd(sessionState, cwd)
-    || !sessionStateMatchesWatcherSession(sessionId, sessionState)
-  ) return;
 
-  const nativeLeaderId = safeString(sessionState.native_session_id).trim();
+  const envLeaderId = normalizeValidSessionId(process.env.CODEX_THREAD_ID);
+  const nativeLeaderId = safeString(matchingSessionState?.native_session_id).trim()
+    || (!matchingSessionState && !trustedLeaderThreadId ? envLeaderId : '');
+  let leaderStartedAt = safeString(matchingSessionState?.started_at).trim();
+
   if (nativeLeaderId) {
     if (trustedLeaderSessionId === sessionId && trustedLeaderThreadId === nativeLeaderId) return;
     trustedLeaderThreadId = nativeLeaderId;
+    leaderStartedAt ||= sessionMetas.find(
+      (meta) => meta.threadSource === 'user' && meta.threadId === nativeLeaderId,
+    )?.sessionStartedAt || new Date(startedAt).toISOString();
   } else {
     if (trustedLeaderSessionId === sessionId && trustedLeaderThreadId) return;
-    const sessionStartedAtMs = parseIsoMillis(sessionState.started_at);
+    const sessionStartedAtMs = parseIsoMillis(matchingSessionState?.started_at);
     if (sessionStartedAtMs === null) return;
     const candidates = sessionMetas.filter((meta) => {
       if (meta.threadSource !== 'user') return false;
@@ -1790,7 +1799,7 @@ async function resolveTrustedLeader(sessionMetas: WatcherSessionMeta[]): Promise
   await recordSubagentTurnForSession(cwd, {
     sessionId,
     threadId: trustedLeaderThreadId,
-    timestamp: sessionState.started_at,
+    timestamp: leaderStartedAt,
     kind: 'leader',
     replaceLeader: true,
     preserveCompletionEvidence: true,
@@ -1813,7 +1822,7 @@ async function recordFallbackSubagentCompletion(
     return 'rejected';
   }
 
-  const sessionId = await readCurrentSessionId(stateDir).catch(() => '');
+  const sessionId = trustedLeaderSessionId || await readCurrentSessionId(stateDir).catch(() => '');
   if (!sessionId) {
     await eventLog({
       type: 'subagent_tracking_pending',
