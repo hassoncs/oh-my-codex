@@ -1,6 +1,10 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { subagentTrackingPath } from '../subagents/tracker.js';
+import {
+  hasVerifiedNativeSubagentLineage,
+  normalizeSubagentTrackingState,
+  subagentTrackingPath,
+} from '../subagents/tracker.js';
 import { getBaseStateDir, resolveWorkingDirectoryForState } from '../state/paths.js';
 
 export const RALPLAN_CONSENSUS_BLOCKED_REASONS = {
@@ -17,10 +21,17 @@ export interface RalplanNativeReviewDiagnostic {
   session_id: string | null;
   thread_id: string | null;
   tracker_path: string;
+  expected_tracker_path: string;
   session_found: boolean;
   thread_found: boolean;
   kind: string | null;
   completed: boolean;
+  tracker_last_seen_at: string | null;
+  tracker_last_turn_id: string | null;
+  tracker_has_current_turn: boolean;
+  tracker_completed_at: string | null;
+  review_completed_turn_id: string | null;
+  tracker_last_completed_turn_id: string | null;
   problem: string | null;
 }
 
@@ -70,17 +81,17 @@ type ConsensusResolution = {
   blockedDetails: string[];
 };
 
+type SelectedConsensusResolution = {
+  evidence: ConsensusResolution;
+  source: string;
+  nativeOptions?: RalplanNativeSubagentConsensusOptions;
+};
+
 export function buildRalplanConsensusGateFromSources(
   sources: RalplanConsensusSource[],
   options: RalplanNativeSubagentConsensusOptions = {},
 ): RalplanConsensusGateEvidence {
-  let nativeBlockedEvidence: {
-    ralplan_architect_review: Record<string, unknown>;
-    ralplan_critic_review: Record<string, unknown>;
-    source: string;
-    options: RalplanNativeSubagentConsensusOptions;
-  } | null = null;
-  let firstCompleteEvidence: (ConsensusResolution & { source: string }) | null = null;
+  let selected: SelectedConsensusResolution | null = null;
 
   for (const candidate of sources) {
     const evidence = resolveConsensusEvidence(candidate.value);
@@ -88,52 +99,38 @@ export function buildRalplanConsensusGateFromSources(
       ...options,
       sessionId: options.sessionId ?? candidate.sessionId,
     };
-
-    if (evidence?.kind === 'invalid') {
-      if (isConsensusEvidenceNewerThanSelected(evidence, firstCompleteEvidence)) {
-        firstCompleteEvidence = { ...evidence, source: candidate.source };
-      }
-      continue;
-    }
-
-    if (evidence?.kind === 'valid') {
-      if (
-        options.requireNativeSubagents
-        && !hasTrackerBackedNativeRalplanLanes(evidence, candidateOptions)
-      ) {
-        nativeBlockedEvidence ??= { ...evidence, source: candidate.source, options: candidateOptions };
-        continue;
-      }
-      if (isConsensusEvidenceNewerThanSelected(evidence, firstCompleteEvidence)) {
-        firstCompleteEvidence = { ...evidence, source: candidate.source };
-      }
+    if (!evidence) continue;
+    if (isConsensusEvidenceNewerThanSelected(evidence, selected?.evidence ?? null)) {
+      selected = {
+        evidence,
+        source: candidate.source,
+        ...(evidence.kind === 'valid'
+          && options.requireNativeSubagents
+          && !hasTrackerBackedNativeRalplanLanes(evidence, candidateOptions)
+          ? { nativeOptions: candidateOptions }
+          : {}),
+      };
     }
   }
 
-  if (firstCompleteEvidence?.kind === 'invalid') {
+  if (selected?.evidence.kind === 'invalid') {
     return {
       complete: false,
       sequence: ['architect-review', 'critic-review'],
-      ralplan_architect_review: firstCompleteEvidence.ralplan_architect_review,
-      ralplan_critic_review: firstCompleteEvidence.ralplan_critic_review,
-      source: firstCompleteEvidence.source,
+      ralplan_architect_review: selected.evidence.ralplan_architect_review,
+      ralplan_critic_review: selected.evidence.ralplan_critic_review,
+      source: selected.source,
       blockedReason: RALPLAN_CONSENSUS_BLOCKED_REASONS.nonApprovingReview,
-      blockedDetails: firstCompleteEvidence.blockedDetails,
+      blockedDetails: selected.evidence.blockedDetails,
     };
   }
 
-  if (firstCompleteEvidence?.kind === 'valid') {
-    return {
-      complete: true,
-      sequence: ['architect-review', 'critic-review'],
-      ralplan_architect_review: firstCompleteEvidence.ralplan_architect_review,
-      ralplan_critic_review: firstCompleteEvidence.ralplan_critic_review,
-      source: firstCompleteEvidence.source,
-      blockedReason: null,
+  if (selected?.evidence.kind === 'valid' && selected.nativeOptions) {
+    const nativeBlockedEvidence = {
+      ...selected.evidence,
+      source: selected.source,
+      options: selected.nativeOptions,
     };
-  }
-
-  if (nativeBlockedEvidence) {
     return {
       complete: false,
       sequence: ['architect-review', 'critic-review'],
@@ -147,6 +144,17 @@ export function buildRalplanConsensusGateFromSources(
         trackerBackedNativeReviewProblem(nativeBlockedEvidence.ralplan_critic_review, 'critic', nativeBlockedEvidence.options),
       ].filter((detail): detail is string => Boolean(detail)),
       diagnostic: buildTrackerBackedNativeConsensusDiagnostic(nativeBlockedEvidence, nativeBlockedEvidence.options),
+    };
+  }
+
+  if (selected?.evidence.kind === 'valid') {
+    return {
+      complete: true,
+      sequence: ['architect-review', 'critic-review'],
+      ralplan_architect_review: selected.evidence.ralplan_architect_review,
+      ralplan_critic_review: selected.evidence.ralplan_critic_review,
+      source: selected.source,
+      blockedReason: null,
     };
   }
 
@@ -371,9 +379,8 @@ function resolveDirectGate(record: Record<string, unknown>): ConsensusResolution
       if (!hasArchitectThenCriticSequence(gateRecord)) {
         blockedDetails.push('consensus review sequence is not architect-review then critic-review');
       }
-      if (!isCriticNotBeforeArchitect(architectReview, criticReview)) {
-        blockedDetails.push('critic review is ordered before architect review');
-      }
+      const sequenceProblem = reviewSequenceProblem(architectReview, criticReview);
+      if (sequenceProblem) blockedDetails.push(sequenceProblem);
       if (blockedDetails.length > 0) {
         return {
           kind: 'invalid',
@@ -432,7 +439,7 @@ function reviewsCarryFreshnessCycle(evidence: ConsensusResolution, reviewCycle: 
 
 function isConsensusEvidenceNewerThanSelected(
   evidence: ConsensusResolution,
-  selected: (ConsensusResolution & { source: string }) | null,
+  selected: ConsensusResolution | null,
 ): boolean {
   if (!selected) return true;
   const evidenceCycle = consensusEvidenceReviewCycle(evidence);
@@ -557,10 +564,20 @@ function isCriticNotBeforeArchitect(
   architectReview: Record<string, unknown> | null,
   criticReview: Record<string, unknown> | null,
 ): boolean {
-  if (!architectReview || !criticReview) return false;
+  return reviewSequenceProblem(architectReview, criticReview) === null;
+}
+
+function reviewSequenceProblem(
+  architectReview: Record<string, unknown> | null,
+  criticReview: Record<string, unknown> | null,
+): string | null {
+  if (!architectReview || !criticReview) return 'architect or critic review is missing';
   const architectOrder = reviewOrderValue(architectReview);
   const criticOrder = reviewOrderValue(criticReview);
-  return architectOrder === null || criticOrder === null || criticOrder >= architectOrder;
+  if (architectOrder === null || criticOrder === null) {
+    return 'architect and critic reviews require parseable sequential order evidence';
+  }
+  return criticOrder > architectOrder ? null : 'critic review lacks strict order after architect review';
 }
 
 function reviewOrderValue(review: Record<string, unknown>): number | null {
@@ -625,6 +642,8 @@ function buildTrackerBackedNativeConsensusDiagnostic(
       'sessions["<current_session_id>"].threads["<architect_thread_id>"].kind = "subagent"',
       'sessions["<current_session_id>"].threads["<critic_thread_id>"].kind = "subagent"',
       'both threads have completed_at',
+      'each review completed_turn_id exactly matches its tracker thread last_completed_turn_id',
+      'notify-fallback completions match agent role and parent lineage to the session leader',
       'architect and critic thread IDs are distinct',
     ],
     current_session_id: currentSessionId || null,
@@ -635,7 +654,7 @@ function buildTrackerBackedNativeConsensusDiagnostic(
     pair_problem: trackerBackedNativeReviewPairProblem(evidence, options),
     remediation: [
       'Re-run native ralplan Architect/Critic reviews.',
-      'Or repair the review artifact so agent_role, provenance_kind, session_id, thread_id, and tracker_path point to completed native subagent threads in the current tracker.',
+      'Or repair the review artifact so agent_role, provenance_kind, session_id, thread_id, completed_turn_id, and tracker_path point to the current completed native subagent turns.',
     ],
     docs: 'docs/contracts/ralplan-consensus-gate.md',
   };
@@ -655,19 +674,36 @@ function buildNativeReviewDiagnostic(
         : nativeReviewSessionId(review))
     : '';
   const threadId = nativeReviewThreadId(review);
-  const tracking = cwd && sessionId ? readJsonState(trackerPath) : null;
+  const authoritativeReplica = cwd && sessionId && threadId
+    ? authoritativeTrackerReviewReplica(cwd, sessionId, threadId)
+    : null;
+  const observedTrackerPath = authoritativeReplica?.trackerPath ?? trackerPath;
+  const tracking = authoritativeReplica?.tracking ?? (cwd && sessionId ? readJsonState(trackerPath) : null);
   const session = asRecord(asRecord(tracking?.sessions)?.[sessionId]);
   const thread = asRecord(asRecord(session?.threads)?.[threadId]);
   const completedAt = typeof thread?.completed_at === 'string' ? thread.completed_at.trim() : '';
+  const trackerLastSeenAt = typeof thread?.last_seen_at === 'string' ? thread.last_seen_at.trim() : '';
+  const trackerLastTurnId = typeof thread?.last_turn_id === 'string' ? thread.last_turn_id.trim() : '';
+  const reviewCompletedTurnId = nativeReviewCompletedTurnId(review);
+  const trackerLastCompletedTurnId = typeof thread?.last_completed_turn_id === 'string'
+    ? thread.last_completed_turn_id.trim()
+    : '';
   return {
     role: agentRole,
     session_id: sessionId || null,
     thread_id: threadId || null,
-    tracker_path: trackerPath,
+    tracker_path: observedTrackerPath,
+    expected_tracker_path: trackerPath,
     session_found: Boolean(session),
     thread_found: Boolean(thread),
     kind: typeof thread?.kind === 'string' ? thread.kind : null,
-    completed: Boolean(completedAt),
+    completed: authoritativeReplica ? authoritativeReplica.completedAt !== null : Boolean(completedAt),
+    tracker_last_seen_at: trackerLastSeenAt || null,
+    tracker_last_turn_id: trackerLastTurnId || null,
+    tracker_has_current_turn: authoritativeReplica?.hasCurrentTurn ?? false,
+    tracker_completed_at: completedAt || null,
+    review_completed_turn_id: reviewCompletedTurnId || null,
+    tracker_last_completed_turn_id: trackerLastCompletedTurnId || null,
     problem,
   };
 }
@@ -688,9 +724,56 @@ function trackerBackedNativeReviewPairProblem(
   const architectSessionId = transitionSessionId || nativeReviewSessionId(evidence.ralplan_architect_review);
   const criticSessionId = transitionSessionId || nativeReviewSessionId(evidence.ralplan_critic_review);
   if (!architectSessionId || !criticSessionId) return null;
-  return architectSessionId === criticSessionId
+  if (architectSessionId !== criticSessionId) {
+    return `architect and critic reviews must resolve to the same native subagent tracker session; architect session_id=${architectSessionId}, critic session_id=${criticSessionId}`;
+  }
+
+  if (
+    trackerBackedNativeReviewProblem(evidence.ralplan_architect_review, 'architect', options)
+    || trackerBackedNativeReviewProblem(evidence.ralplan_critic_review, 'critic', options)
+  ) return null;
+  const architectCompletedAt = trackerReviewCompletionValue(
+    evidence.ralplan_architect_review,
+    'architect',
+    options,
+  );
+  const criticCompletedAt = trackerReviewCompletionValue(
+    evidence.ralplan_critic_review,
+    'critic',
+    options,
+  );
+  if (architectCompletedAt === null || criticCompletedAt === null) {
+    return 'architect and critic tracker threads require parseable completed_at order evidence';
+  }
+  return criticCompletedAt > architectCompletedAt
     ? null
-    : `architect and critic reviews must resolve to the same native subagent tracker session; architect session_id=${architectSessionId}, critic session_id=${criticSessionId}`;
+    : 'critic tracker thread did not complete strictly after architect tracker thread';
+}
+
+function trackerReviewCompletionValue(
+  review: Record<string, unknown> | null,
+  agentRole: 'architect' | 'critic',
+  options: RalplanNativeSubagentConsensusOptions,
+): number | null {
+  const cwd = typeof options.cwd === 'string' ? options.cwd.trim() : '';
+  const sessionId = typeof options.sessionId === 'string' && options.sessionId.trim()
+    ? options.sessionId.trim()
+    : nativeReviewSessionId(review);
+  const threadId = nativeReviewThreadId(review);
+  if (!cwd || !sessionId || !threadId) return null;
+  const replica = authoritativeTrackerReviewReplica(cwd, sessionId, threadId);
+  if (!replica) return null;
+  return trackerReviewCompletionProblem(
+    replica.tracking,
+    sessionId,
+    threadId,
+    review,
+    agentRole,
+    replica.trackerPath,
+    options.cwd,
+  ) === null
+    ? replica.completedAt
+    : null;
 }
 
 function isTrackerBackedNativeReview(
@@ -703,6 +786,10 @@ function isTrackerBackedNativeReview(
 
 function nativeReviewSessionId(review: Record<string, unknown> | null): string {
   return typeof review?.session_id === 'string' ? review.session_id.trim() : '';
+}
+
+function nativeReviewCompletedTurnId(review: Record<string, unknown> | null): string {
+  return typeof review?.completed_turn_id === 'string' ? review.completed_turn_id.trim() : '';
 }
 
 function trackerBackedNativeReviewProblem(
@@ -732,23 +819,139 @@ function trackerBackedNativeReviewProblem(
 
   if (issues.length > 0) return issues.join('; ');
 
+  const replica = authoritativeTrackerReviewReplica(cwd, sessionId, threadId);
+  if (!replica) {
+    return trackerReviewReplicaSelectionProblem(cwd, sessionId, threadId, agentRole, options.cwd);
+  }
+  return trackerReviewCompletionProblem(
+    replica.tracking,
+    sessionId,
+    threadId,
+    review,
+    agentRole,
+    replica.trackerPath,
+    options.cwd,
+  );
+}
+
+interface TrackerReviewReplica {
+  trackerPath: string;
+  tracking: Record<string, unknown>;
+  activityAt: number | null;
+  completedAt: number | null;
+  hasCurrentTurn: boolean;
+}
+
+function trackerReviewPaths(cwd: string): string[] {
+  return uniquePaths([
+    subagentTrackingPath(cwd),
+    join(localBaseStateDir(cwd), 'subagent-tracking.json'),
+  ]);
+}
+
+function authoritativeTrackerReviewReplica(
+  cwd: string,
+  sessionId: string,
+  threadId: string,
+): TrackerReviewReplica | null {
+  let selected: TrackerReviewReplica | null = null;
+  for (const trackerPath of trackerReviewPaths(cwd)) {
+    const tracking = readJsonState(trackerPath);
+    if (!tracking) continue;
+    const session = asRecord(asRecord(tracking.sessions)?.[sessionId]);
+    const thread = asRecord(asRecord(session?.threads)?.[threadId]);
+    if (!thread) continue;
+    const lastSeenAtValue = typeof thread.last_seen_at === 'string'
+      ? Date.parse(thread.last_seen_at)
+      : Number.NaN;
+    const completedAtValue = typeof thread.completed_at === 'string'
+      ? Date.parse(thread.completed_at)
+      : Number.NaN;
+    const lastSeenAt = Number.isFinite(lastSeenAtValue) ? lastSeenAtValue : null;
+    const completedAt = Number.isFinite(completedAtValue) ? completedAtValue : null;
+    const knownActivity = [lastSeenAt, completedAt].filter((value): value is number => value !== null);
+    const activityAt = knownActivity.length > 0 ? Math.max(...knownActivity) : null;
+    const lastTurnId = typeof thread.last_turn_id === 'string' ? thread.last_turn_id.trim() : '';
+    const lastCompletedTurnId = typeof thread.last_completed_turn_id === 'string'
+      ? thread.last_completed_turn_id.trim()
+      : '';
+    const hasCurrentTurn = Boolean(lastTurnId && lastTurnId !== lastCompletedTurnId);
+    const candidate = { trackerPath, tracking, activityAt, completedAt, hasCurrentTurn };
+    if (
+      !selected
+      || (candidate.activityAt !== null && selected.activityAt === null)
+      || (candidate.activityAt !== null && selected.activityAt !== null && candidate.activityAt > selected.activityAt)
+      || (
+        candidate.activityAt === selected.activityAt
+        && candidate.hasCurrentTurn
+        && !selected.hasCurrentTurn
+      )
+      || (
+        candidate.activityAt === selected.activityAt
+        && candidate.hasCurrentTurn === selected.hasCurrentTurn
+        && candidate.completedAt !== null
+        && (selected.completedAt === null || candidate.completedAt > selected.completedAt)
+      )
+    ) {
+      selected = candidate;
+    }
+  }
+  return selected;
+}
+
+function trackerReviewReplicaSelectionProblem(
+  cwd: string,
+  sessionId: string,
+  threadId: string,
+  agentRole: 'architect' | 'critic',
+  leaderCwd: string | undefined,
+): string {
   const expectedTrackerPath = subagentTrackingPath(cwd);
   const tracking = readJsonState(expectedTrackerPath);
-  const expectedProblem = trackerThreadProblem(tracking, sessionId, threadId, agentRole, expectedTrackerPath, options.cwd);
-  if (expectedProblem === null) return null;
-
-  const fallbackTrackerPath = findCompletedNativeReviewThreadInLocalTracker(
-    cwd,
-    expectedTrackerPath,
+  const threadProblem = trackerThreadProblem(
+    tracking,
     sessionId,
     threadId,
     agentRole,
-    options.cwd,
+    expectedTrackerPath,
+    leaderCwd,
   );
-  if (fallbackTrackerPath) return null;
+  if (threadProblem) return threadProblem;
+  return `${agentRole} tracker thread ${threadId} completed_at is not parseable in ${expectedTrackerPath}`;
+}
 
-  return expectedProblem;
-
+function trackerReviewCompletionProblem(
+  tracking: Record<string, unknown> | null,
+  sessionId: string,
+  threadId: string,
+  review: Record<string, unknown> | null,
+  agentRole: 'architect' | 'critic',
+  trackerPath: string,
+  cwd: string | undefined,
+): string | null {
+  const threadProblem = trackerThreadProblem(tracking, sessionId, threadId, agentRole, trackerPath, cwd);
+  if (threadProblem) return threadProblem;
+  const reviewCompletedTurnId = nativeReviewCompletedTurnId(review);
+  if (!reviewCompletedTurnId) {
+    return `${agentRole} review missing completed_turn_id; current completion identity is UNKNOWN`;
+  }
+  const session = asRecord(asRecord(tracking?.sessions)?.[sessionId]);
+  const thread = asRecord(asRecord(session?.threads)?.[threadId]);
+  const trackerLastTurnId = typeof thread?.last_turn_id === 'string'
+    ? thread.last_turn_id.trim()
+    : '';
+  const trackerCompletedTurnId = typeof thread?.last_completed_turn_id === 'string'
+    ? thread.last_completed_turn_id.trim()
+    : '';
+  if (!trackerCompletedTurnId) {
+    return `${agentRole} tracker thread ${threadId} lacks last_completed_turn_id; current completion identity is UNKNOWN`;
+  }
+  if (trackerLastTurnId && trackerLastTurnId !== trackerCompletedTurnId) {
+    return `${agentRole} tracker thread ${threadId} has current last_turn_id=${trackerLastTurnId} after last_completed_turn_id=${trackerCompletedTurnId}; current completion identity is UNKNOWN`;
+  }
+  return trackerCompletedTurnId === reviewCompletedTurnId
+    ? null
+    : `${agentRole} review completed_turn_id=${reviewCompletedTurnId} does not match tracker last_completed_turn_id=${trackerCompletedTurnId}`;
 }
 
 function trackerThreadProblem(
@@ -772,28 +975,20 @@ function trackerThreadProblem(
   if (thread.kind !== 'subagent') return `${agentRole} tracker thread ${threadId} has kind=${String(thread.kind || 'missing')}`;
   const completedAt = typeof thread.completed_at === 'string' ? thread.completed_at.trim() : '';
   if (!completedAt) return `${agentRole} tracker thread ${threadId} is not completed`;
-  return null;
-}
-
-function findCompletedNativeReviewThreadInLocalTracker(
-  cwd: string,
-  expectedTrackerPath: string,
-  sessionId: string,
-  threadId: string,
-  agentRole: 'architect' | 'critic',
-  leaderCwd: string | undefined,
-): string | null {
-  const fallbackTrackerPaths = uniquePaths([
-    join(localBaseStateDir(cwd), 'subagent-tracking.json'),
-  ]).filter((path) => path !== expectedTrackerPath);
-
-  for (const trackerPath of fallbackTrackerPaths) {
-    const tracking = readJsonState(trackerPath);
-    if (trackerThreadProblem(tracking, sessionId, threadId, agentRole, trackerPath, leaderCwd) === null) {
-      return trackerPath;
-    }
+  if (!Number.isFinite(Date.parse(completedAt))) {
+    return `${agentRole} tracker thread ${threadId} completed_at is not parseable`;
   }
-
+  const trackerRole = typeof thread.role === 'string' ? thread.role.trim() : '';
+  if (trackerRole !== agentRole) {
+    return `${agentRole} tracker thread ${threadId} has role=${trackerRole || 'missing'}`;
+  }
+  if (currentLeaderThreadId && leaderThreadId !== currentLeaderThreadId) {
+    return `${agentRole} tracker leader ${leaderThreadId || 'missing'} does not match current native leader ${currentLeaderThreadId}`;
+  }
+  const normalizedSession = normalizeSubagentTrackingState(tracking).sessions[sessionId];
+  if (!hasVerifiedNativeSubagentLineage(normalizedSession, threadId, leaderThreadId)) {
+    return `${agentRole} tracker thread ${threadId} lacks verified native lineage to leader ${leaderThreadId || 'missing'}`;
+  }
   return null;
 }
 

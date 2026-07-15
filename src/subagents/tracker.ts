@@ -1,10 +1,16 @@
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { link, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { getBaseStateDir } from '../state/paths.js';
 
 export const SUBAGENT_TRACKING_SCHEMA_VERSION = 1;
 export const DEFAULT_SUBAGENT_ACTIVE_WINDOW_MS = 120_000;
+const SUBAGENT_TRACKING_LOCK_RETRY_MS = 10;
+const SUBAGENT_TRACKING_LOCK_TIMEOUT_MS = 10_000;
+const SUBAGENT_TRACKING_UNOWNED_STALE_MS = 1_000;
+const SUBAGENT_TRACKING_RECOVERY_CANDIDATE_MAX_MS = 5_000;
 
 export type SubagentAvailabilityStatus = 'available' | 'closed' | 'unavailable';
 
@@ -19,6 +25,9 @@ export interface TrackedSubagentThread {
   turn_count: number;
   mode?: string;
   role?: string;
+  thread_source?: string;
+  parent_thread_id?: string;
+  depth?: number;
   lane_id?: string;
   scope?: string;
   agent_nickname?: string;
@@ -50,11 +59,15 @@ export interface RecordSubagentTurnInput {
   timestamp?: string;
   mode?: string;
   role?: string;
+  threadSource?: string;
+  parentThreadId?: string;
+  depth?: number;
   laneId?: string;
   scope?: string;
   agentNickname?: string;
   kind?: 'leader' | 'subagent';
   leaderThreadId?: string;
+  replaceLeader?: boolean;
   completed?: boolean;
   completionSource?: string;
   status?: SubagentAvailabilityStatus;
@@ -104,6 +117,151 @@ export interface SubagentResumeLedger extends SubagentSessionSummary {
 
 export function subagentTrackingPath(cwd: string): string {
   return join(getBaseStateDir(cwd), 'subagent-tracking.json');
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function processStartIdentity(pid: number): string | null {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const result = process.platform === 'win32'
+    ? spawnSync(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o')`],
+        { encoding: 'utf-8', timeout: 1_000, windowsHide: true },
+      )
+    : spawnSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], {
+        encoding: 'utf-8',
+        timeout: 1_000,
+      });
+  const identity = result.status === 0 ? result.stdout.trim() : '';
+  return identity || null;
+}
+
+const CURRENT_PROCESS_START_IDENTITY = processStartIdentity(process.pid);
+
+function requireCurrentProcessStartIdentity(): string {
+  if (!CURRENT_PROCESS_START_IDENTITY) {
+    throw new Error(`subagent_tracking_process_identity_unavailable:${process.platform}`);
+  }
+  return CURRENT_PROCESS_START_IDENTITY;
+}
+
+async function recordedProcessIsAlive(
+  owner: { pid?: unknown; process_start_identity?: unknown },
+  path: string,
+  legacyMaxAgeMs: number,
+): Promise<boolean> {
+  const pid = typeof owner.pid === 'number' && Number.isInteger(owner.pid) ? owner.pid : 0;
+  if (pid <= 0) return Date.now() - (await stat(path)).mtimeMs <= SUBAGENT_TRACKING_UNOWNED_STALE_MS;
+  if (!isProcessAlive(pid)) return false;
+  const recordedIdentity = typeof owner.process_start_identity === 'string'
+    ? owner.process_start_identity
+    : '';
+  if (!recordedIdentity) return Date.now() - (await stat(path)).mtimeMs <= legacyMaxAgeMs;
+  return processStartIdentity(pid) === recordedIdentity;
+}
+
+async function recoverStaleSubagentTrackingLock(lockPath: string): Promise<boolean> {
+  const recoveryDir = `${lockPath}.recovery`;
+  const candidateName = `candidate-${process.hrtime.bigint().toString().padStart(20, '0')}-${process.pid}-${randomUUID()}`;
+  const candidatePath = join(recoveryDir, candidateName);
+  await mkdir(recoveryDir, { recursive: true });
+  await writeFile(candidatePath, JSON.stringify({
+    pid: process.pid,
+    ...(CURRENT_PROCESS_START_IDENTITY ? { process_start_identity: CURRENT_PROCESS_START_IDENTITY } : {}),
+    created_at: new Date().toISOString(),
+  }), { flag: 'wx' });
+
+  try {
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, SUBAGENT_TRACKING_LOCK_RETRY_MS));
+    const activeCandidates: string[] = [];
+    for (const name of await readdir(recoveryDir)) {
+      if (!name.startsWith('candidate-')) continue;
+      const path = join(recoveryDir, name);
+      let owner: { pid?: unknown; process_start_identity?: unknown } = {};
+      try {
+        owner = JSON.parse(await readFile(path, 'utf-8')) as typeof owner;
+      } catch {
+        owner = {};
+      }
+      const staleCandidate = !(await recordedProcessIsAlive(
+        owner,
+        path,
+        SUBAGENT_TRACKING_RECOVERY_CANDIDATE_MAX_MS,
+      ));
+      if (staleCandidate) await rm(path, { force: true });
+      else activeCandidates.push(name);
+    }
+    activeCandidates.sort();
+    if (activeCandidates[0] !== candidateName) return false;
+
+    let owner: { pid?: unknown; process_start_identity?: unknown } = {};
+    try {
+      owner = JSON.parse(await readFile(lockPath, 'utf-8')) as typeof owner;
+    } catch {
+      owner = {};
+    }
+    if (await recordedProcessIsAlive(owner, lockPath, SUBAGENT_TRACKING_LOCK_TIMEOUT_MS)) return false;
+    await rm(lockPath, { force: true });
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT';
+  } finally {
+    await rm(candidatePath, { force: true });
+  }
+}
+
+async function tryCreateSubagentTrackingLock(lockPath: string, owner: Record<string, unknown>): Promise<boolean> {
+  const candidatePath = `${lockPath}.candidate.${process.pid}.${randomUUID()}`;
+  await writeFile(candidatePath, JSON.stringify(owner), { mode: 0o600 });
+  try {
+    await link(candidatePath, lockPath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw error;
+  } finally {
+    await rm(candidatePath, { force: true });
+  }
+}
+
+async function withSubagentTrackingLock<T>(path: string, operation: () => Promise<T>): Promise<T> {
+  const lockPath = `${path}.lock`;
+  const token = `${process.pid}.${Date.now()}.${randomUUID()}`;
+  const processStartIdentity = requireCurrentProcessStartIdentity();
+  const deadline = Date.now() + SUBAGENT_TRACKING_LOCK_TIMEOUT_MS;
+  await mkdir(dirname(path), { recursive: true });
+
+  while (true) {
+    if (await tryCreateSubagentTrackingLock(lockPath, {
+      pid: process.pid,
+      process_start_identity: processStartIdentity,
+      token,
+      acquired_at: new Date().toISOString(),
+    })) break;
+    if (await recoverStaleSubagentTrackingLock(lockPath)) continue;
+    if (Date.now() >= deadline) throw new Error(`subagent_tracking_lock_timeout:${path}`);
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, SUBAGENT_TRACKING_LOCK_RETRY_MS));
+  }
+
+  try {
+    return await operation();
+  } finally {
+    try {
+      const owner = JSON.parse(await readFile(lockPath, 'utf-8')) as { token?: unknown };
+      if (owner.token === token) await rm(lockPath, { force: true });
+    } catch {
+      // Lock was already recovered or removed.
+    }
+  }
 }
 
 export function createSubagentTrackingState(): SubagentTrackingState {
@@ -195,6 +353,41 @@ export function isTrustedSubagentThread(
   return session.threads[normalizedThreadId]?.kind === 'subagent';
 }
 
+export function hasVerifiedNativeSubagentLineage(
+  session: TrackedSubagentSession | null | undefined,
+  threadId: string,
+  leaderThreadId = session?.leader_thread_id?.trim() ?? '',
+): boolean {
+  let currentThreadId = threadId.trim();
+  const leader = leaderThreadId.trim();
+  if (!session || !currentThreadId || !leader || currentThreadId === leader) return false;
+
+  const seen = new Set<string>();
+  let childDepth: number | undefined;
+  while (currentThreadId) {
+    if (seen.has(currentThreadId)) return false;
+    seen.add(currentThreadId);
+
+    const thread = session.threads[currentThreadId];
+    const parentThreadId = thread?.parent_thread_id?.trim() ?? '';
+    const depth = thread?.depth;
+    if (
+      thread?.kind !== 'subagent'
+      || thread.thread_source !== 'subagent'
+      || !parentThreadId
+      || !Number.isInteger(depth)
+      || (depth ?? 0) < 1
+      || (childDepth !== undefined && depth !== childDepth - 1)
+    ) return false;
+    if (depth === 1) return parentThreadId === leader;
+    if (parentThreadId === leader) return false;
+
+    childDepth = depth;
+    currentThreadId = parentThreadId;
+  }
+  return false;
+}
+
 export function normalizeSubagentTrackingState(input: unknown): SubagentTrackingState {
   const base = createSubagentTrackingState();
   if (!input || typeof input !== 'object') return base;
@@ -239,6 +432,15 @@ export function normalizeSubagentTrackingState(input: unknown): SubagentTracking
           : 1,
         ...(typeof candidate.mode === 'string' && candidate.mode.trim().length > 0 ? { mode: candidate.mode } : {}),
         ...(typeof candidate.role === 'string' && candidate.role.trim().length > 0 ? { role: candidate.role.trim() } : {}),
+        ...(typeof candidate.thread_source === 'string' && candidate.thread_source.trim().length > 0
+          ? { thread_source: candidate.thread_source.trim() }
+          : {}),
+        ...(typeof candidate.parent_thread_id === 'string' && candidate.parent_thread_id.trim().length > 0
+          ? { parent_thread_id: candidate.parent_thread_id.trim() }
+          : {}),
+        ...(typeof candidate.depth === 'number' && Number.isInteger(candidate.depth) && candidate.depth > 0
+          ? { depth: candidate.depth }
+          : {}),
         ...(typeof candidate.lane_id === 'string' && candidate.lane_id.trim().length > 0 ? { lane_id: candidate.lane_id.trim() } : {}),
         ...(typeof candidate.scope === 'string' && candidate.scope.trim().length > 0 ? { scope: candidate.scope.trim() } : {}),
         ...(typeof candidate.agent_nickname === 'string' && candidate.agent_nickname.trim().length > 0 ? { agent_nickname: candidate.agent_nickname.trim() } : {}),
@@ -294,12 +496,24 @@ export async function readSubagentTrackingState(cwd: string): Promise<SubagentTr
   }
 }
 
-export async function writeSubagentTrackingState(cwd: string, state: SubagentTrackingState): Promise<string> {
+async function writeSubagentTrackingStateUnlocked(cwd: string, state: SubagentTrackingState): Promise<string> {
   const normalized = normalizeSubagentTrackingState(state);
   const path = subagentTrackingPath(cwd);
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(normalized, null, 2)}\n`);
+  const tmpPath = `${path}.tmp.${process.pid}.${randomUUID()}`;
+  await writeFile(tmpPath, `${JSON.stringify(normalized, null, 2)}\n`);
+  try {
+    await rename(tmpPath, path);
+  } catch (error) {
+    await rm(tmpPath, { force: true });
+    throw error;
+  }
   return path;
+}
+
+export async function writeSubagentTrackingState(cwd: string, state: SubagentTrackingState): Promise<string> {
+  const path = subagentTrackingPath(cwd);
+  return withSubagentTrackingLock(path, () => writeSubagentTrackingStateUnlocked(cwd, state));
 }
 
 export function recordSubagentTurn(
@@ -337,8 +551,11 @@ export function recordSubagentTurn(
     : requestedLeaderThreadId;
   const preserveExistingSubagent = existingKind === 'subagent' && requestedKind !== 'subagent';
   const preserveKnownLeader = requestedKind === 'subagent'
-    && (existingKind === 'leader' || existingLeaderThreadId === threadId);
-  const leaderThreadId = preserveKnownLeader
+    && (existingLeaderThreadId === threadId || (!existingLeaderThreadId && existingKind === 'leader'));
+  const replaceLeader = input.replaceLeader === true && requestedKind === 'leader';
+  const leaderThreadId = replaceLeader
+    ? threadId
+    : preserveKnownLeader
     ? existingLeaderThreadId || threadId
     : existingLeaderThreadId
       || requestedSessionLeaderThreadId
@@ -350,7 +567,8 @@ export function recordSubagentTurn(
       : requestedKind ?? (threadId === leaderThreadId ? 'leader' : existingKind ?? 'subagent');
   const requestedStatus = normalizeSubagentStatus(input.status);
   const preservedStatus = normalizeSubagentStatus(existingThread?.status);
-  const preserveCompletionEvidence = input.preserveCompletionEvidence === true;
+  const sameTurn = Boolean(input.turnId?.trim() && existingThread?.last_turn_id === input.turnId.trim());
+  const preserveCompletionEvidence = input.preserveCompletionEvidence === true || sameTurn;
   const clearsPriorCompletion = input.completed !== true
     && preserveCompletionEvidence !== true
     && Boolean(existingThread?.completed_at);
@@ -369,7 +587,7 @@ export function recordSubagentTurn(
     kind,
     first_seen_at: existingThread?.first_seen_at ?? timestamp,
     last_seen_at: timestamp,
-    turn_count: (existingThread?.turn_count ?? 0) + 1,
+    turn_count: (existingThread?.turn_count ?? 0) + (sameTurn ? 0 : 1),
     ...(input.turnId?.trim() ? { last_turn_id: input.turnId.trim() } : existingThread?.last_turn_id ? { last_turn_id: existingThread.last_turn_id } : {}),
     ...(input.completed
       ? {
@@ -380,6 +598,15 @@ export function recordSubagentTurn(
       : preservedCompletion),
     ...(input.mode?.trim() ? { mode: input.mode.trim() } : existingThread?.mode ? { mode: existingThread.mode } : {}),
     ...(input.role?.trim() ? { role: input.role.trim() } : existingThread?.role ? { role: existingThread.role } : {}),
+    ...(input.threadSource?.trim()
+      ? { thread_source: input.threadSource.trim() }
+      : existingThread?.thread_source ? { thread_source: existingThread.thread_source } : {}),
+    ...(input.parentThreadId?.trim()
+      ? { parent_thread_id: input.parentThreadId.trim() }
+      : existingThread?.parent_thread_id ? { parent_thread_id: existingThread.parent_thread_id } : {}),
+    ...(typeof input.depth === 'number' && Number.isInteger(input.depth) && input.depth > 0
+      ? { depth: input.depth }
+      : existingThread?.depth ? { depth: existingThread.depth } : {}),
     ...(input.laneId?.trim() ? { lane_id: input.laneId.trim() } : existingThread?.lane_id ? { lane_id: existingThread.lane_id } : {}),
     ...(input.scope?.trim() ? { scope: input.scope.trim() } : existingThread?.scope ? { scope: existingThread.scope } : {}),
     ...(input.agentNickname?.trim()
@@ -424,10 +651,13 @@ export function recordSubagentTurn(
 }
 
 export async function recordSubagentTurnForSession(cwd: string, input: RecordSubagentTurnInput): Promise<SubagentTrackingState> {
-  const current = await readSubagentTrackingState(cwd);
-  const next = recordSubagentTurn(current, input);
-  await writeSubagentTrackingState(cwd, next);
-  return next;
+  const path = subagentTrackingPath(cwd);
+  return withSubagentTrackingLock(path, async () => {
+    const current = await readSubagentTrackingState(cwd);
+    const next = recordSubagentTurn(current, input);
+    await writeSubagentTrackingStateUnlocked(cwd, next);
+    return next;
+  });
 }
 
 export function summarizeSubagentSession(

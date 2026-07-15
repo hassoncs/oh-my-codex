@@ -383,6 +383,9 @@ async function main() {
   const latestUserInput = safeString(inputMessages.length > 0 ? inputMessages[inputMessages.length - 1] : '');
   const isTurnComplete = isTurnCompletePayload(payload);
   const isNotifyFallbackTaskComplete = isNotifyFallbackTaskCompletePayload(payload);
+  const fallbackTrackerHandled = isNotifyFallbackTaskComplete
+    && process.env.OMX_NOTIFY_FALLBACK_TRACKER_HANDLED === '1'
+    && sameFilePath(safeString(process.env.OMX_NOTIFY_HOOK_TRUSTED_MANAGED_CWD || ''), cwd);
 
   // Team worker detection via environment variable
   const teamWorkerEnv = process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER; // e.g., "fix-ts/worker-1"
@@ -435,7 +438,7 @@ async function main() {
   }
 
   // 0.5. Track leader + native subagent thread activity (lead session only)
-  if (!isTeamWorker) {
+  if (!isTeamWorker && !fallbackTrackerHandled) {
     try {
       const threadId = safeString(payload['thread-id'] || payload.thread_id || '');
       const turnId = safeString(payload['turn-id'] || payload.turn_id || '');

@@ -50,6 +50,9 @@ export interface RalplanReviewResult {
   lane_id?: string;
   tracker_path?: string;
   new_lane_reason?: string;
+  completed_at?: string;
+  completed_turn_id?: string;
+  sequence_index?: number;
 }
 
 export interface RalplanConsensusGate {
@@ -58,10 +61,10 @@ export interface RalplanConsensusGate {
   sequence: ['architect-review', 'critic-review'];
   planning_artifacts_are_not_consensus: true;
   required_review_roles: ['architect', 'critic'];
-  ralplan_architect_review: (RalplanReviewResult & { agent_role: 'architect'; iteration: number }) | null;
-  ralplan_critic_review: (RalplanReviewResult & { agent_role: 'critic'; iteration: number }) | null;
-  architect_review: (RalplanReviewResult & { agent_role: 'architect'; iteration: number }) | null;
-  critic_review: (RalplanReviewResult & { agent_role: 'critic'; iteration: number }) | null;
+  ralplan_architect_review: (RalplanReviewResult & { agent_role: 'architect'; iteration: number; sequence_index: number }) | null;
+  ralplan_critic_review: (RalplanReviewResult & { agent_role: 'critic'; iteration: number; sequence_index: number }) | null;
+  architect_review: (RalplanReviewResult & { agent_role: 'architect'; iteration: number; sequence_index: number }) | null;
+  critic_review: (RalplanReviewResult & { agent_role: 'critic'; iteration: number; sequence_index: number }) | null;
   blocked_reason: string | null;
 }
 
@@ -201,11 +204,13 @@ function buildRalplanConsensusGate(
       ...latestArchitect,
       agent_role: 'architect' as const,
       iteration: architectReviews.length,
+      sequence_index: architectReviews.length * 2 - 1,
     };
     const ralplanCriticReview = {
       ...latestCritic,
       agent_role: 'critic' as const,
       iteration: criticReviews.length,
+      sequence_index: criticReviews.length * 2,
     };
     const gate: RalplanConsensusGate = {
       required: true,
@@ -241,10 +246,10 @@ function buildRalplanConsensusGate(
       ? 'critic_review_missing_or_not_approved'
       : 'missing_sequential_architect_then_critic_approval';
   const ralplanArchitectReview = latestArchitect
-    ? { ...latestArchitect, agent_role: 'architect' as const, iteration: architectReviews.length }
+    ? { ...latestArchitect, agent_role: 'architect' as const, iteration: architectReviews.length, sequence_index: architectReviews.length * 2 - 1 }
     : null;
   const ralplanCriticReview = latestCritic
-    ? { ...latestCritic, agent_role: 'critic' as const, iteration: criticReviews.length }
+    ? { ...latestCritic, agent_role: 'critic' as const, iteration: criticReviews.length, sequence_index: criticReviews.length * 2 }
     : null;
 
   return {

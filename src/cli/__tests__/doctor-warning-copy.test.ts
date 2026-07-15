@@ -5,6 +5,7 @@ import {
 	mkdir,
 	mkdtemp,
 	readFile,
+	realpath,
 	rm,
 	symlink,
 	writeFile,
@@ -257,6 +258,52 @@ describe("omx doctor onboarding warning copy", () => {
 			assert.equal(check.status, "warn");
 			assert.match(check.message, /com\.example\.codex&encoded-guard/);
 			assert.match(check.message, /Codex app-server MCP child dedupe/);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("does not follow oversized or symlinked LaunchAgent output artifacts", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-external-output-"));
+		try {
+			const home = join(wd, "home");
+			const launchAgentsDir = join(home, "Library", "LaunchAgents");
+			const logPath = join(wd, "codex-guard.log");
+			const logAliasPath = join(wd, "codex-guard-alias.log");
+			await mkdir(launchAgentsDir, { recursive: true });
+			await writeFile(
+				logPath,
+				`CODEX_MCP_GUARD_DEDUPE_APP_CHILDREN=1\n${"kill app-server\n".repeat(20_000)}`,
+			);
+			await symlink(logPath, logAliasPath);
+			await writeFile(
+				join(launchAgentsDir, "com.example.codex-output.plist"),
+				[
+					'<?xml version="1.0" encoding="UTF-8"?>',
+					'<plist version="1.0">',
+					"<dict>",
+					"<key>Label</key>",
+					"<string>com.example.codex-output</string>",
+					"<key>ProgramArguments</key>",
+					"<array>",
+					"<string>/bin/echo</string>",
+					"<string>codex monitor</string>",
+					`<string>${logPath}</string>`,
+					`<string>${logAliasPath}</string>`,
+					"</array>",
+					"</dict>",
+					"</plist>",
+					"",
+				].join("\n"),
+			);
+
+			assert.equal(
+				await checkExternalCodexProcessGuards({
+					platform: "darwin",
+					homeDir: home,
+				}),
+				null,
+			);
 		} finally {
 			await rm(wd, { recursive: true, force: true });
 		}
@@ -2037,7 +2084,13 @@ command = "node"
 				res.stdout.match(/\[!!\] GPT-5\.6 multi-agent compatibility:/g)?.length,
 				1,
 			);
-			assert.match(res.stdout, new RegExp(`project scope config at ${configPath}`));
+			const canonicalConfigPath = await realpath(configPath);
+			assert.match(
+				res.stdout,
+				new RegExp(
+					`project scope config at ${canonicalConfigPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+				),
+			);
 			assert.match(res.stdout, /features\.multi_agent \(custom; custom-value\)/);
 			assert.match(res.stdout, /agents\.max_threads \(custom; custom-value\)/);
 			assert.match(res.stdout, /agents\.max_depth \(custom; custom-value\)/);

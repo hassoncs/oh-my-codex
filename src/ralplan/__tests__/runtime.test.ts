@@ -19,6 +19,8 @@ async function readScopedRalplanState(cwd: string, sessionId: string): Promise<R
 
 async function writeNativeSubagentTracking(cwd: string, sessionId: string): Promise<void> {
   const now = '2026-05-28T00:00:00.000Z';
+  const architectCompletedAt = '2026-05-28T00:01:00.000Z';
+  const criticCompletedAt = '2026-05-28T00:02:00.000Z';
   const trackingPath = subagentTrackingPath(cwd);
   await mkdir(join(trackingPath, '..'), { recursive: true });
   await writeFile(trackingPath, JSON.stringify({
@@ -39,17 +41,27 @@ async function writeNativeSubagentTracking(cwd: string, sessionId: string): Prom
           'thread-architect': {
             thread_id: 'thread-architect',
             kind: 'subagent',
+            role: 'architect',
+            thread_source: 'subagent',
+            parent_thread_id: 'thread-leader',
+            depth: 1,
             first_seen_at: now,
-            last_seen_at: now,
-            completed_at: now,
+            last_seen_at: architectCompletedAt,
+            completed_at: architectCompletedAt,
+            last_completed_turn_id: 'turn-architect-1',
             turn_count: 1,
           },
           'thread-critic': {
             thread_id: 'thread-critic',
             kind: 'subagent',
+            role: 'critic',
+            thread_source: 'subagent',
+            parent_thread_id: 'thread-leader',
+            depth: 1,
             first_seen_at: now,
-            last_seen_at: now,
-            completed_at: now,
+            last_seen_at: criticCompletedAt,
+            completed_at: criticCompletedAt,
+            last_completed_turn_id: 'turn-critic-1',
             turn_count: 1,
           },
         },
@@ -145,6 +157,7 @@ describe('ralplan runtime', () => {
         ralplan_architect_review: {
           agent_role: 'architect',
           iteration: 1,
+          sequence_index: 1,
           verdict: 'approve',
           summary: 'architect-ok',
           artifacts: { architected: true },
@@ -152,6 +165,7 @@ describe('ralplan runtime', () => {
         ralplan_critic_review: {
           agent_role: 'critic',
           iteration: 1,
+          sequence_index: 2,
           verdict: 'approve',
           summary: 'critic-ok',
           artifacts: { critiqued: true },
@@ -159,6 +173,7 @@ describe('ralplan runtime', () => {
         architect_review: {
           agent_role: 'architect',
           iteration: 1,
+          sequence_index: 1,
           verdict: 'approve',
           summary: 'architect-ok',
           artifacts: { architected: true },
@@ -166,6 +181,7 @@ describe('ralplan runtime', () => {
         critic_review: {
           agent_role: 'critic',
           iteration: 1,
+          sequence_index: 2,
           verdict: 'approve',
           summary: 'critic-ok',
           artifacts: { critiqued: true },
@@ -314,6 +330,91 @@ describe('ralplan runtime', () => {
     }
   });
 
+  it('binds reused native review lanes to current tracker completion turns', async () => {
+    async function runCase(matchCurrentCompletion: boolean): Promise<Awaited<ReturnType<typeof runRalplanConsensus>>> {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-ralplan-runtime-reused-completion-${matchCurrentCompletion ? 'match' : 'stale'}-`));
+      const sessionId = `sess-ralplan-reused-completion-${matchCurrentCompletion ? 'match' : 'stale'}`;
+      try {
+        await mkdir(join(sessionStatePath(cwd, sessionId), '..'), { recursive: true });
+        await writeFile(join(sessionStatePath(cwd, sessionId), '..', '..', '..', 'session.json'), JSON.stringify({ session_id: sessionId }));
+        await writeNativeSubagentTracking(cwd, sessionId);
+
+        async function recordCycleTwoCompletion(threadId: 'thread-architect' | 'thread-critic'): Promise<void> {
+          if (!matchCurrentCompletion) return;
+          const trackingPath = subagentTrackingPath(cwd);
+          const tracking = JSON.parse(await readFile(trackingPath, 'utf-8'));
+          const thread = tracking.sessions[sessionId].threads[threadId];
+          const role = threadId === 'thread-architect' ? 'architect' : 'critic';
+          thread.completed_at = role === 'architect'
+            ? '2026-05-28T00:03:00.000Z'
+            : '2026-05-28T00:04:00.000Z';
+          thread.last_completed_turn_id = `turn-${role}-2`;
+          await writeFile(trackingPath, JSON.stringify(tracking, null, 2));
+        }
+
+        return await runRalplanConsensus({
+          async draft(ctx) {
+            const plansDir = join(cwd, '.omx', 'plans');
+            await mkdir(plansDir, { recursive: true });
+            const prdPath = join(plansDir, 'prd-reused-completion.md');
+            await writeFile(prdPath, `# plan ${ctx.iteration}\n`);
+            await writeFile(join(plansDir, 'test-spec-reused-completion.md'), '# tests\n');
+            return { summary: `draft-${ctx.iteration}`, planPath: prdPath };
+          },
+          async architectReview(ctx) {
+            if (ctx.iteration === 2) {
+              assert.equal(ctx.reusableRoleLanes.architect?.thread_id, 'thread-architect');
+              await recordCycleTwoCompletion('thread-architect');
+            }
+            return {
+              verdict: 'approve',
+              summary: `architect-${ctx.iteration}`,
+              provenance_kind: 'native_subagent',
+              session_id: sessionId,
+              thread_id: 'thread-architect',
+              completed_turn_id: `turn-architect-${ctx.iteration}`,
+              agent_role: 'architect',
+              tracker_path: '.omx/state/subagent-tracking.json',
+            };
+          },
+          async criticReview(ctx) {
+            if (ctx.iteration === 2) {
+              assert.equal(ctx.reusableRoleLanes.critic?.thread_id, 'thread-critic');
+              await recordCycleTwoCompletion('thread-critic');
+            }
+            return {
+              verdict: ctx.iteration === 1 ? 'iterate' : 'approve',
+              summary: `critic-${ctx.iteration}`,
+              provenance_kind: 'native_subagent',
+              session_id: sessionId,
+              thread_id: 'thread-critic',
+              completed_turn_id: `turn-critic-${ctx.iteration}`,
+              agent_role: 'critic',
+              tracker_path: '.omx/state/subagent-tracking.json',
+            };
+          },
+        }, {
+          task: 'bind reused review completion',
+          cwd,
+          sessionId,
+          maxIterations: 2,
+          requireNativeSubagents: true,
+        });
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+
+    const stale = await runCase(false);
+    assert.equal(stale.status, 'failed');
+    assert.equal(stale.ralplanConsensusGate.complete, false);
+    assert.match(stale.ralplanConsensusGate.blocked_reason || '', /native_subagent_consensus_evidence_missing/);
+
+    const matching = await runCase(true);
+    assert.equal(matching.status, 'completed');
+    assert.equal(matching.ralplanConsensusGate.complete, true);
+  });
+
   it('fails Autopilot-required consensus when approvals lack native subagent provenance', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-runtime-native-required-missing-'));
     const sessionId = 'sess-ralplan-native-required-missing';
@@ -456,7 +557,8 @@ describe('ralplan runtime', () => {
   it('preserves existing tracker completion for review threads without native-required mode', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-runtime-preserve-completion-'));
     const sessionId = 'sess-ralplan-preserve-completion';
-    const completedAt = '2026-05-28T00:00:00.000Z';
+    const architectCompletedAt = '2026-05-28T00:01:00.000Z';
+    const criticCompletedAt = '2026-05-28T00:02:00.000Z';
     try {
       await mkdir(join(sessionStatePath(cwd, sessionId), '..'), { recursive: true });
       await writeFile(join(sessionStatePath(cwd, sessionId), '..', '..', '..', 'session.json'), JSON.stringify({ session_id: sessionId }));
@@ -498,8 +600,8 @@ describe('ralplan runtime', () => {
       const tracking = JSON.parse(await readFile(subagentTrackingPath(cwd), 'utf-8')) as {
         sessions?: Record<string, { threads?: Record<string, { completed_at?: string }> }>;
       };
-      assert.equal(tracking.sessions?.[sessionId]?.threads?.['thread-architect']?.completed_at, completedAt);
-      assert.equal(tracking.sessions?.[sessionId]?.threads?.['thread-critic']?.completed_at, completedAt);
+      assert.equal(tracking.sessions?.[sessionId]?.threads?.['thread-architect']?.completed_at, architectCompletedAt);
+      assert.equal(tracking.sessions?.[sessionId]?.threads?.['thread-critic']?.completed_at, criticCompletedAt);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -528,6 +630,7 @@ describe('ralplan runtime', () => {
             provenance_kind: 'native_subagent',
             session_id: sessionId,
             thread_id: 'thread-architect',
+            completed_turn_id: 'turn-architect-1',
             artifact_path: '.omx/artifacts/architect.md',
             agent_role: 'architect',
             tracker_path: '.omx/state/subagent-tracking.json',
@@ -540,6 +643,7 @@ describe('ralplan runtime', () => {
             provenance_kind: 'native_subagent',
             session_id: sessionId,
             thread_id: 'thread-critic',
+            completed_turn_id: 'turn-critic-1',
             artifact_path: '.omx/artifacts/critic.md',
             agent_role: 'critic',
             tracker_path: '.omx/state/subagent-tracking.json',
@@ -594,6 +698,7 @@ describe('ralplan runtime', () => {
             provenance_kind: 'native_subagent',
             session_id: sessionId,
             thread_id: 'thread-architect',
+            completed_turn_id: 'turn-architect-1',
             artifact_path: '.omx/artifacts/architect.md',
             agent_role: 'architect',
             tracker_path: '.omx/state/subagent-tracking.json',
@@ -606,6 +711,7 @@ describe('ralplan runtime', () => {
             provenance_kind: 'native_subagent',
             session_id: sessionId,
             thread_id: 'thread-critic',
+            completed_turn_id: 'turn-critic-1',
             artifact_path: '.omx/artifacts/critic.md',
             agent_role: 'critic',
             tracker_path: '.omx/state/subagent-tracking.json',

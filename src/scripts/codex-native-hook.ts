@@ -16,6 +16,7 @@ import {
   type SkillActiveEntry,
 } from "../state/skill-active.js";
 import {
+  hasVerifiedNativeSubagentLineage,
   isTrustedSubagentThread,
   readSubagentSessionSummary,
   readSubagentSessionLedger,
@@ -329,6 +330,7 @@ function shouldSuppressParentWorkflowStopForSideConversation(payload: CodexHookP
 
 interface NativeSubagentSessionStartMetadata {
   parentThreadId: string;
+  depth?: number;
   agentNickname?: string;
   agentRole?: string;
 }
@@ -376,12 +378,14 @@ function readNativeSubagentSessionStartMetadata(transcriptPath: string): NativeS
     const subagent = safeObject(source.subagent);
     const threadSpawn = safeObject(subagent.thread_spawn);
     const parentThreadId = safeString(threadSpawn.parent_thread_id).trim();
+    const depth = safePositiveInteger(threadSpawn.depth);
     if (!parentThreadId) return null;
 
     const agentNickname = safeString(threadSpawn.agent_nickname ?? payload.agent_nickname).trim();
     const agentRole = safeString(threadSpawn.agent_role ?? payload.agent_role).trim();
     return {
       parentThreadId,
+      ...(depth !== null ? { depth } : {}),
       ...(agentNickname ? { agentNickname } : {}),
       ...(agentRole ? { agentRole } : {}),
     };
@@ -404,7 +408,7 @@ async function recordNativeSubagentSessionStart(
     parentThreadId,
   ].filter(Boolean))];
   for (const sessionId of trackingSessionIds) {
-    if (parentThreadId && parentThreadId !== childThreadId) {
+    if ((metadata.depth ?? 1) === 1 && parentThreadId && parentThreadId !== childThreadId) {
       await recordSubagentTurnForSession(cwd, {
         sessionId,
         threadId: parentThreadId,
@@ -417,6 +421,15 @@ async function recordNativeSubagentSessionStart(
       kind: 'subagent',
       ...(parentThreadId && parentThreadId !== childThreadId ? { leaderThreadId: parentThreadId } : {}),
       mode: metadata.agentRole,
+      ...(metadata.agentRole ? { role: metadata.agentRole } : {}),
+      ...(metadata.depth
+        ? {
+            threadSource: 'subagent',
+            parentThreadId,
+            depth: metadata.depth,
+          }
+        : {}),
+      ...(metadata.agentNickname ? { agentNickname: metadata.agentNickname } : {}),
     }).catch(() => {});
   }
   await appendToLog(cwd, {
@@ -425,6 +438,7 @@ async function recordNativeSubagentSessionStart(
     native_owner_session_id: metadata.parentThreadId,
     native_session_id: childSessionId,
     parent_thread_id: metadata.parentThreadId,
+    ...(metadata.depth ? { depth: metadata.depth } : {}),
     ...(metadata.agentNickname ? { agent_nickname: metadata.agentNickname } : {}),
     ...(metadata.agentRole ? { agent_role: metadata.agentRole } : {}),
     ...(transcriptPath ? { transcript_path: transcriptPath } : {}),
@@ -442,14 +456,21 @@ async function nativeSubagentSessionStartBelongsToCanonicalSession(
   if (!parentThreadId) return false;
 
   const currentNativeSessionId = safeString(currentSessionState?.native_session_id).trim();
-  if (currentNativeSessionId && currentNativeSessionId === parentThreadId) {
+  if (metadata.depth === undefined) {
+    if (currentNativeSessionId && currentNativeSessionId === parentThreadId) return true;
+    const summary = await readSubagentSessionSummary(cwd, canonicalSessionId).catch(() => null);
+    return summary?.leaderThreadId === parentThreadId || summary?.allThreadIds.includes(parentThreadId) === true;
+  }
+  if (metadata.depth === 1 && currentNativeSessionId && currentNativeSessionId === parentThreadId) {
     return true;
   }
 
-  const summary = await readSubagentSessionSummary(cwd, canonicalSessionId).catch(() => null);
-  if (!summary) return false;
-  if (summary.leaderThreadId === parentThreadId) return true;
-  return summary.allThreadIds.includes(parentThreadId);
+  const tracking = await readSubagentTrackingState(cwd).catch(() => null);
+  const session = tracking?.sessions[canonicalSessionId];
+  if (metadata.depth === 1) return session?.leader_thread_id === parentThreadId;
+  const parent = session?.threads[parentThreadId];
+  return parent?.depth === metadata.depth - 1
+    && hasVerifiedNativeSubagentLineage(session, parentThreadId);
 }
 
 async function isNativeSubagentHook(

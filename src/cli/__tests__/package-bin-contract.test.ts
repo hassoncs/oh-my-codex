@@ -38,6 +38,7 @@ describe('package bin contract', () => {
     );
 
     assert.deepEqual(pkg.bin, { omx: 'dist/cli/omx.js' });
+    assert.equal(pkg.scripts?.build, 'node src/scripts/build.js');
     assert.equal(pkg.scripts?.['build:explore'], 'cargo build -p omx-explore-harness');
     assert.equal(pkg.scripts?.['build:explore:release'], 'node dist/scripts/build-explore-harness.js');
     assert.equal(pkg.scripts?.['build:full'], 'npm run build && npm run build:explore:release && npm run build:sparkshell && npm run build:api');
@@ -91,6 +92,7 @@ describe('package bin contract', () => {
     }
 
     assert.equal(pkg.files?.includes('dist/'), true, 'expected package files allowlist to include dist/');
+    assert.equal(pkg.files?.includes('src/scripts/'), true, 'expected package files allowlist to include runtime build/test helpers');
     assert.equal(pkg.files?.includes('bin/'), false, 'did not expect broad bin/ allowlist in package files');
     assert.equal(pkg.files?.includes('agents/'), false, 'native agent TOMLs are setup output, not package input');
     assert.ok(pkg.files?.includes('Cargo.toml'));
@@ -103,6 +105,29 @@ describe('package bin contract', () => {
     const compiledCliPath = join(process.cwd(), 'dist', 'cli', 'index.js');
 
     const prepareBuildSource = readFileSync(join(process.cwd(), 'src', 'scripts', 'prepare-build.js'), 'utf-8');
+    const buildSource = readFileSync(join(process.cwd(), 'src', 'scripts', 'build.js'), 'utf-8');
+    const distLockSource = readFileSync(join(process.cwd(), 'src', 'scripts', 'dist-lock.js'), 'utf-8');
+    const distChildLeaseSource = readFileSync(join(process.cwd(), 'src', 'scripts', 'dist-lock-child-lease.js'), 'utf-8');
+    const testRunnerSource = readFileSync(join(process.cwd(), 'src', 'scripts', 'run-test-files.ts'), 'utf-8');
+    assert.match(distLockSource, /dist-build\.lock/);
+    assert.match(distLockSource, /linkSync/);
+    assert.match(distLockSource, /\.recovery/);
+    assert.match(distLockSource, /process_group_id/);
+    assert.match(distLockSource, /process_start_identity/);
+    assert.match(distLockSource, /activateOwnedChildLease/);
+    assert.match(distLockSource, /RECOVERY_CANDIDATE_MAX_MS/);
+    assert.match(distLockSource, /dist_process_tree_authority_unsupported:win32/);
+    assert.match(distChildLeaseSource, /dist_child_lease_activation_timeout/);
+    assert.match(buildSource, /compiled test reader/);
+    assert.match(buildSource, /activateOwnedChildLease/);
+    assert.match(buildSource, /assertDistProcessTreeAuthority/);
+    assert.match(buildSource, /dist_build_reentrant_reader_lock/);
+    assert.match(buildSource, /dist_build_lock_timeout/);
+    assert.match(testRunnerSource, /dist-reader-/);
+    assert.match(testRunnerSource, /activateOwnedChildLease/);
+    assert.match(testRunnerSource, /assertDistProcessTreeAuthority/);
+    assert.match(testRunnerSource, /waiting for build to finish/);
+    assert.match(testRunnerSource, /dist_reader_lock_timeout/);
     assert.match(prepareBuildSource, /dist.*cli.*omx\.js/s);
     assert.match(prepareBuildSource, /dist.*scripts.*postinstall\.js/s);
     assert.match(prepareBuildSource, /npm.*run.*build/s);
@@ -193,6 +218,10 @@ describe('package bin contract', () => {
 
     const binEntry = results[0]?.files?.find((file) => file.path === 'dist/cli/omx.js');
     assert.ok(binEntry, 'expected npm pack output to include dist/cli/omx.js');
+    const distLockEntry = results[0]?.files?.find((file) => file.path === 'src/scripts/dist-lock.js');
+    const distChildLeaseEntry = results[0]?.files?.find((file) => file.path === 'src/scripts/dist-lock-child-lease.js');
+    assert.ok(distLockEntry, 'expected npm pack output to include dist lock runtime');
+    assert.ok(distChildLeaseEntry, 'expected npm pack output to include dist child lease gate');
 
     const packagedHarnessPath = process.platform === 'win32' ? 'bin/omx-explore-harness.exe' : 'bin/omx-explore-harness';
     const packagedHarnessEntry = results[0]?.files?.find((file) => file.path === packagedHarnessPath);

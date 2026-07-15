@@ -55,7 +55,11 @@ async function runSetupWithCapturedLogs(
     logs.push(args.map((arg) => String(arg)).join(" "));
   };
   try {
-    await setup({ ...TEST_CODEX_PROBES, ...options });
+    await setup({
+      ...TEST_CODEX_PROBES,
+      installMode: "legacy",
+      ...options,
+    });
     return logs.join("\n");
   } finally {
     console.log = originalLog;
@@ -71,7 +75,11 @@ describe("omx setup refresh summary and dry-run behavior", () => {
     const previousCwd = process.cwd();
     process.chdir(wd);
     try {
-      await setup({ ...TEST_CODEX_PROBES, ...options });
+      await setup({
+        ...TEST_CODEX_PROBES,
+        installMode: "legacy",
+        ...options,
+      });
     } finally {
       process.chdir(previousCwd);
     }

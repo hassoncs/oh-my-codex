@@ -157,6 +157,9 @@ export function buildAutopilotRalplanUltragoalGateError(
     const renderReview = (label: string, review: typeof architect) => [
       `  ${label} thread_id: ${review.thread_id ?? 'missing'} found: ${review.thread_found ? 'yes' : 'no'} kind=${review.kind ?? 'missing'} completed=${review.completed ? 'yes' : 'no'}`,
       `    session_id: ${review.session_id ?? 'missing'} session_found=${review.session_found ? 'yes' : 'no'}`,
+      `    tracker_path: ${review.tracker_path}${review.tracker_path === review.expected_tracker_path ? '' : ` expected=${review.expected_tracker_path}`}`,
+      `    activity: turn=${review.tracker_last_turn_id ?? 'missing'} seen=${review.tracker_last_seen_at ?? 'missing'} current=${review.tracker_has_current_turn ? 'yes' : 'no'}`,
+      `    completion: review=${review.review_completed_turn_id ?? 'missing'} tracker=${review.tracker_last_completed_turn_id ?? 'missing'} at=${review.tracker_completed_at ?? 'missing'}`,
       review.problem ? `    problem: ${review.problem}` : null,
     ].filter((line): line is string => Boolean(line)).join('\n');
     const guidance = decision.unsupportedNativeSubagentGuidance;

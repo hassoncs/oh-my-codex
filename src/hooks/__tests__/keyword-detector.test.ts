@@ -16,6 +16,7 @@ import {
 import { SKILL_ACTIVE_STATE_FILE } from '../../state/skill-active.js';
 import { isUnderspecifiedForExecution, applyRalplanGate } from '../keyword-detector.js';
 import { KEYWORD_TRIGGER_DEFINITIONS } from '../keyword-registry.js';
+import { subagentTrackingPath } from '../../subagents/tracker.js';
 
 async function withIsolatedHome<T>(prefix: string, run: (homeDir: string) => Promise<T>): Promise<T> {
   const homeDir = await mkdtemp(join(tmpdir(), `omx-keyword-home-${prefix}-`));
@@ -4221,6 +4222,82 @@ describe('isUnderspecifiedForExecution', () => {
 });
 
 describe('applyRalplanGate', () => {
+  async function writeDurableNativeConsensus(cwd: string, sessionId: string): Promise<Record<string, unknown>> {
+    const trackingPath = subagentTrackingPath(cwd);
+    const architectCompletedAt = '2026-06-12T10:00:00.000Z';
+    const criticCompletedAt = '2026-06-12T10:01:00.000Z';
+    await mkdir(join(trackingPath, '..'), { recursive: true });
+    await writeFile(trackingPath, JSON.stringify({
+      schemaVersion: 1,
+      sessions: {
+        [sessionId]: {
+          session_id: sessionId,
+          leader_thread_id: 'thread-leader',
+          updated_at: criticCompletedAt,
+          threads: {
+            'thread-leader': {
+              thread_id: 'thread-leader',
+              kind: 'leader',
+              first_seen_at: '2026-06-12T09:59:00.000Z',
+              last_seen_at: '2026-06-12T09:59:00.000Z',
+              turn_count: 1,
+            },
+            'thread-architect': {
+              thread_id: 'thread-architect',
+              kind: 'subagent',
+              role: 'architect',
+              thread_source: 'subagent',
+              parent_thread_id: 'thread-leader',
+              depth: 1,
+              first_seen_at: architectCompletedAt,
+              last_seen_at: architectCompletedAt,
+              completed_at: architectCompletedAt,
+              last_turn_id: 'turn-architect-1',
+              last_completed_turn_id: 'turn-architect-1',
+              turn_count: 1,
+            },
+            'thread-critic': {
+              thread_id: 'thread-critic',
+              kind: 'subagent',
+              role: 'critic',
+              thread_source: 'subagent',
+              parent_thread_id: 'thread-leader',
+              depth: 1,
+              first_seen_at: criticCompletedAt,
+              last_seen_at: criticCompletedAt,
+              completed_at: criticCompletedAt,
+              last_turn_id: 'turn-critic-1',
+              last_completed_turn_id: 'turn-critic-1',
+              turn_count: 1,
+            },
+          },
+        },
+      },
+    }, null, 2));
+    return {
+      complete: true,
+      sequence: ['architect-review', 'critic-review'],
+      ralplan_architect_review: {
+        agent_role: 'architect',
+        provenance_kind: 'native_subagent',
+        verdict: 'approve',
+        session_id: sessionId,
+        thread_id: 'thread-architect',
+        completed_turn_id: 'turn-architect-1',
+        completed_at: architectCompletedAt,
+      },
+      ralplan_critic_review: {
+        agent_role: 'critic',
+        provenance_kind: 'native_subagent',
+        verdict: 'approve',
+        session_id: sessionId,
+        thread_id: 'thread-critic',
+        completed_turn_id: 'turn-critic-1',
+        completed_at: criticCompletedAt,
+      },
+    };
+  }
+
   it('gates short team follow-up when only PRD/test-spec artifacts exist', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-gate-followup-'));
     try {
@@ -4252,18 +4329,14 @@ describe('applyRalplanGate', () => {
         '# Approved plan\n\nLaunch hint: omx team 3:executor "Execute approved issue 831 plan"\n',
       );
       await writeFile(join(plansDir, 'test-spec-issue-831.md'), '# Test spec\n');
+      const consensusGate = await writeDurableNativeConsensus(cwd, 'sess-keyword-team-followup');
       await writeFile(join(stateDir, 'ralplan-state.json'), JSON.stringify({
         current_phase: 'complete',
         planning_complete: true,
-        ralplan_consensus_gate: {
-          complete: true,
-          sequence: ['architect-review', 'critic-review'],
-          ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', iteration: 1 },
-          ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', iteration: 1 },
-        },
+        ralplan_consensus_gate: consensusGate,
       }));
 
-      const result = applyRalplanGate(['team'], 'team으로 해줘', { cwd });
+      const result = applyRalplanGate(['team'], 'team으로 해줘', { cwd, requireNativeSubagents: true });
       assert.equal(result.gateApplied, false);
       assert.deepEqual(result.keywords, ['team']);
     } finally {
@@ -4324,18 +4397,18 @@ describe('applyRalplanGate', () => {
         '# Approved plan\n\nLaunch hint: omx ralph "Execute approved issue 832 plan"\n',
       );
       await writeFile(join(plansDir, 'test-spec-issue-832.md'), '# Test spec\n');
+      const consensusGate = await writeDurableNativeConsensus(cwd, 'sess-keyword-ralph-followup');
       await writeFile(join(stateDir, 'ralplan-state.json'), JSON.stringify({
         current_phase: 'complete',
         planning_complete: true,
-        ralplan_consensus_gate: {
-          complete: true,
-          sequence: ['architect-review', 'critic-review'],
-          ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', iteration: 1 },
-          ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', iteration: 1 },
-        },
+        ralplan_consensus_gate: consensusGate,
       }));
 
-      const result = applyRalplanGate(['ralph'], 'ralph please', { cwd, priorSkill: 'ralplan' });
+      const result = applyRalplanGate(['ralph'], 'ralph please', {
+        cwd,
+        priorSkill: 'ralplan',
+        requireNativeSubagents: true,
+      });
       assert.equal(result.gateApplied, false);
       assert.deepEqual(result.keywords, ['ralph']);
     } finally {

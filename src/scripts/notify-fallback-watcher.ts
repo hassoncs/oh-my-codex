@@ -17,6 +17,7 @@ import {
   resolveAutoNudgeSignature,
 } from './notify-hook/auto-nudge.js';
 import {
+  readCurrentSessionId,
   readScopedJsonIfExists,
 } from './notify-hook/state-io.js';
 import { checkPaneReadyForTeamSendKeys } from './notify-hook/team-tmux-guard.js';
@@ -32,6 +33,9 @@ import { isTerminalPhase } from './notify-hook/utils.js';
 import { isSessionStale, isSessionStateAuthoritativeForCwd, readSessionState } from '../hooks/session.js';
 import {
   DEFAULT_SUBAGENT_ACTIVE_WINDOW_MS,
+  hasVerifiedNativeSubagentLineage,
+  readSubagentTrackingState,
+  recordSubagentTurnForSession,
   readSubagentSessionSummary,
 } from '../subagents/tracker.js';
 import { listNotifyCanonicalActiveTeams } from './notify-hook/active-team.js';
@@ -168,11 +172,20 @@ const QUIET_ONCE_EVENT_TYPES = new Set(['watcher_start', 'watcher_once_complete'
 
 interface WatcherFileMeta {
   threadId: string;
+  threadSource: string;
+  sessionStartedAt: string;
+  parentThreadId: string;
+  depth: number | null;
+  role: string;
+  agentNickname: string;
+  provenanceError: string;
   offset: number;
   size: number;
   partial: string;
   decoder: StringDecoder;
 }
+
+type WatcherSessionMeta = Omit<WatcherFileMeta, 'offset' | 'size' | 'partial' | 'decoder'>;
 
 interface RalphContinueSteerState {
   enabled: boolean;
@@ -282,6 +295,9 @@ interface CycleActivitySummary {
 
 const fileState = new Map<string, WatcherFileMeta>();
 const seenTurnKeys = new Set<string>();
+const pendingTurnEvents = new Map<string, { meta: WatcherFileMeta; line: string; filePath: string }>();
+let trustedLeaderThreadId = '';
+let trustedLeaderSessionId = '';
 let stopping = false;
 let shutdownPromise: Promise<void> | null = null;
 const dispatchTickMax = Math.max(1, asNumber(argValue('--dispatch-max-per-tick', '5'), 5));
@@ -1319,6 +1335,9 @@ async function writeState(extra: Record<string, unknown> = {}): Promise<void> {
     max_lifetime_ms: maxLifetimeMs,
     tracked_files: fileState.size,
     seen_turns: seenTurnKeys.size,
+    pending_turns: pendingTurnEvents.size,
+    trusted_leader_session_id: trustedLeaderSessionId || null,
+    trusted_leader_thread_id: trustedLeaderThreadId || null,
     dispatch_drain: {
       enabled: true,
       max_per_tick: dispatchTickMax,
@@ -1597,7 +1616,13 @@ async function readFirstLine(path: string): Promise<string> {
   return idx >= 0 ? content.slice(0, idx) : content;
 }
 
-function shouldTrackSessionMeta(line: string): string | null {
+function asObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function shouldTrackSessionMeta(line: string): WatcherSessionMeta | null {
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(line) as Record<string, unknown>;
@@ -1607,8 +1632,45 @@ function shouldTrackSessionMeta(line: string): string | null {
   if (!parsed || parsed.type !== 'session_meta' || !parsed.payload) return null;
   const payload = parsed.payload as Record<string, unknown>;
   if (safeString(payload.cwd) !== cwd) return null;
-  const threadId = safeString(payload.id);
-  return threadId || null;
+  const threadId = safeString(payload.id).trim();
+  if (!threadId) return null;
+
+  const threadSource = safeString(payload.thread_source).trim();
+  const source = asObject(payload.source);
+  const subagent = asObject(source?.subagent);
+  const spawn = asObject(subagent?.thread_spawn);
+  const payloadParentThreadId = safeString(payload.parent_thread_id).trim();
+  const spawnParentThreadId = safeString(spawn?.parent_thread_id).trim();
+  const contradictoryParent = Boolean(
+    payloadParentThreadId
+    && spawnParentThreadId
+    && payloadParentThreadId !== spawnParentThreadId,
+  );
+  const parentThreadId = contradictoryParent ? '' : spawnParentThreadId || payloadParentThreadId;
+  const depthValue = asNumber(spawn?.depth as string | number | undefined, 0);
+  const depth = Number.isInteger(depthValue) && depthValue > 0 ? depthValue : null;
+  const provenanceError = threadSource !== 'subagent'
+    ? ''
+    : contradictoryParent
+      ? 'contradictory_parent_thread_id'
+      : !spawn
+        ? 'thread_spawn_missing'
+        : !parentThreadId
+          ? 'parent_thread_id_missing'
+          : depth === null
+            ? 'depth_missing_or_invalid'
+            : '';
+
+  return {
+    threadId,
+    threadSource,
+    sessionStartedAt: safeString(payload.timestamp || parsed.timestamp).trim(),
+    parentThreadId,
+    depth,
+    role: safeString(spawn?.agent_role).trim(),
+    agentNickname: safeString(spawn?.agent_nickname).trim(),
+    provenanceError,
+  };
 }
 
 async function discoverRolloutFiles(): Promise<string[]> {
@@ -1645,13 +1707,19 @@ function buildNotifyPayload(threadId: string, turnId: string, lastMessage: strin
   };
 }
 
-async function invokeNotifyHook(payload: Record<string, unknown>, filePath: string): Promise<void> {
+async function invokeNotifyHook(
+  payload: Record<string, unknown>,
+  filePath: string,
+  trackerHandled: boolean,
+  trackerOutcome: FallbackTrackerOutcome,
+): Promise<boolean> {
   const result = spawnSync(process.execPath, [notifyScript, JSON.stringify(payload)], {
     cwd,
     encoding: 'utf-8',
     env: {
       ...process.env,
       OMX_NOTIFY_HOOK_TRUSTED_MANAGED_CWD: cwd,
+      OMX_NOTIFY_FALLBACK_TRACKER_HANDLED: trackerHandled ? '1' : '',
     },
     windowsHide: true,
   });
@@ -1662,9 +1730,161 @@ async function invokeNotifyHook(payload: Record<string, unknown>, filePath: stri
     thread_id: (payload as Record<string, string>)['thread-id'],
     turn_id: (payload as Record<string, string>)['turn-id'],
     file: filePath,
+    tracker_outcome: trackerOutcome,
     reason: ok ? 'sent' : 'notify_hook_failed',
     error: ok ? undefined : (result.stderr || result.stdout || '').trim().slice(0, 240),
   });
+  return ok;
+}
+
+type FallbackTrackerOutcome = 'not-subagent' | 'recorded' | 'rejected' | 'retry';
+
+function sessionStateMatchesWatcherSession(sessionId: string, sessionState: Awaited<ReturnType<typeof readSessionState>>): boolean {
+  if (!sessionState) return false;
+  return sessionId === safeString(sessionState.session_id).trim()
+    || sessionId === safeString(sessionState.native_session_id).trim()
+    || sessionId === safeString(sessionState.owner_omx_session_id).trim();
+}
+
+async function resolveTrustedLeader(sessionMetas: WatcherSessionMeta[]): Promise<void> {
+  const sessionId = await readCurrentSessionId(stateDir).catch(() => '');
+  if (sessionId && trustedLeaderSessionId && sessionId !== trustedLeaderSessionId) {
+    trustedLeaderSessionId = '';
+    trustedLeaderThreadId = '';
+  }
+  const sessionState = await readSessionState(cwd);
+  if (
+    !sessionId
+    || !sessionState
+    || !isSessionStateAuthoritativeForCwd(sessionState, cwd)
+    || !sessionStateMatchesWatcherSession(sessionId, sessionState)
+  ) return;
+
+  const nativeLeaderId = safeString(sessionState.native_session_id).trim();
+  if (nativeLeaderId) {
+    if (trustedLeaderSessionId === sessionId && trustedLeaderThreadId === nativeLeaderId) return;
+    trustedLeaderThreadId = nativeLeaderId;
+  } else {
+    if (trustedLeaderSessionId === sessionId && trustedLeaderThreadId) return;
+    const sessionStartedAtMs = parseIsoMillis(sessionState.started_at);
+    if (sessionStartedAtMs === null) return;
+    const candidates = sessionMetas.filter((meta) => {
+      if (meta.threadSource !== 'user') return false;
+      const rolloutStartedAtMs = parseIsoMillis(meta.sessionStartedAt);
+      return rolloutStartedAtMs !== null && Math.abs(rolloutStartedAtMs - sessionStartedAtMs) <= 5000;
+    });
+    if (candidates.length !== 1) {
+      if (candidates.length > 1) {
+        await eventLog({
+          type: 'subagent_tracking_pending',
+          reason: 'leader_rollout_ambiguous',
+          candidate_thread_ids: candidates.map((candidate) => candidate.threadId),
+        });
+      }
+      return;
+    }
+    trustedLeaderThreadId = candidates[0].threadId;
+  }
+
+  trustedLeaderSessionId = sessionId;
+  await recordSubagentTurnForSession(cwd, {
+    sessionId,
+    threadId: trustedLeaderThreadId,
+    timestamp: sessionState.started_at,
+    kind: 'leader',
+    replaceLeader: true,
+    preserveCompletionEvidence: true,
+  });
+}
+
+async function recordFallbackSubagentCompletion(
+  meta: WatcherFileMeta,
+  turnId: string,
+  timestamp: string,
+): Promise<FallbackTrackerOutcome> {
+  if (meta.threadSource !== 'subagent') return 'not-subagent';
+
+  if (meta.provenanceError) {
+    await eventLog({
+      type: 'subagent_tracking_rejected',
+      reason: meta.provenanceError,
+      thread_id: meta.threadId,
+    });
+    return 'rejected';
+  }
+
+  const sessionId = await readCurrentSessionId(stateDir).catch(() => '');
+  if (!sessionId) {
+    await eventLog({
+      type: 'subagent_tracking_pending',
+      reason: 'session_id_missing',
+      thread_id: meta.threadId,
+    });
+    return 'retry';
+  }
+  if (!trustedLeaderThreadId) {
+    await eventLog({
+      type: 'subagent_tracking_pending',
+      reason: 'trusted_leader_missing',
+      thread_id: meta.threadId,
+    });
+    return 'retry';
+  }
+
+  if (meta.depth === 1 && meta.parentThreadId !== trustedLeaderThreadId) {
+    await eventLog({
+      type: 'subagent_tracking_rejected',
+      reason: 'parent_not_current_leader',
+      thread_id: meta.threadId,
+      parent_thread_id: meta.parentThreadId,
+      trusted_leader_thread_id: trustedLeaderThreadId,
+    });
+    return 'rejected';
+  }
+  if (meta.depth !== 1) {
+    const tracking = await readSubagentTrackingState(cwd);
+    const session = tracking.sessions[sessionId];
+    const parent = session?.threads[meta.parentThreadId];
+    if (
+      !hasVerifiedNativeSubagentLineage(session, meta.parentThreadId, trustedLeaderThreadId)
+      || parent?.depth !== (meta.depth ?? 0) - 1
+    ) {
+      await eventLog({
+        type: 'subagent_tracking_pending',
+        reason: 'tracked_subagent_parent_untrusted',
+        thread_id: meta.threadId,
+        parent_thread_id: meta.parentThreadId,
+      });
+      return 'retry';
+    }
+  }
+
+  try {
+    await recordSubagentTurnForSession(cwd, {
+      sessionId,
+      threadId: meta.threadId,
+      turnId,
+      timestamp,
+      kind: 'subagent',
+      leaderThreadId: trustedLeaderThreadId,
+      ...(meta.role ? { role: meta.role } : {}),
+      threadSource: meta.threadSource,
+      parentThreadId: meta.parentThreadId,
+      ...(meta.depth ? { depth: meta.depth } : {}),
+      ...(meta.agentNickname ? { agentNickname: meta.agentNickname } : {}),
+      completed: true,
+      completionSource: 'notify-fallback-watcher',
+    });
+  } catch (error) {
+    await eventLog({
+      type: 'subagent_tracking_failed',
+      reason: 'rollout_provenance_write_failed',
+      thread_id: meta.threadId,
+      error: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240),
+    });
+    return 'retry';
+  }
+  return 'recorded';
 }
 
 async function processLine(meta: WatcherFileMeta, line: string, filePath: string): Promise<void> {
@@ -1686,28 +1906,55 @@ async function processLine(meta: WatcherFileMeta, line: string, filePath: string
 
   const key = turnKey(meta.threadId, turnId);
   if (seenTurnKeys.has(key)) return;
-  seenTurnKeys.add(key);
 
+  const timestamp = Number.isFinite(evtTs) ? new Date(evtTs).toISOString() : new Date().toISOString();
+  const trackerOutcome = await recordFallbackSubagentCompletion(meta, turnId, timestamp);
+  if (trackerOutcome === 'retry') {
+    pendingTurnEvents.set(key, { meta, line, filePath });
+    return;
+  }
   const payload = buildNotifyPayload(
     meta.threadId,
     turnId,
     safeString((parsed.payload as Record<string, unknown>).last_agent_message)
   );
-  await invokeNotifyHook(payload, filePath);
+  const ok = await invokeNotifyHook(
+    payload,
+    filePath,
+    trackerOutcome === 'recorded' || trackerOutcome === 'rejected',
+    trackerOutcome,
+  );
+  if (!ok) {
+    pendingTurnEvents.set(key, { meta, line, filePath });
+    return;
+  }
+  seenTurnKeys.add(key);
+  pendingTurnEvents.delete(key);
 }
 
 async function ensureTrackedFiles(): Promise<void> {
   const files = await discoverRolloutFiles();
+  const discovered: Array<{ path: string; meta: WatcherSessionMeta }> = [];
   for (const path of files) {
     if (fileState.has(path)) continue;
     const line = await readFirstLine(path).catch(() => '');
-    const threadId = shouldTrackSessionMeta(line);
-    if (!threadId) continue;
+    const sessionMeta = shouldTrackSessionMeta(line);
+    if (!sessionMeta) continue;
+    discovered.push({ path, meta: sessionMeta });
+  }
+  await resolveTrustedLeader(discovered.map((entry) => entry.meta));
+  for (const { path, meta: sessionMeta } of discovered) {
     const fileStat = await stat(path).catch(() => null);
     if (!fileStat) continue;
     const size = fileStat.size || 0;
     const offset = runOnce ? 0 : size;
-    fileState.set(path, { threadId, offset, size, partial: '', decoder: new StringDecoder('utf8') });
+    fileState.set(path, { ...sessionMeta, offset, size, partial: '', decoder: new StringDecoder('utf8') });
+  }
+}
+
+async function retryPendingTurnEvents(): Promise<void> {
+  for (const pending of [...pendingTurnEvents.values()]) {
+    await processLine(pending.meta, pending.line, pending.filePath);
   }
 }
 
@@ -1929,7 +2176,9 @@ async function runWatcherCycle(): Promise<number> {
   }
   if (!authorityOnly) {
     await ensureTrackedFiles();
+    await retryPendingTurnEvents();
     processedRolloutCount = await pollFiles();
+    await retryPendingTurnEvents();
   }
   const controlPlaneSummary = await pumpTeamControlPlaneTick();
   if (!authorityOnly && !(await shouldSuppressInteractiveFallbackTicks())) {
@@ -2000,6 +2249,9 @@ async function main(): Promise<void> {
 
   if (runOnce) {
     await runWatcherCycle();
+    if (!authorityOnly && pendingTurnEvents.size > 0) {
+      throw new Error(`subagent tracker evidence UNKNOWN: ${pendingTurnEvents.size} task_complete event(s) pending retry`);
+    }
     if (!authorityOnly) {
       await eventLog({ type: 'watcher_once_complete', authority_only: authorityOnly, seen_turns: seenTurnKeys.size });
     }

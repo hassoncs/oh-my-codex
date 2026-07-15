@@ -116,6 +116,8 @@ function validExecutionContract(stride: 'task' | 'deliverable' | 'milestone'): R
 async function writeNativeSubagentTracking(cwd: string, sessionId: string): Promise<void> {
   const trackingPath = subagentTrackingPath(cwd);
   const now = '2026-05-28T00:00:00.000Z';
+  const architectCompletedAt = '2026-05-28T00:01:00.000Z';
+  const criticCompletedAt = '2026-05-28T00:02:00.000Z';
   await mkdir(dirname(trackingPath), { recursive: true });
   await writeFile(trackingPath, JSON.stringify({
     schemaVersion: 1,
@@ -126,8 +128,8 @@ async function writeNativeSubagentTracking(cwd: string, sessionId: string): Prom
         updated_at: now,
         threads: {
           'thread-leader': { thread_id: 'thread-leader', kind: 'leader', first_seen_at: now, last_seen_at: now, turn_count: 1 },
-          'thread-architect': { thread_id: 'thread-architect', kind: 'subagent', first_seen_at: now, last_seen_at: now, completed_at: now, turn_count: 1 },
-          'thread-critic': { thread_id: 'thread-critic', kind: 'subagent', first_seen_at: now, last_seen_at: now, completed_at: now, turn_count: 1 },
+          'thread-architect': { thread_id: 'thread-architect', kind: 'subagent', role: 'architect', thread_source: 'subagent', parent_thread_id: 'thread-leader', depth: 1, first_seen_at: now, last_seen_at: architectCompletedAt, completed_at: architectCompletedAt, last_completed_turn_id: 'turn-architect-1', completion_source: 'notify-fallback-watcher', turn_count: 1 },
+          'thread-critic': { thread_id: 'thread-critic', kind: 'subagent', role: 'critic', thread_source: 'subagent', parent_thread_id: 'thread-leader', depth: 1, first_seen_at: now, last_seen_at: criticCompletedAt, completed_at: criticCompletedAt, last_completed_turn_id: 'turn-critic-1', completion_source: 'notify-fallback-watcher', turn_count: 1 },
         },
       },
     },
@@ -153,6 +155,8 @@ function ralplanConsensusGate(
       provenance_kind: provenanceKind,
       session_id: sessionId,
       thread_id: architectThread,
+      completed_turn_id: 'turn-architect-1',
+      completed_at: '2026-05-28T00:01:00.000Z',
       artifact_path: '.omx/artifacts/architect.md',
       tracker_path: '.omx/state/subagent-tracking.json',
     },
@@ -162,6 +166,8 @@ function ralplanConsensusGate(
       provenance_kind: provenanceKind,
       session_id: sessionId,
       thread_id: criticThread,
+      completed_turn_id: 'turn-critic-1',
+      completed_at: '2026-05-28T00:02:00.000Z',
       artifact_path: '.omx/artifacts/critic.md',
       tracker_path: '.omx/state/subagent-tracking.json',
     },
@@ -1179,8 +1185,8 @@ describe('state operations directory initialization', () => {
               updated_at: '2026-07-07T04:31:00.000Z',
               threads: {
                 'thread-leader': { thread_id: 'thread-leader', kind: 'leader', first_seen_at: '2026-07-07T04:29:00.000Z', last_seen_at: '2026-07-07T04:29:00.000Z', turn_count: 1 },
-                'thread-architect': { thread_id: 'thread-architect', kind: 'subagent', first_seen_at: '2026-07-07T04:30:00.000Z', last_seen_at: '2026-07-07T04:30:00.000Z', turn_count: 1 },
-                'thread-critic': { thread_id: 'thread-critic', kind: 'subagent', first_seen_at: '2026-07-07T04:31:00.000Z', last_seen_at: '2026-07-07T04:31:00.000Z', turn_count: 1 },
+                'thread-architect': { thread_id: 'thread-architect', kind: 'subagent', first_seen_at: '2026-07-07T04:29:30.000Z', last_seen_at: '2026-07-07T04:29:30.000Z', turn_count: 1 },
+                'thread-critic': { thread_id: 'thread-critic', kind: 'subagent', first_seen_at: '2026-07-07T04:30:30.000Z', last_seen_at: '2026-07-07T04:30:30.000Z', turn_count: 1 },
               },
             },
           },
@@ -1194,8 +1200,8 @@ describe('state operations directory initialization', () => {
               updated_at: '2026-07-07T04:31:00.000Z',
               threads: {
                 'thread-leader': { thread_id: 'thread-leader', kind: 'leader', first_seen_at: '2026-07-07T04:29:00.000Z', last_seen_at: '2026-07-07T04:29:00.000Z', turn_count: 1 },
-                'thread-architect': { thread_id: 'thread-architect', kind: 'subagent', first_seen_at: '2026-07-07T04:30:00.000Z', last_seen_at: '2026-07-07T04:30:00.000Z', completed_at: '2026-07-07T04:30:00.000Z', turn_count: 1 },
-                'thread-critic': { thread_id: 'thread-critic', kind: 'subagent', first_seen_at: '2026-07-07T04:31:00.000Z', last_seen_at: '2026-07-07T04:31:00.000Z', completed_at: '2026-07-07T04:31:00.000Z', turn_count: 1 },
+                'thread-architect': { thread_id: 'thread-architect', kind: 'subagent', role: 'architect', thread_source: 'subagent', parent_thread_id: 'thread-leader', depth: 1, first_seen_at: '2026-07-07T04:30:00.000Z', last_seen_at: '2026-07-07T04:30:00.000Z', completed_at: '2026-07-07T04:30:00.000Z', last_completed_turn_id: 'turn-architect-1', completion_source: 'notify-fallback-watcher', turn_count: 1 },
+                'thread-critic': { thread_id: 'thread-critic', kind: 'subagent', role: 'critic', thread_source: 'subagent', parent_thread_id: 'thread-leader', depth: 1, first_seen_at: '2026-07-07T04:31:00.000Z', last_seen_at: '2026-07-07T04:31:00.000Z', completed_at: '2026-07-07T04:31:00.000Z', last_completed_turn_id: 'turn-critic-1', completion_source: 'notify-fallback-watcher', turn_count: 1 },
               },
             },
           },

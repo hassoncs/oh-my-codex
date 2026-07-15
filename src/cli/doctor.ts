@@ -1469,8 +1469,15 @@ function extractPlistLabel(content: string, fallback: string): string {
 	return decodeBasicXmlEntities(labelMatch?.[1]?.trim() || fallback);
 }
 
-async function readExistingTextFile(path: string): Promise<string> {
+const MAX_EXTERNAL_PROCESS_GUARD_TEXT_BYTES = 256 * 1024;
+
+async function readExistingTextFile(
+	path: string,
+	maxBytes = MAX_EXTERNAL_PROCESS_GUARD_TEXT_BYTES,
+): Promise<string> {
 	try {
+		const info = await lstat(path);
+		if (!info.isFile() || info.size > maxBytes) return "";
 		return await readFile(path, "utf-8");
 	} catch {
 		return "";
@@ -1554,7 +1561,15 @@ export async function checkExternalCodexProcessGuards(
 			const expandedValue = expandLaunchAgentPath(value, homeDir);
 			if (!expandedValue.startsWith("/")) continue;
 			if (!existsSync(expandedValue)) continue;
-			combinedContent += `\n${await readExistingTextFile(expandedValue)}`;
+			const remainingBytes =
+				MAX_EXTERNAL_PROCESS_GUARD_TEXT_BYTES -
+				Buffer.byteLength(combinedContent, "utf-8");
+			if (remainingBytes <= 0) break;
+			const referencedContent = await readExistingTextFile(
+				expandedValue,
+				remainingBytes,
+			);
+			if (referencedContent) combinedContent += `\n${referencedContent}`;
 		}
 
 		const reason = classifyExternalCodexProcessGuard(

@@ -484,12 +484,17 @@ describe('notify-fallback watcher', () => {
     assert.doesNotMatch(source, /stat\(path\)\.catch\(\(\) => \(\{ size: 0 \}\)\)/);
   });
 
-  it('one-shot mode forwards only recent task_complete events', async () => {
+  it('one-shot mode preserves current-session subagent provenance and rejects foreign lineage', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-once-'));
     const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
     const sid = `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const sessionDir = todaySessionDir(tempHome);
-    const rolloutPath = join(sessionDir, `rollout-test-fallback-once-${sid}.jsonl`);
+    const leaderRolloutPath = join(sessionDir, `rollout-test-fallback-once-${sid}-00-leader.jsonl`);
+    const rolloutPath = join(sessionDir, `rollout-test-fallback-once-${sid}-10-subagent.jsonl`);
+    const nestedRolloutPath = join(sessionDir, `rollout-test-fallback-once-${sid}-05-nested.jsonl`);
+    const foreignLeaderRolloutPath = join(sessionDir, `rollout-test-fallback-once-${sid}-30-foreign-leader.jsonl`);
+    const foreignRolloutPath = join(sessionDir, `rollout-test-fallback-once-${sid}-40-foreign-subagent.jsonl`);
+    const contradictoryRolloutPath = join(sessionDir, `rollout-test-fallback-once-${sid}-50-contradictory.jsonl`);
 
     try {
       await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
@@ -497,44 +502,56 @@ describe('notify-fallback watcher', () => {
       await mkdir(sessionDir, { recursive: true });
 
       const staleIso = new Date(Date.now() - 60_000).toISOString();
+      const sessionStartedIso = new Date(Date.now() - 1_000).toISOString();
       const freshIso = new Date(Date.now() + 2_000).toISOString();
       const threadId = `thread-${sid}`;
       const leaderThreadId = `leader-${sid}`;
+      const nestedThreadId = `nested-${sid}`;
+      const foreignLeaderThreadId = `foreign-leader-${sid}`;
+      const foreignThreadId = `foreign-${sid}`;
+      const contradictoryThreadId = `contradictory-${sid}`;
       const staleTurn = `turn-stale-${sid}`;
       const freshTurn = `turn-fresh-${sid}`;
-      await writeFile(join(wd, '.omx', 'state', 'session.json'), JSON.stringify({ session_id: sid }));
-      await writeFile(join(wd, '.omx', 'state', 'subagent-tracking.json'), JSON.stringify({
-        schemaVersion: 1,
-        sessions: {
-          [sid]: {
-            session_id: sid,
-            leader_thread_id: leaderThreadId,
-            updated_at: staleIso,
-            threads: {
-              [leaderThreadId]: {
-                thread_id: leaderThreadId,
-                kind: 'leader',
-                first_seen_at: staleIso,
-                last_seen_at: staleIso,
-                turn_count: 1,
-              },
-              [threadId]: {
-                thread_id: threadId,
-                kind: 'subagent',
-                first_seen_at: staleIso,
-                last_seen_at: staleIso,
-                turn_count: 1,
-              },
-            },
-          },
-        },
+      const nestedTurn = `turn-nested-${sid}`;
+      const foreignTurn = `turn-foreign-${sid}`;
+      const contradictoryTurn = `turn-contradictory-${sid}`;
+      await writeFile(join(wd, '.omx', 'state', 'session.json'), JSON.stringify({
+        session_id: sid,
+        started_at: sessionStartedIso,
+        cwd: wd,
+        pid: process.pid,
       }));
+      await writeFile(leaderRolloutPath, `${JSON.stringify({
+        timestamp: freshIso,
+        type: 'session_meta',
+        payload: {
+          id: leaderThreadId,
+          timestamp: sessionStartedIso,
+          cwd: wd,
+          thread_source: 'user',
+        },
+      })}\n`);
 
       const lines = [
         {
           timestamp: freshIso,
           type: 'session_meta',
-          payload: { id: threadId, cwd: wd },
+          payload: {
+            id: threadId,
+            cwd: wd,
+            parent_thread_id: leaderThreadId,
+            thread_source: 'subagent',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: leaderThreadId,
+                  depth: 1,
+                  agent_nickname: 'Chandrasekhar',
+                  agent_role: 'architect',
+                },
+              },
+            },
+          },
         },
         {
           timestamp: staleIso,
@@ -556,6 +573,101 @@ describe('notify-fallback watcher', () => {
         },
       ];
       await writeFile(rolloutPath, `${lines.map(v => JSON.stringify(v)).join('\n')}\n`);
+      await writeFile(nestedRolloutPath, `${[
+        {
+          timestamp: freshIso,
+          type: 'session_meta',
+          payload: {
+            id: nestedThreadId,
+            cwd: wd,
+            parent_thread_id: threadId,
+            thread_source: 'subagent',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: threadId,
+                  depth: 2,
+                  agent_nickname: 'Lovelace',
+                  agent_role: 'critic',
+                },
+              },
+            },
+          },
+        },
+        {
+          timestamp: freshIso,
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: nestedTurn,
+            last_agent_message: 'nested message',
+          },
+        },
+      ].map(v => JSON.stringify(v)).join('\n')}\n`);
+      await writeFile(foreignLeaderRolloutPath, `${JSON.stringify({
+        timestamp: freshIso,
+        type: 'session_meta',
+        payload: {
+          id: foreignLeaderThreadId,
+          timestamp: new Date(Date.now() + 60_000).toISOString(),
+          cwd: wd,
+          thread_source: 'user',
+        },
+      })}\n`);
+      await writeFile(foreignRolloutPath, `${[
+        {
+          timestamp: freshIso,
+          type: 'session_meta',
+          payload: {
+            id: foreignThreadId,
+            cwd: wd,
+            parent_thread_id: foreignLeaderThreadId,
+            thread_source: 'subagent',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: foreignLeaderThreadId,
+                  depth: 1,
+                  agent_nickname: 'Foreign',
+                  agent_role: 'architect',
+                },
+              },
+            },
+          },
+        },
+        {
+          timestamp: freshIso,
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: foreignTurn, last_agent_message: 'foreign message' },
+        },
+      ].map(v => JSON.stringify(v)).join('\n')}\n`);
+      await writeFile(contradictoryRolloutPath, `${[
+        {
+          timestamp: freshIso,
+          type: 'session_meta',
+          payload: {
+            id: contradictoryThreadId,
+            cwd: wd,
+            parent_thread_id: leaderThreadId,
+            thread_source: 'subagent',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: foreignLeaderThreadId,
+                  depth: 1,
+                  agent_nickname: 'Contradictory',
+                  agent_role: 'critic',
+                },
+              },
+            },
+          },
+        },
+        {
+          timestamp: freshIso,
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: contradictoryTurn, last_agent_message: 'contradictory message' },
+        },
+      ].map(v => JSON.stringify(v)).join('\n')}\n`);
 
       const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
       const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
@@ -568,19 +680,594 @@ describe('notify-fallback watcher', () => {
 
       const turnLog = join(wd, '.omx', 'logs', `turns-${new Date().toISOString().split('T')[0]}.jsonl`);
       const turnLines = await readLines(turnLog);
-      assert.equal(turnLines.length, 1);
-      assert.match(turnLines[0], new RegExp(freshTurn));
-      assert.doesNotMatch(turnLines[0], new RegExp(staleTurn));
+      assert.equal(turnLines.length, 4);
+      assert.equal(turnLines.some((line) => line.includes(freshTurn)), true);
+      assert.equal(turnLines.some((line) => line.includes(nestedTurn)), true);
+      assert.equal(turnLines.some((line) => line.includes(foreignTurn)), true);
+      assert.equal(turnLines.some((line) => line.includes(contradictoryTurn)), true);
+      assert.equal(turnLines.some((line) => line.includes(staleTurn)), false);
 
       const fallbackLog = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
       const fallbackEntries = await readJsonLines(fallbackLog);
-      assert.deepEqual(fallbackEntries.map((entry) => entry.type), ['fallback_notify']);
+      assert.equal(fallbackEntries.filter((entry) => entry.type === 'fallback_notify').length, 4);
+      assert.deepEqual(
+        fallbackEntries
+          .filter((entry) => entry.type === 'subagent_tracking_rejected')
+          .map((entry) => entry.reason)
+          .sort(),
+        ['contradictory_parent_thread_id', 'parent_not_current_leader'],
+      );
 
       const tracking = JSON.parse(await readFile(join(wd, '.omx', 'state', 'subagent-tracking.json'), 'utf-8'));
+      const trackedSession = tracking.sessions?.[sid];
       const completedThread = tracking.sessions?.[sid]?.threads?.[threadId];
+      const nestedThread = tracking.sessions?.[sid]?.threads?.[nestedThreadId];
+      assert.equal(trackedSession?.leader_thread_id, leaderThreadId);
+      assert.equal(trackedSession?.threads?.[leaderThreadId]?.kind, 'leader');
+      assert.equal(completedThread?.kind, 'subagent');
+      assert.equal(completedThread?.role, 'architect');
+      assert.equal(completedThread?.thread_source, 'subagent');
+      assert.equal(completedThread?.parent_thread_id, leaderThreadId);
+      assert.equal(completedThread?.depth, 1);
+      assert.equal(completedThread?.agent_nickname, 'Chandrasekhar');
       assert.equal(completedThread?.completed_at ? true : false, true);
       assert.equal(completedThread?.last_completed_turn_id, freshTurn);
       assert.equal(completedThread?.completion_source, 'notify-fallback-watcher');
+      assert.equal(nestedThread?.kind, 'subagent');
+      assert.equal(nestedThread?.role, 'critic');
+      assert.equal(nestedThread?.agent_nickname, 'Lovelace');
+      assert.equal(nestedThread?.last_completed_turn_id, nestedTurn);
+      assert.equal(nestedThread?.parent_thread_id, threadId);
+      assert.equal(nestedThread?.depth, 2);
+      assert.equal(trackedSession?.threads?.[foreignThreadId], undefined);
+      assert.equal(trackedSession?.threads?.[contradictoryThreadId], undefined);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+      await rm(rolloutPath, { force: true });
+      await rm(leaderRolloutPath, { force: true });
+      await rm(nestedRolloutPath, { force: true });
+      await rm(foreignLeaderRolloutPath, { force: true });
+      await rm(foreignRolloutPath, { force: true });
+      await rm(contradictoryRolloutPath, { force: true });
+    }
+  });
+
+  it('fails one-shot mode loudly when tracker evidence remains pending', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-once-pending-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
+    const sid = randomUUID();
+    const sessionDir = todaySessionDir(tempHome);
+    const rolloutPath = join(sessionDir, `rollout-test-fallback-pending-${sid}.jsonl`);
+    try {
+      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+      const nowIso = new Date(Date.now() + 2_000).toISOString();
+      await writeFile(rolloutPath, `${[
+        {
+          timestamp: nowIso,
+          type: 'session_meta',
+          payload: {
+            id: `subagent-${sid}`,
+            cwd: wd,
+            parent_thread_id: `leader-${sid}`,
+            thread_source: 'subagent',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: `leader-${sid}`,
+                  depth: 1,
+                  agent_role: 'architect',
+                },
+              },
+            },
+          },
+        },
+        {
+          timestamp: nowIso,
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: `turn-${sid}` },
+        },
+      ].map((value) => JSON.stringify(value)).join('\n')}\n`);
+
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
+        { encoding: 'utf-8', env: buildCleanNotifyEnv({ HOME: tempHome }) },
+      );
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /subagent tracker evidence UNKNOWN/);
+      const fallbackLog = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const fallbackEntries = await readJsonLines(fallbackLog);
+      assert.equal(fallbackEntries.some((entry) => entry.type === 'fallback_notify'), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+      await rm(rolloutPath, { force: true });
+    }
+  });
+
+  it('does not bind a shared watcher to a newer cwd session pointer', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-session-race-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
+    const watcherSessionId = `watcher-${randomUUID()}`;
+    const newerSessionId = `newer-${randomUUID()}`;
+    const newerLeaderThreadId = `leader-${randomUUID()}`;
+    const childThreadId = `child-${randomUUID()}`;
+    const sessionDir = todaySessionDir(tempHome);
+    const rolloutPath = join(sessionDir, `rollout-test-fallback-session-race-${childThreadId}.jsonl`);
+    try {
+      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+      const nowIso = new Date(Date.now() + 2_000).toISOString();
+      await writeFile(join(wd, '.omx', 'state', 'session.json'), JSON.stringify({
+        session_id: newerSessionId,
+        native_session_id: newerLeaderThreadId,
+        started_at: nowIso,
+        cwd: wd,
+        pid: process.pid,
+      }));
+      await writeFile(rolloutPath, `${[
+        {
+          timestamp: nowIso,
+          type: 'session_meta',
+          payload: {
+            id: childThreadId,
+            cwd: wd,
+            parent_thread_id: newerLeaderThreadId,
+            thread_source: 'subagent',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: newerLeaderThreadId,
+                  depth: 1,
+                  agent_role: 'architect',
+                },
+              },
+            },
+          },
+        },
+        {
+          timestamp: nowIso,
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: `turn-${childThreadId}` },
+        },
+      ].map((value) => JSON.stringify(value)).join('\n')}\n`);
+
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
+        {
+          encoding: 'utf-8',
+          env: buildCleanNotifyEnv({ HOME: tempHome, OMX_SESSION_ID: watcherSessionId }),
+        },
+      );
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /subagent tracker evidence UNKNOWN/);
+      const tracking = JSON.parse(
+        await readFile(join(wd, '.omx', 'state', 'subagent-tracking.json'), 'utf-8').catch(() => '{"sessions":{}}'),
+      );
+      assert.equal(tracking.sessions?.[watcherSessionId]?.threads?.[newerLeaderThreadId], undefined);
+      assert.equal(tracking.sessions?.[watcherSessionId]?.threads?.[childThreadId], undefined);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+      await rm(rolloutPath, { force: true });
+    }
+  });
+
+  it('switches cached native leader after /new through the original OMX owner alias', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-new-session-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
+    const ownerSessionId = `owner-${randomUUID()}`;
+    const oldLeaderThreadId = `old-${randomUUID()}`;
+    const newLeaderThreadId = `new-${randomUUID()}`;
+    const oldChildThreadId = `old-child-${randomUUID()}`;
+    const newChildThreadId = `new-child-${randomUUID()}`;
+    const sessionDir = todaySessionDir(tempHome);
+    const oldRolloutPath = join(sessionDir, `rollout-test-fallback-new-session-10-${oldChildThreadId}.jsonl`);
+    const newRolloutPath = join(sessionDir, `rollout-test-fallback-new-session-20-${newChildThreadId}.jsonl`);
+    let child: ReturnType<typeof spawn> | undefined;
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
+      await mkdir(stateDir, { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+      const oldStartedAt = new Date(Date.now() - 1_000).toISOString();
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+        session_id: oldLeaderThreadId,
+        native_session_id: oldLeaderThreadId,
+        owner_omx_session_id: ownerSessionId,
+        started_at: oldStartedAt,
+        cwd: wd,
+        pid: process.pid,
+      }));
+      await writeFile(oldRolloutPath, `${JSON.stringify({
+        timestamp: oldStartedAt,
+        type: 'session_meta',
+        payload: {
+          id: oldChildThreadId,
+          cwd: wd,
+          parent_thread_id: oldLeaderThreadId,
+          thread_source: 'subagent',
+          source: { subagent: { thread_spawn: { parent_thread_id: oldLeaderThreadId, depth: 1 } } },
+        },
+      })}\n`);
+
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      child = spawn(
+        process.execPath,
+        [watcherScript, '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '75'],
+        {
+          cwd: wd,
+          stdio: 'ignore',
+          env: buildCleanNotifyEnv({ HOME: tempHome, OMX_SESSION_ID: ownerSessionId }),
+        },
+      );
+
+      await waitFor(async () => {
+        const tracking = JSON.parse(
+          await readFile(join(stateDir, 'subagent-tracking.json'), 'utf-8').catch(() => '{"sessions":{}}'),
+        );
+        return tracking.sessions?.[oldLeaderThreadId]?.leader_thread_id === oldLeaderThreadId;
+      }, 4000, 75);
+
+      const newStartedAt = new Date().toISOString();
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+        session_id: newLeaderThreadId,
+        native_session_id: newLeaderThreadId,
+        previous_native_session_id: oldLeaderThreadId,
+        owner_omx_session_id: ownerSessionId,
+        started_at: newStartedAt,
+        cwd: wd,
+        pid: process.pid,
+      }));
+      await writeFile(newRolloutPath, `${JSON.stringify({
+        timestamp: newStartedAt,
+        type: 'session_meta',
+        payload: {
+          id: newChildThreadId,
+          cwd: wd,
+          parent_thread_id: newLeaderThreadId,
+          thread_source: 'subagent',
+          source: {
+            subagent: {
+              thread_spawn: {
+                parent_thread_id: newLeaderThreadId,
+                depth: 1,
+                agent_role: 'architect',
+              },
+            },
+          },
+        },
+      })}\n`);
+
+      await waitFor(async () => {
+        const tracking = JSON.parse(
+          await readFile(join(stateDir, 'subagent-tracking.json'), 'utf-8').catch(() => '{"sessions":{}}'),
+        );
+        return tracking.sessions?.[newLeaderThreadId]?.leader_thread_id === newLeaderThreadId;
+      }, 4000, 75);
+      await appendLine(newRolloutPath, {
+        timestamp: new Date(Date.now() + 500).toISOString(),
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: `turn-${newChildThreadId}` },
+      });
+
+      await waitFor(async () => {
+        const tracking = JSON.parse(
+          await readFile(join(stateDir, 'subagent-tracking.json'), 'utf-8').catch(() => '{"sessions":{}}'),
+        );
+        const session = tracking.sessions?.[newLeaderThreadId];
+        return session?.leader_thread_id === newLeaderThreadId
+          && session?.threads?.[newChildThreadId]?.parent_thread_id === newLeaderThreadId
+          && Boolean(session?.threads?.[newChildThreadId]?.completed_at);
+      }, 4000, 75);
+    } finally {
+      if (child) {
+        child.kill('SIGTERM');
+        await waitForExit(child, 4000).catch(() => {});
+      }
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+      await rm(oldRolloutPath, { force: true });
+      await rm(newRolloutPath, { force: true });
+    }
+  });
+
+  it('replaces a fake tracker leader and rejects its foreign depth-one child', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-fake-leader-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
+    const sessionId = randomUUID();
+    const realLeaderThreadId = `real-${randomUUID()}`;
+    const fakeLeaderThreadId = `fake-${randomUUID()}`;
+    const childThreadId = `child-${randomUUID()}`;
+    const sessionDir = todaySessionDir(tempHome);
+    const rolloutPath = join(sessionDir, `rollout-test-fallback-fake-leader-${childThreadId}.jsonl`);
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
+      await mkdir(stateDir, { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+      const nowIso = new Date().toISOString();
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+        session_id: sessionId,
+        native_session_id: realLeaderThreadId,
+        started_at: nowIso,
+        cwd: wd,
+        pid: process.pid,
+      }));
+      await writeFile(join(stateDir, 'subagent-tracking.json'), JSON.stringify({
+        schemaVersion: 1,
+        sessions: {
+          [sessionId]: {
+            session_id: sessionId,
+            leader_thread_id: fakeLeaderThreadId,
+            updated_at: nowIso,
+            threads: {
+              [fakeLeaderThreadId]: {
+                thread_id: fakeLeaderThreadId,
+                kind: 'leader',
+                first_seen_at: nowIso,
+                last_seen_at: nowIso,
+                turn_count: 1,
+              },
+            },
+          },
+        },
+      }));
+      await writeFile(rolloutPath, `${[
+        {
+          timestamp: nowIso,
+          type: 'session_meta',
+          payload: {
+            id: childThreadId,
+            cwd: wd,
+            parent_thread_id: fakeLeaderThreadId,
+            thread_source: 'subagent',
+            source: {
+              subagent: {
+                thread_spawn: { parent_thread_id: fakeLeaderThreadId, depth: 1, agent_role: 'architect' },
+              },
+            },
+          },
+        },
+        {
+          timestamp: new Date(Date.now() + 500).toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: `turn-${childThreadId}` },
+        },
+      ].map((value) => JSON.stringify(value)).join('\n')}\n`);
+
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
+        { encoding: 'utf-8', env: buildCleanNotifyEnv({ HOME: tempHome }) },
+      );
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const tracking = JSON.parse(await readFile(join(stateDir, 'subagent-tracking.json'), 'utf-8'));
+      assert.equal(tracking.sessions?.[sessionId]?.leader_thread_id, realLeaderThreadId);
+      assert.equal(tracking.sessions?.[sessionId]?.threads?.[realLeaderThreadId]?.kind, 'leader');
+      assert.equal(tracking.sessions?.[sessionId]?.threads?.[childThreadId], undefined);
+      const entries = await readJsonLines(
+        join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`),
+      );
+      assert.equal(entries.some((entry) => entry.reason === 'parent_not_current_leader'), true);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+      await rm(rolloutPath, { force: true });
+    }
+  });
+
+  it('reclassifies a stale leader before accepting its nested child', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-stale-nested-parent-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
+    const sessionId = randomUUID();
+    const realLeaderThreadId = `real-${randomUUID()}`;
+    const staleLeaderThreadId = `stale-${randomUUID()}`;
+    const nestedThreadId = `nested-${randomUUID()}`;
+    const sessionDir = todaySessionDir(tempHome);
+    const nestedRolloutPath = join(sessionDir, `rollout-test-fallback-stale-parent-05-${nestedThreadId}.jsonl`);
+    const parentRolloutPath = join(sessionDir, `rollout-test-fallback-stale-parent-10-${staleLeaderThreadId}.jsonl`);
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
+      await mkdir(stateDir, { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+      const nowIso = new Date().toISOString();
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+        session_id: sessionId,
+        native_session_id: realLeaderThreadId,
+        started_at: nowIso,
+        cwd: wd,
+        pid: process.pid,
+      }));
+      await writeFile(join(stateDir, 'subagent-tracking.json'), JSON.stringify({
+        schemaVersion: 1,
+        sessions: {
+          [sessionId]: {
+            session_id: sessionId,
+            leader_thread_id: staleLeaderThreadId,
+            updated_at: nowIso,
+            threads: {
+              [staleLeaderThreadId]: {
+                thread_id: staleLeaderThreadId,
+                kind: 'leader',
+                first_seen_at: nowIso,
+                last_seen_at: nowIso,
+                turn_count: 1,
+              },
+            },
+          },
+        },
+      }));
+      await writeFile(nestedRolloutPath, `${[
+        {
+          timestamp: nowIso,
+          type: 'session_meta',
+          payload: {
+            id: nestedThreadId,
+            cwd: wd,
+            parent_thread_id: staleLeaderThreadId,
+            thread_source: 'subagent',
+            source: {
+              subagent: {
+                thread_spawn: { parent_thread_id: staleLeaderThreadId, depth: 2, agent_role: 'critic' },
+              },
+            },
+          },
+        },
+        {
+          timestamp: new Date(Date.now() + 500).toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: `turn-${nestedThreadId}` },
+        },
+      ].map((value) => JSON.stringify(value)).join('\n')}\n`);
+      await writeFile(parentRolloutPath, `${[
+        {
+          timestamp: nowIso,
+          type: 'session_meta',
+          payload: {
+            id: staleLeaderThreadId,
+            cwd: wd,
+            parent_thread_id: realLeaderThreadId,
+            thread_source: 'subagent',
+            source: {
+              subagent: {
+                thread_spawn: { parent_thread_id: realLeaderThreadId, depth: 1, agent_role: 'architect' },
+              },
+            },
+          },
+        },
+        {
+          timestamp: new Date(Date.now() + 500).toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: `turn-${staleLeaderThreadId}` },
+        },
+      ].map((value) => JSON.stringify(value)).join('\n')}\n`);
+
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
+        { encoding: 'utf-8', env: buildCleanNotifyEnv({ HOME: tempHome }) },
+      );
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const tracking = JSON.parse(await readFile(join(stateDir, 'subagent-tracking.json'), 'utf-8'));
+      const session = tracking.sessions?.[sessionId];
+      assert.equal(session?.leader_thread_id, realLeaderThreadId);
+      assert.equal(session?.threads?.[staleLeaderThreadId]?.kind, 'subagent');
+      assert.equal(session?.threads?.[staleLeaderThreadId]?.parent_thread_id, realLeaderThreadId);
+      assert.equal(session?.threads?.[nestedThreadId]?.kind, 'subagent');
+      assert.equal(session?.threads?.[nestedThreadId]?.parent_thread_id, staleLeaderThreadId);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+      await rm(nestedRolloutPath, { force: true });
+      await rm(parentRolloutPath, { force: true });
+    }
+  });
+
+  it('rejects a nested child whose parent only has generic notify tracking', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-untrusted-nested-parent-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
+    const sessionId = randomUUID();
+    const leaderThreadId = `leader-${randomUUID()}`;
+    const genericParentThreadId = `generic-${randomUUID()}`;
+    const nestedThreadId = `nested-${randomUUID()}`;
+    const sessionDir = todaySessionDir(tempHome);
+    const rolloutPath = join(sessionDir, `rollout-test-fallback-untrusted-parent-${nestedThreadId}.jsonl`);
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
+      await mkdir(stateDir, { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+      const nowIso = new Date().toISOString();
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+        session_id: sessionId,
+        native_session_id: leaderThreadId,
+        started_at: nowIso,
+        cwd: wd,
+        pid: process.pid,
+      }));
+      await writeFile(join(stateDir, 'subagent-tracking.json'), JSON.stringify({
+        schemaVersion: 1,
+        sessions: {
+          [sessionId]: {
+            session_id: sessionId,
+            leader_thread_id: leaderThreadId,
+            updated_at: nowIso,
+            threads: {
+              [leaderThreadId]: {
+                thread_id: leaderThreadId,
+                kind: 'leader',
+                first_seen_at: nowIso,
+                last_seen_at: nowIso,
+                turn_count: 1,
+              },
+              [genericParentThreadId]: {
+                thread_id: genericParentThreadId,
+                kind: 'subagent',
+                first_seen_at: nowIso,
+                last_seen_at: nowIso,
+                turn_count: 1,
+              },
+            },
+          },
+        },
+      }));
+      await writeFile(rolloutPath, `${[
+        {
+          timestamp: nowIso,
+          type: 'session_meta',
+          payload: {
+            id: nestedThreadId,
+            cwd: wd,
+            parent_thread_id: genericParentThreadId,
+            thread_source: 'subagent',
+            source: {
+              subagent: {
+                thread_spawn: { parent_thread_id: genericParentThreadId, depth: 2, agent_role: 'critic' },
+              },
+            },
+          },
+        },
+        {
+          timestamp: new Date(Date.now() + 500).toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: `turn-${nestedThreadId}` },
+        },
+      ].map((value) => JSON.stringify(value)).join('\n')}\n`);
+
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
+        { encoding: 'utf-8', env: buildCleanNotifyEnv({ HOME: tempHome }) },
+      );
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /subagent tracker evidence UNKNOWN/);
+
+      const tracking = JSON.parse(await readFile(join(stateDir, 'subagent-tracking.json'), 'utf-8'));
+      assert.equal(tracking.sessions?.[sessionId]?.threads?.[nestedThreadId], undefined);
+      const entries = await readJsonLines(
+        join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`),
+      );
+      assert.equal(entries.some((entry) => entry.reason === 'tracked_subagent_parent_untrusted'), true);
     } finally {
       await rm(wd, { recursive: true, force: true });
       await rm(tempHome, { recursive: true, force: true });

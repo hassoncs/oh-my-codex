@@ -40,6 +40,7 @@ async function readSessionMetadataFromBaseStateDir(baseStateDir: string): Promis
     session?.native_session_id,
     session?.codex_session_id,
     session?.previous_native_session_id,
+    session?.owner_omx_session_id,
   ]
     .map((value) => safeString(value).trim())
     .filter(Boolean);

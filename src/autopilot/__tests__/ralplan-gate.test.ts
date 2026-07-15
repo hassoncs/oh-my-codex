@@ -543,8 +543,8 @@ describe('autopilot ralplan gate', () => {
             updated_at: '2026-06-12T10:03:00.000Z',
             threads: {
               'thread-leader': { thread_id: 'thread-leader', kind: 'leader', first_seen_at: '2026-06-12T09:59:00.000Z', last_seen_at: '2026-06-12T09:59:00.000Z', turn_count: 1 },
-              'thread-architect-fresh': { thread_id: 'thread-architect-fresh', kind: 'subagent', first_seen_at: '2026-06-12T10:02:00.000Z', last_seen_at: '2026-06-12T10:02:00.000Z', completed_at: '2026-06-12T10:02:00.000Z', turn_count: 1 },
-              'thread-critic-fresh': { thread_id: 'thread-critic-fresh', kind: 'subagent', first_seen_at: '2026-06-12T10:03:00.000Z', last_seen_at: '2026-06-12T10:03:00.000Z', completed_at: '2026-06-12T10:03:00.000Z', turn_count: 1 },
+              'thread-architect-fresh': { thread_id: 'thread-architect-fresh', kind: 'subagent', role: 'architect', thread_source: 'subagent', parent_thread_id: 'thread-leader', depth: 1, first_seen_at: '2026-06-12T10:02:00.000Z', last_seen_at: '2026-06-12T10:02:00.000Z', completed_at: '2026-06-12T10:02:00.000Z', last_completed_turn_id: 'turn-architect-cycle-2', turn_count: 1 },
+              'thread-critic-fresh': { thread_id: 'thread-critic-fresh', kind: 'subagent', role: 'critic', thread_source: 'subagent', parent_thread_id: 'thread-leader', depth: 1, first_seen_at: '2026-06-12T10:03:00.000Z', last_seen_at: '2026-06-12T10:03:00.000Z', completed_at: '2026-06-12T10:03:00.000Z', last_completed_turn_id: 'turn-critic-cycle-2', turn_count: 1 },
             },
           },
         },
@@ -564,6 +564,7 @@ describe('autopilot ralplan gate', () => {
               review_cycle: 2,
               session_id: sessionId,
               thread_id: 'thread-architect-fresh',
+              completed_turn_id: 'turn-architect-cycle-2',
               artifact_path: '.omx/artifacts/architect-fresh.md',
               tracker_path: '.omx/state/subagent-tracking.json',
               completed_at: '2026-06-12T10:02:00.000Z',
@@ -575,6 +576,7 @@ describe('autopilot ralplan gate', () => {
               review_cycle: 2,
               session_id: sessionId,
               thread_id: 'thread-critic-fresh',
+              completed_turn_id: 'turn-critic-cycle-2',
               artifact_path: '.omx/artifacts/critic-fresh.md',
               tracker_path: '.omx/state/subagent-tracking.json',
               completed_at: '2026-06-12T10:03:00.000Z',
@@ -641,8 +643,8 @@ describe('autopilot ralplan gate', () => {
             updated_at: '2026-06-12T10:03:00.000Z',
             threads: {
               'thread-leader': { thread_id: 'thread-leader', kind: 'leader', first_seen_at: '2026-06-12T09:59:00.000Z', last_seen_at: '2026-06-12T09:59:00.000Z', turn_count: 1 },
-              'thread-architect': { thread_id: 'thread-architect', kind: 'subagent', first_seen_at: '2026-06-12T10:02:00.000Z', last_seen_at: '2026-06-12T10:02:00.000Z', completed_at: '2026-06-12T10:02:00.000Z', turn_count: 1 },
-              'thread-critic': { thread_id: 'thread-critic', kind: 'subagent', first_seen_at: '2026-06-12T10:03:00.000Z', last_seen_at: '2026-06-12T10:03:00.000Z', completed_at: '2026-06-12T10:03:00.000Z', turn_count: 1 },
+              'thread-architect': { thread_id: 'thread-architect', kind: 'subagent', role: 'architect', thread_source: 'subagent', parent_thread_id: 'thread-leader', depth: 1, first_seen_at: '2026-06-12T10:02:00.000Z', last_seen_at: '2026-06-12T10:02:00.000Z', completed_at: '2026-06-12T10:02:00.000Z', last_completed_turn_id: 'turn-architect-1', turn_count: 1 },
+              'thread-critic': { thread_id: 'thread-critic', kind: 'subagent', role: 'critic', thread_source: 'subagent', parent_thread_id: 'thread-leader', depth: 1, first_seen_at: '2026-06-12T10:03:00.000Z', last_seen_at: '2026-06-12T10:03:00.000Z', completed_at: '2026-06-12T10:03:00.000Z', last_completed_turn_id: 'turn-critic-1', turn_count: 1 },
             },
           },
         },
@@ -659,6 +661,7 @@ describe('autopilot ralplan gate', () => {
               provenance_kind: 'native_subagent',
               verdict: 'approve',
               thread_id: 'thread-architect',
+              completed_turn_id: 'turn-architect-1',
               completed_at: '2026-06-12T10:02:00.000Z',
             },
             ralplan_critic_review: {
@@ -666,6 +669,7 @@ describe('autopilot ralplan gate', () => {
               provenance_kind: 'native_subagent',
               verdict: 'approve',
               thread_id: 'thread-critic',
+              completed_turn_id: 'turn-critic-1',
               completed_at: '2026-06-12T10:03:00.000Z',
             },
           },
@@ -823,12 +827,14 @@ describe('autopilot ralplan gate', () => {
               provenance_kind: 'native_subagent',
               verdict: 'approve',
               thread_id: 'thread-architect',
+              completed_at: '2026-06-12T10:02:00.000Z',
             },
             ralplan_critic_review: {
               agent_role: 'critic',
               provenance_kind: 'native_subagent',
               verdict: 'approve',
               thread_id: 'thread-critic',
+              completed_at: '2026-06-12T10:03:00.000Z',
             },
           },
         },
@@ -1161,6 +1167,7 @@ describe('autopilot ralplan gate', () => {
               verdict: 'approve',
               session_id: sessionId,
               thread_id: 'thread-architect',
+              completed_at: '2026-06-12T10:02:00.000Z',
             },
             ralplan_critic_review: {
               agent_role: 'critic',
@@ -1168,6 +1175,7 @@ describe('autopilot ralplan gate', () => {
               verdict: 'approve',
               session_id: sessionId,
               thread_id: 'thread-critic',
+              completed_at: '2026-06-12T10:03:00.000Z',
             },
           },
         },
@@ -1263,7 +1271,7 @@ describe('autopilot ralplan gate', () => {
     }
   });
 
-  it('accepts fresh native review evidence when tracker leader id aliases a subagent lane', async () => {
+  it('rejects native review evidence when tracker leader id aliases a subagent lane', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-autopilot-ralplan-fresh-subagent-alias-'));
     const sessionId = 'sess-autopilot-fresh-subagent-alias';
     const trackingPath = subagentTrackingPath(cwd);
@@ -1280,6 +1288,10 @@ describe('autopilot ralplan gate', () => {
               'thread-architect': {
                 thread_id: 'thread-architect',
                 kind: 'subagent',
+                role: 'architect',
+                thread_source: 'subagent',
+                parent_thread_id: 'thread-leader',
+                depth: 1,
                 first_seen_at: '2026-05-28T18:34:51.000Z',
                 last_seen_at: '2026-05-28T18:34:51.000Z',
                 completed_at: '2026-05-28T18:34:51.000Z',
@@ -1289,6 +1301,10 @@ describe('autopilot ralplan gate', () => {
               'thread-critic': {
                 thread_id: 'thread-critic',
                 kind: 'subagent',
+                role: 'critic',
+                thread_source: 'subagent',
+                parent_thread_id: 'thread-leader',
+                depth: 1,
                 first_seen_at: '2026-05-28T18:35:10.000Z',
                 last_seen_at: '2026-05-28T18:35:10.000Z',
                 completed_at: '2026-05-28T18:35:10.000Z',
@@ -1331,8 +1347,8 @@ describe('autopilot ralplan gate', () => {
       };
 
       const decision = canAdvanceAutopilotRalplanToUltragoal({ cwd, sessionId, currentState: state });
-      assert.equal(decision.allowed, true);
-      assert.equal(decision.evidence?.blockedReason, null);
+      assert.equal(decision.allowed, false);
+      assert.match(buildAutopilotRalplanUltragoalGateError(decision), /lacks verified native lineage/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

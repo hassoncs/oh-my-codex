@@ -581,6 +581,7 @@ case "$(cat "$CODEX_HOME/config.toml")" in *'source = "${repoRoot}"'*) echo mark
       const previousRuntimeCodexHome = join(wd, '.omx', 'runtime', 'codex-home', 'omx-existing-runtime');
       const fakeBin = join(wd, 'bin');
       const fakeCodexPath = join(fakeBin, 'codex');
+      const mtimeProbePath = join(fakeBin, 'print-mtimes.mjs');
       const fakePsPath = join(fakeBin, 'ps');
       const oldRolloutPath = join(projectCodexHome, 'sessions', '2024', '01', '02', 'rollout-old-a.jsonl');
       const newerRolloutPath = join(projectCodexHome, 'sessions', '2024', '03', '04', 'rollout-old-b.jsonl');
@@ -600,9 +601,25 @@ case "$(cat "$CODEX_HOME/config.toml")" in *'source = "${repoRoot}"'*) echo mark
       await utimes(newerRolloutPath, newerMtime, newerMtime);
       await symlink(join(projectCodexHome, 'sessions'), join(previousRuntimeCodexHome, 'sessions'), 'dir');
 
+      await writeFile(mtimeProbePath, [
+        "import { readdirSync, statSync } from 'node:fs';",
+        "import { join } from 'node:path';",
+        "function visit(dir) {",
+        "  for (const entry of readdirSync(dir, { withFileTypes: true })) {",
+        "    const path = join(dir, entry.name);",
+        "    if (entry.isDirectory()) visit(path);",
+        "    else if (entry.isFile() && entry.name.endsWith('.jsonl')) {",
+        "      const mtime = statSync(path).mtime.toISOString().replace('T', ' ').replace('Z', '');",
+        "      console.log(`${mtime} ${path}`);",
+        "    }",
+        "  }",
+        "}",
+        "visit(process.argv[2]);",
+        "",
+      ].join("\n"));
       await writeFile(fakeCodexPath, `#!/bin/sh
 printf 'fake-codex:%s\\n' "$*"
-find "$CODEX_HOME/sessions" -type f -name '*.jsonl' -exec stat -c '%y %n' {} \\; | sort
+${JSON.stringify(process.execPath)} ${JSON.stringify(mtimeProbePath)} "$CODEX_HOME/sessions" | sort
 `);
       await chmod(fakeCodexPath, 0o755);
       await writeFile(fakePsPath, '#!/bin/sh\nexit 0\n');

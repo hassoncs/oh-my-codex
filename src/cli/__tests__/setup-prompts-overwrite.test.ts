@@ -4,12 +4,16 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { setup } from '../setup.js';
+import { setup as runSetup } from '../setup.js';
 import { readCatalogManifest } from '../../catalog/reader.js';
 import {
   NON_NATIVE_AGENT_PROMPT_ASSETS,
   getInstallableNativeAgentNames,
 } from '../../agents/policy.js';
+
+function setup(options: Parameters<typeof runSetup>[0] = {}): Promise<void> {
+  return runSetup({ installMode: 'legacy', ...options });
+}
 
 describe('omx setup prompt/native-agent overwrite behavior', () => {
   const obsoleteNativeAgentField = ['skill', 'ref'].join('_');

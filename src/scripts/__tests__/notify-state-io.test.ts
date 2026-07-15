@@ -165,4 +165,32 @@ describe('notify-hook state I/O session authority', () => {
       await rm(wd, { recursive: true, force: true });
     }
   });
+
+  it('maps the original OMX owner to the replacement native session after /new', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-notify-state-io-owner-alias-'));
+    const previousOmxSessionId = process.env.OMX_SESSION_ID;
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      await mkdir(join(stateDir, 'sessions', 'native-new'), { recursive: true });
+      await writeFile(
+        join(stateDir, 'session.json'),
+        JSON.stringify({
+          session_id: 'native-new',
+          native_session_id: 'native-new',
+          previous_native_session_id: 'native-old',
+          owner_omx_session_id: 'omx-owner',
+          cwd: wd,
+        }, null, 2),
+        'utf-8',
+      );
+      process.env.OMX_SESSION_ID = 'omx-owner';
+
+      assert.equal(await readCurrentSessionId(stateDir), 'native-new');
+      assert.equal(await resolveScopedStateDir(stateDir), join(stateDir, 'sessions', 'native-new'));
+    } finally {
+      if (typeof previousOmxSessionId === 'string') process.env.OMX_SESSION_ID = previousOmxSessionId;
+      else delete process.env.OMX_SESSION_ID;
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
 });

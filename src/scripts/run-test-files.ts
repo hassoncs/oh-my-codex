@@ -1,6 +1,20 @@
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { readdirSync, statSync } from 'node:fs';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import {
+  activateOwnedChildLease,
+  assertDistProcessTreeAuthority,
+  isOwnedChildLeaseActive,
+  isProcessAlive,
+  isProcessGroupAlive,
+  prepareOwnedChildLease,
+  recoverStaleOwnedLock,
+  releaseOwnedChildLease,
+  releaseOwnedLock,
+  resolveDistLockConfig,
+  tryCreateOwnedLock,
+} from '../../src/scripts/dist-lock.js';
 
 const DEFAULT_TEST_TIMEOUT_MS = 0;
 const DEFAULT_RUNNER_TIMEOUT_MS = 30 * 60 * 1_000;
@@ -9,6 +23,9 @@ const DEFAULT_CI_TEST_CONCURRENCY = 1;
 const DEFAULT_LOCAL_TEST_CONCURRENCY = 1;
 const PRESERVED_TEST_ENV_KEYS = new Set([
   'OMX_EXPLORE_BIN',
+  'OMX_DIST_LOCK_ROOT',
+  'OMX_DIST_LOCK_TIMEOUT_MS',
+  'OMX_DIST_READER_LOCK',
   'OMX_NODE_TEST_CONCURRENCY',
   'OMX_NODE_TEST_FORCE_EXIT',
   'OMX_NODE_TEST_FORCE_EXIT_GRACE_MS',
@@ -16,6 +33,59 @@ const PRESERVED_TEST_ENV_KEYS = new Set([
   'OMX_NODE_TEST_RUNNER_TIMEOUT_MS',
   'OMX_NODE_TEST_TIMEOUT_MS',
 ]);
+const DIST_LOCK_CONFIG = resolveDistLockConfig(process.cwd());
+const DIST_LOCK_ROOT = DIST_LOCK_CONFIG.lockRoot;
+const DIST_BUILD_LOCK = DIST_LOCK_CONFIG.buildLock;
+const DIST_READER_LOCK = join(DIST_LOCK_ROOT, `dist-reader-${process.pid}-${Date.now()}`);
+const DIST_READER_TOKEN = `${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
+const DIST_STALE_UNOWNED_LOCK_MS = 60_000;
+const DIST_LOCK_TIMEOUT_MS = DIST_LOCK_CONFIG.timeoutMs;
+const DIST_LOCK_WAIT_BUFFER = new Int32Array(new SharedArrayBuffer(4));
+const DIST_CHILD_LEASE_MODULE = pathToFileURL(join(process.cwd(), 'src', 'scripts', 'dist-lock-child-lease.js')).href;
+let activeTestChild: ChildProcess | null = null;
+let shutdownExitCode = 0;
+
+function sleepForDistLock(ms: number): void {
+  Atomics.wait(DIST_LOCK_WAIT_BUFFER, 0, 0, ms);
+}
+
+function acquireDistReaderLock(): void {
+  mkdirSync(DIST_LOCK_ROOT, { recursive: true });
+  const deadline = Date.now() + DIST_LOCK_TIMEOUT_MS;
+  let waitingLogged = false;
+  while (true) {
+    recoverStaleOwnedLock(DIST_BUILD_LOCK, DIST_STALE_UNOWNED_LOCK_MS);
+    if (existsSync(DIST_BUILD_LOCK)) {
+      if (Date.now() >= deadline) throw new Error(`dist_reader_lock_timeout:${DIST_BUILD_LOCK}`);
+      if (!waitingLogged) {
+        console.error('[run-test-files] waiting for build to finish');
+        waitingLogged = true;
+      }
+      sleepForDistLock(100);
+      continue;
+    }
+    if (!tryCreateOwnedLock(DIST_READER_LOCK, {
+      pid: process.pid,
+      token: DIST_READER_TOKEN,
+      started_at: new Date().toISOString(),
+    })) continue;
+    if (!existsSync(DIST_BUILD_LOCK)) return;
+    releaseOwnedLock(DIST_READER_LOCK, DIST_READER_TOKEN);
+  }
+}
+
+function releaseDistReaderLock(): void {
+  releaseOwnedLock(DIST_READER_LOCK, DIST_READER_TOKEN);
+}
+
+try {
+  assertDistProcessTreeAuthority();
+  acquireDistReaderLock();
+} catch (error) {
+  console.error(`[run-test-files] ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(2);
+}
+process.on('exit', releaseDistReaderLock);
 
 type TestRunResult = {
   status: number | null;
@@ -141,6 +211,7 @@ console.error(
 );
 
 const childEnv = buildChildEnv(process.env);
+childEnv.OMX_DIST_READER_LOCK = DIST_READER_LOCK;
 
 function reportAbnormalExit(file: string, signal: NodeJS.Signals | null, errorMessage?: string): void {
   if (errorMessage) {
@@ -172,14 +243,45 @@ function signalChild(child: ChildProcess, signal: NodeJS.Signals): void {
   }
 }
 
-function terminateChild(child: ChildProcess): void {
-  signalChild(child, 'SIGTERM');
-  signalChild(child, 'SIGKILL');
+function terminateChild(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void {
+  signalChild(child, signal);
+  const timer = setTimeout(() => signalChild(child, 'SIGKILL'), 1_000);
+  timer.unref();
+  child.once('exit', () => clearTimeout(timer));
 }
 
-function runFileWithCompletionForceExit(file: string): Promise<TestRunResult> {
+async function drainChildGroup(child: ChildProcess, requireActiveLease = true): Promise<boolean> {
+  if (!child.pid) return true;
+  const childGroupIsAlive = (): boolean => isWindows()
+    ? isProcessAlive(child.pid ?? 0)
+    : isProcessGroupAlive(child.pid ?? 0);
+  if (requireActiveLease && !isOwnedChildLeaseActive(DIST_READER_LOCK, DIST_READER_TOKEN)) return true;
+  signalChild(child, 'SIGTERM');
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (!childGroupIsAlive()) return true;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+  }
+  signalChild(child, 'SIGKILL');
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (!childGroupIsAlive()) return true;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+  }
+  return false;
+}
+
+function requestRunnerShutdown(signal: NodeJS.Signals, exitCode: number): void {
+  if (shutdownExitCode) return;
+  shutdownExitCode = exitCode;
+  if (activeTestChild) terminateChild(activeTestChild, signal);
+}
+
+process.on('SIGINT', () => requestRunnerShutdown('SIGINT', 130));
+process.on('SIGTERM', () => requestRunnerShutdown('SIGTERM', 143));
+
+function runFile(file: string): Promise<TestRunResult> {
   return new Promise((resolveRun) => {
     let finished = false;
+    let pendingTermination: TestRunResult & { reason: string } | undefined;
     let sawFailure = false;
     let lastTapOk = 0;
     let tapTests: number | undefined;
@@ -192,30 +294,85 @@ function runFileWithCompletionForceExit(file: string): Promise<TestRunResult> {
     let stdoutRemainder = '';
     let stderrRemainder = '';
 
-    const child = spawn(process.execPath, [...sharedTestArgs, file], {
+    const leasePath = prepareOwnedChildLease(DIST_READER_LOCK, DIST_READER_TOKEN);
+    const child = spawn(process.execPath, ['--import', DIST_CHILD_LEASE_MODULE, ...sharedTestArgs, file], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: childEnv,
+      env: {
+        ...childEnv,
+        OMX_DIST_CHILD_LEASE: leasePath,
+        OMX_DIST_CHILD_LEASE_TOKEN: DIST_READER_TOKEN,
+      },
       detached: !isWindows(),
     });
+    activeTestChild = child;
+    if (!child.pid) {
+      activeTestChild = null;
+      terminateChild(child);
+      releaseOwnedChildLease(DIST_READER_LOCK, DIST_READER_TOKEN);
+      resolveRun({ status: null, signal: null, timedOut: false, abnormal: true, errorMessage: 'test child pid missing' });
+      return;
+    }
+    try {
+      activateOwnedChildLease(
+        DIST_READER_LOCK,
+        DIST_READER_TOKEN,
+        child.pid,
+        process.platform === 'win32' ? 0 : child.pid,
+      );
+    } catch (error) {
+      void (async () => {
+        const drained = await drainChildGroup(child, false);
+        const errorMessage = drained
+          ? error instanceof Error ? error.message : String(error)
+          : 'dist_test_child_group_live';
+        if (drained) releaseOwnedChildLease(DIST_READER_LOCK, DIST_READER_TOKEN);
+        if (activeTestChild === child) activeTestChild = null;
+        console.error(`[run-test-files] ${errorMessage}`);
+        resolveRun({
+          status: null,
+          signal: null,
+          timedOut: false,
+          abnormal: true,
+          errorMessage,
+        });
+      })();
+      return;
+    }
 
-    function finish(status: number | null, signal: NodeJS.Signals | null, reason: string, terminate: boolean): void {
+    async function complete(result: TestRunResult, reason: string): Promise<void> {
       if (finished) return;
       finished = true;
       if (completionTimer) clearTimeout(completionTimer);
       if (runnerTimer) clearTimeout(runnerTimer);
-      console.error(`[run-test-files] ${file}: ${reason}; status ${status ?? 'unknown'}`);
-      if (terminate) {
-        terminateChild(child);
-      }
+      const drained = await drainChildGroup(child);
+      const finalResult = drained
+        ? result
+        : { ...result, status: null, abnormal: true, errorMessage: 'dist_test_child_group_live' };
+      console.error(`[run-test-files] ${file}: ${reason}; status ${result.status ?? 'unknown'}`);
       child.stdout?.destroy();
       child.stderr?.destroy();
       child.unref();
-      resolveRun({
+      if (activeTestChild === child) activeTestChild = null;
+      if (drained) releaseOwnedChildLease(DIST_READER_LOCK, DIST_READER_TOKEN);
+      resolveRun(finalResult);
+    }
+
+    function finish(status: number | null, signal: NodeJS.Signals | null, reason: string, terminate: boolean): void {
+      const result = {
         status,
         signal,
         timedOut: reason.startsWith('runner timeout'),
         abnormal: status === null || signal !== null || reason.startsWith('node --test failed to spawn'),
-      });
+      };
+      if (!terminate) {
+        void complete(result, reason);
+        return;
+      }
+      if (pendingTermination) return;
+      pendingTermination = { ...result, reason };
+      if (completionTimer) clearTimeout(completionTimer);
+      if (runnerTimer) clearTimeout(runnerTimer);
+      terminateChild(child);
     }
 
     function markFailure(): void {
@@ -227,7 +384,7 @@ function runFileWithCompletionForceExit(file: string): Promise<TestRunResult> {
     }
 
     function armCompletionTimer(reason: string): void {
-      if (sawFailure) return;
+      if (!forceExit || sawFailure) return;
       if (completionTimer) clearTimeout(completionTimer);
       completionTimer = setTimeout(() => {
         if (sawFailure) return;
@@ -297,11 +454,21 @@ function runFileWithCompletionForceExit(file: string): Promise<TestRunResult> {
 
     child.on('error', (error) => {
       reportAbnormalExit(file, null, error.message);
-      finish(null, null, 'node --test failed to spawn', true);
+      void complete({
+        status: null,
+        signal: null,
+        timedOut: false,
+        abnormal: true,
+        errorMessage: error.message,
+      }, 'node --test failed to spawn');
     });
 
     child.on('exit', (status, signal) => {
       if (finished) return;
+      if (pendingTermination) {
+        void complete(pendingTermination, pendingTermination.reason);
+        return;
+      }
       if (stdoutRemainder) parseTapLine(stdoutRemainder);
       if (stderrRemainder) parseTapLine(stderrRemainder);
       if (typeof status === 'number') {
@@ -309,7 +476,12 @@ function runFileWithCompletionForceExit(file: string): Promise<TestRunResult> {
         return;
       }
       reportAbnormalExit(file, signal);
-      finish(null, signal, 'node --test exited without a numeric status', true);
+      void complete({
+        status: null,
+        signal,
+        timedOut: false,
+        abnormal: true,
+      }, 'node --test exited without a numeric status');
     });
 
     if (runnerTimeoutMs > 0) {
@@ -321,35 +493,15 @@ function runFileWithCompletionForceExit(file: string): Promise<TestRunResult> {
   });
 }
 
-function runFileSync(file: string): TestRunResult {
-  const result = spawnSync(process.execPath, [...sharedTestArgs, file], {
-    stdio: 'inherit',
-    env: childEnv,
-    timeout: runnerTimeoutMs > 0 ? runnerTimeoutMs : undefined,
-    killSignal: 'SIGTERM',
-  });
-
-  const timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT';
-  if (result.status !== 0 && (result.error || typeof result.status !== 'number')) {
-    reportAbnormalExit(file, result.signal, result.error?.message);
-  }
-
-  return {
-    status: result.status,
-    signal: result.signal,
-    errorMessage: result.error?.message,
-    timedOut,
-    abnormal: Boolean(result.error || typeof result.status !== 'number'),
-  };
-}
-
-async function main(): Promise<void> {
+async function main(): Promise<number> {
   const failedFiles: string[] = [];
   let abnormalExit = false;
   let runnerTimedOut = false;
 
   for (const file of files) {
-    const result = forceExit ? await runFileWithCompletionForceExit(file) : runFileSync(file);
+    if (shutdownExitCode) break;
+    const result = await runFile(file);
+    if (shutdownExitCode) break;
 
     if (result.status === 0) {
       continue;
@@ -358,6 +510,7 @@ async function main(): Promise<void> {
     failedFiles.push(file);
     abnormalExit = abnormalExit || result.abnormal;
     runnerTimedOut = runnerTimedOut || result.timedOut;
+    if (result.errorMessage === 'dist_test_child_group_live') break;
   }
 
   if (failedFiles.length > 0 || runnerTimedOut) {
@@ -370,10 +523,14 @@ async function main(): Promise<void> {
     for (const file of failedFiles) {
       console.error(`[run-test-files]   ${file}`);
     }
-    process.exit(1);
+    return 1;
   }
 
-  process.exit(0);
+  return shutdownExitCode;
 }
 
-await main();
+try {
+  process.exitCode = await main();
+} finally {
+  releaseDistReaderLock();
+}

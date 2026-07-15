@@ -31,6 +31,8 @@ OMX is a workflow layer for [OpenAI Codex CLI](https://github.com/openai/codex).
 </tr>
 </table>
 
+Compiled build/test serialization currently requires POSIX process-group and process-start identity authority. Native Windows or unavailable identity observation fails loud instead of risking concurrent `dist` mutation while descendant processes remain alive.
+
 It keeps Codex as the execution engine and makes it easier to:
 - start a stronger Codex session by default
 - run one consistent workflow from clarification to completion

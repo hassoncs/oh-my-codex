@@ -2266,12 +2266,16 @@ PY`,
       ) as {
         sessions?: Record<string, {
           leader_thread_id?: string;
-          threads?: Record<string, { kind?: string; mode?: string }>;
+          threads?: Record<string, { kind?: string; mode?: string; role?: string; thread_source?: string; parent_thread_id?: string; depth?: number }>;
         }>;
       };
       assert.equal(tracking.sessions?.[canonicalSessionId]?.leader_thread_id, leaderNativeSessionId);
       assert.equal(tracking.sessions?.[canonicalSessionId]?.threads?.[childNativeSessionId]?.kind, "subagent");
       assert.equal(tracking.sessions?.[canonicalSessionId]?.threads?.[childNativeSessionId]?.mode, "critic");
+      assert.equal(tracking.sessions?.[canonicalSessionId]?.threads?.[childNativeSessionId]?.role, "critic");
+      assert.equal(tracking.sessions?.[canonicalSessionId]?.threads?.[childNativeSessionId]?.thread_source, "subagent");
+      assert.equal(tracking.sessions?.[canonicalSessionId]?.threads?.[childNativeSessionId]?.parent_thread_id, leaderNativeSessionId);
+      assert.equal(tracking.sessions?.[canonicalSessionId]?.threads?.[childNativeSessionId]?.depth, 1);
       assert.equal(tracking.sessions?.[leaderNativeSessionId]?.leader_thread_id, leaderNativeSessionId);
       assert.equal(tracking.sessions?.[leaderNativeSessionId]?.threads?.[childNativeSessionId]?.kind, "subagent");
       assert.equal(tracking.sessions?.[leaderNativeSessionId]?.threads?.[childNativeSessionId]?.mode, "critic");
@@ -2360,6 +2364,17 @@ PY`,
         { cwd, sessionOwnerPid: process.pid },
       );
 
+      const tracking = JSON.parse(
+        await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"),
+      ) as {
+        sessions?: Record<string, {
+          threads?: Record<string, { kind?: string; thread_source?: string; depth?: number }>;
+        }>;
+      };
+      const child = tracking.sessions?.[canonicalSessionId]?.threads?.[childNativeSessionId];
+      assert.equal(child?.kind, "subagent");
+      assert.equal(child?.thread_source, undefined, "missing depth must not become verified lineage");
+      assert.equal(child?.depth, undefined);
       assert.equal(
         existsSync(join(cwd, "hook-events.jsonl")),
         false,
@@ -16985,8 +17000,9 @@ PY`,
       await mkdir(join(stateDir, "sessions", nativeSessionId), { recursive: true });
       await writeJson(join(stateDir, "session.json"), {
         session_id: nativeSessionId,
-        native_session_id: nativeSessionId,
+        native_session_id: "thread-leader",
         owner_omx_session_id: ownerSessionId,
+        owner_codex_thread_id: "thread-leader",
         cwd,
       });
       await writeJson(join(stateDir, "sessions", nativeSessionId, "skill-active-state.json"), {
@@ -17003,6 +17019,8 @@ PY`,
         session_id: nativeSessionId,
       });
       const now = "2026-06-30T00:00:00.000Z";
+      const architectCompletedAt = "2026-06-30T00:01:00.000Z";
+      const criticCompletedAt = "2026-06-30T00:02:00.000Z";
       await writeJson(join(stateDir, "subagent-tracking.json"), {
         schemaVersion: 1,
         sessions: {
@@ -17012,8 +17030,34 @@ PY`,
             updated_at: now,
             threads: {
               "thread-leader": { thread_id: "thread-leader", kind: "leader", first_seen_at: now, last_seen_at: now, turn_count: 1 },
-              "thread-architect": { thread_id: "thread-architect", kind: "subagent", first_seen_at: now, last_seen_at: now, completed_at: now, turn_count: 1 },
-              "thread-critic": { thread_id: "thread-critic", kind: "subagent", first_seen_at: now, last_seen_at: now, completed_at: now, turn_count: 1 },
+              "thread-architect": {
+                thread_id: "thread-architect",
+                kind: "subagent",
+                role: "architect",
+                thread_source: "subagent",
+                parent_thread_id: "thread-leader",
+                depth: 1,
+                first_seen_at: now,
+                last_seen_at: architectCompletedAt,
+                completed_at: architectCompletedAt,
+                last_turn_id: "turn-architect-1",
+                last_completed_turn_id: "turn-architect-1",
+                turn_count: 1,
+              },
+              "thread-critic": {
+                thread_id: "thread-critic",
+                kind: "subagent",
+                role: "critic",
+                thread_source: "subagent",
+                parent_thread_id: "thread-leader",
+                depth: 1,
+                first_seen_at: now,
+                last_seen_at: criticCompletedAt,
+                completed_at: criticCompletedAt,
+                last_turn_id: "turn-critic-1",
+                last_completed_turn_id: "turn-critic-1",
+                turn_count: 1,
+              },
             },
           },
         },
@@ -17030,6 +17074,8 @@ PY`,
           provenance_kind: "native_subagent",
           session_id: nativeSessionId,
           thread_id: "thread-architect",
+          completed_turn_id: "turn-architect-1",
+          completed_at: architectCompletedAt,
           artifact_path: ".omx/artifacts/architect.md",
           tracker_path: ".omx/state/subagent-tracking.json",
         },
@@ -17039,6 +17085,8 @@ PY`,
           provenance_kind: "native_subagent",
           session_id: nativeSessionId,
           thread_id: "thread-critic",
+          completed_turn_id: "turn-critic-1",
+          completed_at: criticCompletedAt,
           artifact_path: ".omx/artifacts/critic.md",
           tracker_path: ".omx/state/subagent-tracking.json",
         },
@@ -17055,7 +17103,7 @@ PY`,
         workingDirectory: cwd,
       });
 
-      assert.notEqual(writeResult.isError, true);
+      assert.notEqual(writeResult.isError, true, JSON.stringify(writeResult.payload));
       assert.equal(existsSync(join(stateDir, "sessions", ownerSessionId, "ralplan-state.json")), false);
       const result = await dispatchCodexNativeHook(
         {

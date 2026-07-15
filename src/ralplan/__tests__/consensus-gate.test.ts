@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { getBaseStateDir } from '../../state/paths.js';
@@ -98,6 +98,48 @@ describe('ralplan consensus gate state roots', () => {
     assert.equal(gate.source, 'later-malformed-source');
     assert.equal(gate.blockedReason, 'non_approving_ralplan_consensus_review');
     assert.match(gate.blockedDetails?.join(' ') ?? '', /sequence is not architect-review then critic-review/i);
+  });
+
+  it('rejects approvals without observable Architect-before-Critic order', () => {
+    const gate = buildRalplanConsensusGateFromSources([{
+      source: 'orderless-consensus',
+      value: {
+        ralplan_consensus_gate: {
+          complete: true,
+          sequence: ['architect-review', 'critic-review'],
+          ralplan_architect_review: { agent_role: 'architect', verdict: 'approve' },
+          ralplan_critic_review: { agent_role: 'critic', verdict: 'approve' },
+        },
+      },
+    }]);
+
+    assert.equal(gate.complete, false);
+    assert.match(gate.blockedDetails?.join(' ') ?? '', /parseable sequential order evidence/i);
+  });
+
+  it('rejects equal Architect and Critic order evidence', () => {
+    const gate = buildRalplanConsensusGateFromSources([{
+      source: 'equal-order-consensus',
+      value: {
+        ralplan_consensus_gate: {
+          complete: true,
+          sequence: ['architect-review', 'critic-review'],
+          ralplan_architect_review: {
+            agent_role: 'architect',
+            verdict: 'approve',
+            completed_at: '2026-06-12T10:00:00.000Z',
+          },
+          ralplan_critic_review: {
+            agent_role: 'critic',
+            verdict: 'approve',
+            completed_at: '2026-06-12T10:00:00.000Z',
+          },
+        },
+      },
+    }]);
+
+    assert.equal(gate.complete, false);
+    assert.match(gate.blockedDetails?.join(' ') ?? '', /lacks strict order/i);
   });
 
   it('lets fresh ordered direct consensus displace stale no-order invalid direct consensus', () => {
@@ -219,17 +261,27 @@ describe('ralplan consensus gate state roots', () => {
               'thread-architect': {
                 thread_id: 'thread-architect',
                 kind: 'subagent',
+                role: 'architect',
+                thread_source: 'subagent',
+                parent_thread_id: 'thread-leader',
+                depth: 1,
                 first_seen_at: '2026-06-11T16:29:30.000Z',
                 last_seen_at: '2026-06-11T16:29:30.000Z',
                 completed_at: '2026-06-11T16:29:30.000Z',
+                last_completed_turn_id: 'turn-architect-1',
                 turn_count: 1,
               },
               'thread-critic': {
                 thread_id: 'thread-critic',
                 kind: 'subagent',
+                role: 'critic',
+                thread_source: 'subagent',
+                parent_thread_id: 'thread-leader',
+                depth: 1,
                 first_seen_at: '2026-06-11T16:30:00.000Z',
                 last_seen_at: '2026-06-11T16:30:00.000Z',
                 completed_at: '2026-06-11T16:30:00.000Z',
+                last_completed_turn_id: 'turn-critic-1',
                 turn_count: 1,
               },
             },
@@ -248,6 +300,7 @@ describe('ralplan consensus gate state roots', () => {
               verdict: 'approve',
               session_id: sessionId,
               thread_id: 'thread-architect',
+              completed_turn_id: 'turn-architect-1',
               artifact_path: '.omx/plans/architect.md',
               tracker_path: '.omx/state/subagent-tracking.json',
               completed_at: '2026-06-11T16:29:30.000Z',
@@ -258,6 +311,7 @@ describe('ralplan consensus gate state roots', () => {
               verdict: 'approve',
               session_id: sessionId,
               thread_id: 'thread-critic',
+              completed_turn_id: 'turn-critic-1',
               artifact_path: '.omx/plans/critic.md',
               tracker_path: '.omx/state/subagent-tracking.json',
               completed_at: '2026-06-11T16:30:00.000Z',
@@ -274,6 +328,17 @@ describe('ralplan consensus gate state roots', () => {
       assert.equal(gate.complete, true);
       assert.equal(gate.blockedReason, null);
       assert.match(String(gate.source), new RegExp(`${boxedRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+
+      const trackerPath = subagentTrackingPath(cwd);
+      const unverifiedTracker = JSON.parse(await readFile(trackerPath, 'utf-8'));
+      delete unverifiedTracker.sessions[sessionId].threads['thread-architect'].depth;
+      await writeFile(trackerPath, JSON.stringify(unverifiedTracker, null, 2));
+      const unverifiedGate = buildRalplanConsensusGateForCwd(cwd, {
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(unverifiedGate.complete, false);
+      assert.match(unverifiedGate.blockedDetails?.join(' ') ?? '', /architect.*verified native lineage/i);
     } finally {
       if (typeof previousOmxRoot === 'string') process.env.OMX_ROOT = previousOmxRoot;
       else delete process.env.OMX_ROOT;
@@ -286,7 +351,7 @@ describe('ralplan consensus gate state roots', () => {
     }
   });
 
-  it('accepts ordered native reviews when runtime tracker lags but workspace tracker has completion evidence', async () => {
+  it('ranks tracker-invalid native evidence by freshness before older valid evidence', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-consensus-runtime-lag-'));
     const boxedRoot = await mkdtemp(join(tmpdir(), 'omx-ralplan-consensus-runtime-root-'));
     const previousOmxRoot = process.env.OMX_ROOT;
@@ -317,8 +382,8 @@ describe('ralplan consensus gate state roots', () => {
             updated_at: '2026-07-07T04:31:00.000Z',
             threads: {
               'thread-leader': { thread_id: 'thread-leader', kind: 'leader', first_seen_at: '2026-07-07T04:29:00.000Z', last_seen_at: '2026-07-07T04:29:00.000Z', turn_count: 1 },
-              'thread-architect': { thread_id: 'thread-architect', kind: 'subagent', first_seen_at: '2026-07-07T04:30:00.000Z', last_seen_at: '2026-07-07T04:30:00.000Z', turn_count: 1 },
-              'thread-critic': { thread_id: 'thread-critic', kind: 'subagent', first_seen_at: '2026-07-07T04:31:00.000Z', last_seen_at: '2026-07-07T04:31:00.000Z', turn_count: 1 },
+              'thread-architect': { thread_id: 'thread-architect', kind: 'subagent', first_seen_at: '2026-07-07T04:29:30.000Z', last_seen_at: '2026-07-07T04:29:30.000Z', turn_count: 1 },
+              'thread-critic': { thread_id: 'thread-critic', kind: 'subagent', first_seen_at: '2026-07-07T04:30:30.000Z', last_seen_at: '2026-07-07T04:30:30.000Z', turn_count: 1 },
             },
           },
         },
@@ -332,8 +397,9 @@ describe('ralplan consensus gate state roots', () => {
             updated_at: '2026-07-07T04:33:00.000Z',
             threads: {
               'thread-leader': { thread_id: 'thread-leader', kind: 'leader', first_seen_at: '2026-07-07T04:29:00.000Z', last_seen_at: '2026-07-07T04:29:00.000Z', turn_count: 1 },
-              'thread-architect': { thread_id: 'thread-architect', kind: 'subagent', first_seen_at: '2026-07-07T04:30:00.000Z', last_seen_at: '2026-07-07T04:30:00.000Z', completed_at: '2026-07-07T04:30:00.000Z', turn_count: 1 },
-              'thread-critic': { thread_id: 'thread-critic', kind: 'subagent', first_seen_at: '2026-07-07T04:31:00.000Z', last_seen_at: '2026-07-07T04:31:00.000Z', completed_at: '2026-07-07T04:31:00.000Z', turn_count: 1 },
+              'thread-parent': { thread_id: 'thread-parent', kind: 'subagent', thread_source: 'subagent', parent_thread_id: 'thread-leader', depth: 1, first_seen_at: '2026-07-07T04:29:30.000Z', last_seen_at: '2026-07-07T04:29:30.000Z', turn_count: 1 },
+              'thread-architect': { thread_id: 'thread-architect', kind: 'subagent', role: 'architect', thread_source: 'subagent', parent_thread_id: 'thread-leader', depth: 1, first_seen_at: '2026-07-07T04:30:00.000Z', last_seen_at: '2026-07-07T04:30:00.000Z', completed_at: '2026-07-07T04:30:00.000Z', last_completed_turn_id: 'turn-architect-cycle-2', completion_source: 'notify-fallback-watcher', turn_count: 1 },
+              'thread-critic': { thread_id: 'thread-critic', kind: 'subagent', role: 'critic', thread_source: 'subagent', parent_thread_id: 'thread-leader', depth: 1, first_seen_at: '2026-07-07T04:31:00.000Z', last_seen_at: '2026-07-07T04:31:00.000Z', completed_at: '2026-07-07T04:31:00.000Z', last_completed_turn_id: 'turn-critic-cycle-2', completion_source: 'notify-fallback-watcher', turn_count: 1 },
             },
           },
         },
@@ -354,6 +420,7 @@ describe('ralplan consensus gate state roots', () => {
             verdict: 'approve',
             session_id: sessionId,
             thread_id: 'thread-architect',
+            completed_turn_id: 'turn-architect-cycle-2',
             tracker_path: '.omx/state/subagent-tracking.json',
             completed_at: '2026-07-07T04:30:00.000Z',
           },
@@ -363,6 +430,7 @@ describe('ralplan consensus gate state roots', () => {
             verdict: 'approve',
             session_id: sessionId,
             thread_id: 'thread-critic',
+            completed_turn_id: 'turn-critic-cycle-2',
             tracker_path: '.omx/state/subagent-tracking.json',
             completed_at: '2026-07-07T04:31:00.000Z',
           },
@@ -376,6 +444,444 @@ describe('ralplan consensus gate state roots', () => {
 
       assert.equal(gate.complete, true);
       assert.equal(gate.blockedReason, null);
+
+      completedTracker.sessions[sessionId].threads['thread-architect'].last_completed_turn_id = 'turn-architect-cycle-1';
+      completedTracker.sessions[sessionId].threads['thread-critic'].last_completed_turn_id = 'turn-critic-cycle-1';
+      await writeFile(subagentTrackingPath(cwd), JSON.stringify(completedTracker, null, 2));
+      await writeFile(join(workspaceStateDir, 'subagent-tracking.json'), JSON.stringify(completedTracker, null, 2));
+      const olderValid = {
+        ralplan_consensus_gate: {
+          complete: true,
+          sequence: ['architect-review', 'critic-review'],
+          ralplan_architect_review: {
+            agent_role: 'architect',
+            provenance_kind: 'native_subagent',
+            verdict: 'approve',
+            review_cycle: 1,
+            session_id: sessionId,
+            thread_id: 'thread-architect',
+            completed_turn_id: 'turn-architect-cycle-1',
+            completed_at: '2026-07-07T04:30:00.000Z',
+          },
+          ralplan_critic_review: {
+            agent_role: 'critic',
+            provenance_kind: 'native_subagent',
+            verdict: 'approve',
+            review_cycle: 1,
+            session_id: sessionId,
+            thread_id: 'thread-critic',
+            completed_turn_id: 'turn-critic-cycle-1',
+            completed_at: '2026-07-07T04:31:00.000Z',
+          },
+        },
+      };
+      const newerInvalid = {
+        ralplan_consensus_gate: {
+          complete: true,
+          sequence: ['architect-review', 'critic-review'],
+          ralplan_architect_review: {
+            agent_role: 'architect',
+            provenance_kind: 'native_subagent',
+            verdict: 'approve',
+            review_cycle: 2,
+            session_id: sessionId,
+            thread_id: 'thread-architect',
+            completed_turn_id: 'turn-architect-cycle-2',
+            completed_at: '2026-07-07T04:32:00.000Z',
+          },
+          ralplan_critic_review: {
+            agent_role: 'critic',
+            provenance_kind: 'native_subagent',
+            verdict: 'approve',
+            review_cycle: 2,
+            session_id: sessionId,
+            thread_id: 'thread-critic',
+            completed_turn_id: 'turn-critic-cycle-2',
+            completed_at: '2026-07-07T04:33:00.000Z',
+          },
+        },
+      };
+      const newerInvalidGate = buildRalplanConsensusGateFromSources([
+        { source: 'older-tracker-valid', value: olderValid },
+        { source: 'newer-tracker-invalid', value: newerInvalid },
+      ], {
+        cwd,
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(newerInvalidGate.complete, false);
+      assert.equal(newerInvalidGate.source, 'newer-tracker-invalid');
+      assert.match(newerInvalidGate.blockedDetails?.join(' ') ?? '', /completed_turn_id=turn-architect-cycle-2 does not match tracker last_completed_turn_id=turn-architect-cycle-1/);
+
+      completedTracker.sessions[sessionId].threads['thread-architect'].last_completed_turn_id = 'turn-architect-cycle-2';
+      completedTracker.sessions[sessionId].threads['thread-critic'].last_completed_turn_id = 'turn-critic-cycle-2';
+      await writeFile(subagentTrackingPath(cwd), JSON.stringify(completedTracker, null, 2));
+      await writeFile(join(workspaceStateDir, 'subagent-tracking.json'), JSON.stringify(completedTracker, null, 2));
+      const newerValidGate = buildRalplanConsensusGateFromSources([
+        { source: 'older-tracker-valid', value: olderValid },
+        { source: 'newer-tracker-valid', value: newerInvalid },
+      ], {
+        cwd,
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(newerValidGate.complete, true);
+      assert.equal(newerValidGate.source, 'newer-tracker-valid');
+
+      completedTracker.sessions[sessionId].threads['thread-architect'].last_completed_turn_id = 'turn-architect-cycle-1';
+      await writeFile(subagentTrackingPath(cwd), JSON.stringify(completedTracker, null, 2));
+      await writeFile(join(workspaceStateDir, 'subagent-tracking.json'), JSON.stringify(completedTracker, null, 2));
+      const staleCompletionGate = buildRalplanConsensusGateForCwd(cwd, {
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(staleCompletionGate.complete, false);
+      assert.match(staleCompletionGate.blockedDetails?.join(' ') ?? '', /completed_turn_id=turn-architect-cycle-2 does not match tracker last_completed_turn_id=turn-architect-cycle-1/);
+
+      completedTracker.sessions[sessionId].threads['thread-architect'].last_completed_turn_id = 'turn-architect-cycle-2';
+      await writeFile(subagentTrackingPath(cwd), JSON.stringify(completedTracker, null, 2));
+      await writeFile(join(workspaceStateDir, 'subagent-tracking.json'), JSON.stringify(completedTracker, null, 2));
+
+      completedTracker.sessions[sessionId].threads['thread-architect'].role = 'critic';
+      await writeFile(subagentTrackingPath(cwd), JSON.stringify(completedTracker, null, 2));
+      await writeFile(join(workspaceStateDir, 'subagent-tracking.json'), JSON.stringify(completedTracker, null, 2));
+      const wrongRoleGate = buildRalplanConsensusGateForCwd(cwd, {
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(wrongRoleGate.complete, false);
+      assert.match(wrongRoleGate.blockedDetails?.join(' ') ?? '', /architect.*role=critic/);
+
+      completedTracker.sessions[sessionId].threads['thread-architect'].role = 'architect';
+      completedTracker.sessions[sessionId].threads['thread-architect'].parent_thread_id = 'foreign-leader';
+      await writeFile(subagentTrackingPath(cwd), JSON.stringify(completedTracker, null, 2));
+      await writeFile(join(workspaceStateDir, 'subagent-tracking.json'), JSON.stringify(completedTracker, null, 2));
+      const wrongParentGate = buildRalplanConsensusGateForCwd(cwd, {
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(wrongParentGate.complete, false);
+      assert.match(wrongParentGate.blockedDetails?.join(' ') ?? '', /architect.*lacks verified native lineage/);
+
+      completedTracker.sessions[sessionId].threads['thread-architect'].parent_thread_id = 'thread-leader';
+      completedTracker.sessions[sessionId].threads['thread-architect'].parent_thread_id = 'thread-parent';
+      completedTracker.sessions[sessionId].threads['thread-architect'].depth = 2;
+      await writeFile(subagentTrackingPath(cwd), JSON.stringify(completedTracker, null, 2));
+      await writeFile(join(workspaceStateDir, 'subagent-tracking.json'), JSON.stringify(completedTracker, null, 2));
+      const nestedParentGate = buildRalplanConsensusGateForCwd(cwd, {
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(nestedParentGate.complete, true);
+
+      completedTracker.sessions[sessionId].threads['thread-parent'].thread_source = '';
+      await writeFile(subagentTrackingPath(cwd), JSON.stringify(completedTracker, null, 2));
+      await writeFile(join(workspaceStateDir, 'subagent-tracking.json'), JSON.stringify(completedTracker, null, 2));
+      const untrustedNestedParentGate = buildRalplanConsensusGateForCwd(cwd, {
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(untrustedNestedParentGate.complete, false);
+      assert.match(untrustedNestedParentGate.blockedDetails?.join(' ') ?? '', /architect.*lacks verified native lineage/);
+
+      completedTracker.sessions[sessionId].threads['thread-parent'].thread_source = 'subagent';
+      completedTracker.sessions[sessionId].threads['thread-architect'].parent_thread_id = 'thread-leader';
+      completedTracker.sessions[sessionId].threads['thread-architect'].depth = 1;
+      completedTracker.sessions[sessionId].threads['thread-architect'].completed_at = '2026-07-07T04:32:00.000Z';
+      await writeFile(subagentTrackingPath(cwd), JSON.stringify(completedTracker, null, 2));
+      await writeFile(join(workspaceStateDir, 'subagent-tracking.json'), JSON.stringify(completedTracker, null, 2));
+      const reversedTrackerOrderGate = buildRalplanConsensusGateForCwd(cwd, {
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(reversedTrackerOrderGate.complete, false);
+      assert.match(reversedTrackerOrderGate.blockedDetails?.join(' ') ?? '', /critic tracker thread did not complete strictly after architect/i);
+
+      completedTracker.sessions[sessionId].threads['thread-architect'].completed_at = '2026-07-07T04:31:00.000Z';
+      await writeFile(subagentTrackingPath(cwd), JSON.stringify(completedTracker, null, 2));
+      await writeFile(join(workspaceStateDir, 'subagent-tracking.json'), JSON.stringify(completedTracker, null, 2));
+      const equalTrackerOrderGate = buildRalplanConsensusGateForCwd(cwd, {
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(equalTrackerOrderGate.complete, false);
+      assert.match(equalTrackerOrderGate.blockedDetails?.join(' ') ?? '', /critic tracker thread did not complete strictly after architect/i);
+
+      completedTracker.sessions[sessionId].threads['thread-architect'].completed_at = '2026-07-07T04:30:00.000Z';
+      await writeFile(subagentTrackingPath(cwd), JSON.stringify(completedTracker, null, 2));
+      await writeFile(join(workspaceStateDir, 'subagent-tracking.json'), JSON.stringify(completedTracker, null, 2));
+      await writeFile(join(runtimeStateDir, 'session.json'), JSON.stringify({
+        session_id: sessionId,
+        native_session_id: 'current-native-leader',
+        cwd,
+      }, null, 2));
+      const staleLeaderGate = buildRalplanConsensusGateForCwd(cwd, {
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(staleLeaderGate.complete, false);
+      assert.match(staleLeaderGate.blockedDetails?.join(' ') ?? '', /tracker leader thread-leader does not match current native leader current-native-leader/);
+    } finally {
+      if (typeof previousOmxRoot === 'string') process.env.OMX_ROOT = previousOmxRoot;
+      else delete process.env.OMX_ROOT;
+      if (typeof previousOmxStateRoot === 'string') process.env.OMX_STATE_ROOT = previousOmxStateRoot;
+      else delete process.env.OMX_STATE_ROOT;
+      if (typeof previousOmxTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousOmxTeamStateRoot;
+      else delete process.env.OMX_TEAM_STATE_ROOT;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(boxedRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('selects the freshest parseable tracker replica before matching completion identity', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-consensus-replica-cwd-'));
+    const boxedRoot = await mkdtemp(join(tmpdir(), 'omx-ralplan-consensus-replica-runtime-'));
+    const previousOmxRoot = process.env.OMX_ROOT;
+    const previousOmxStateRoot = process.env.OMX_STATE_ROOT;
+    const previousOmxTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
+    const sessionId = 'sess-replica-freshness';
+    try {
+      delete process.env.OMX_ROOT;
+      delete process.env.OMX_TEAM_STATE_ROOT;
+      process.env.OMX_STATE_ROOT = boxedRoot;
+      const runtimeStateDir = getBaseStateDir(cwd);
+      const runtimeTrackerPath = subagentTrackingPath(cwd);
+      const workspaceStateDir = join(cwd, '.omx', 'state');
+      const workspaceTrackerPath = join(workspaceStateDir, 'subagent-tracking.json');
+      await mkdir(runtimeStateDir, { recursive: true });
+      await mkdir(workspaceStateDir, { recursive: true });
+      await writeFile(join(runtimeStateDir, 'session.json'), JSON.stringify({
+        session_id: sessionId,
+        native_session_id: 'thread-leader',
+        cwd,
+      }, null, 2));
+
+      function tracker(
+        architectTurnId: string,
+        criticTurnId: string,
+        architectCompletedAt: string,
+        criticCompletedAt: string,
+        inProgress = false,
+        currentTurnIds?: { architect: string; critic: string },
+      ): Record<string, unknown> {
+        return {
+          schemaVersion: 1,
+          sessions: {
+            [sessionId]: {
+              session_id: sessionId,
+              leader_thread_id: 'thread-leader',
+              updated_at: criticCompletedAt,
+              threads: {
+                'thread-leader': {
+                  thread_id: 'thread-leader',
+                  kind: 'leader',
+                  first_seen_at: '2026-07-07T00:00:00.000Z',
+                  last_seen_at: '2026-07-07T00:00:00.000Z',
+                  turn_count: 1,
+                },
+                'thread-architect': {
+                  thread_id: 'thread-architect',
+                  kind: 'subagent',
+                  role: 'architect',
+                  thread_source: 'subagent',
+                  parent_thread_id: 'thread-leader',
+                  depth: 1,
+                  first_seen_at: architectCompletedAt,
+                  last_seen_at: architectCompletedAt,
+                  last_turn_id: currentTurnIds?.architect ?? architectTurnId,
+                  ...(inProgress ? {} : {
+                    completed_at: architectCompletedAt,
+                    last_completed_turn_id: architectTurnId,
+                  }),
+                  turn_count: 1,
+                },
+                'thread-critic': {
+                  thread_id: 'thread-critic',
+                  kind: 'subagent',
+                  role: 'critic',
+                  thread_source: 'subagent',
+                  parent_thread_id: 'thread-leader',
+                  depth: 1,
+                  first_seen_at: criticCompletedAt,
+                  last_seen_at: criticCompletedAt,
+                  last_turn_id: currentTurnIds?.critic ?? criticTurnId,
+                  ...(inProgress ? {} : {
+                    completed_at: criticCompletedAt,
+                    last_completed_turn_id: criticTurnId,
+                  }),
+                  turn_count: 1,
+                },
+              },
+            },
+          },
+        };
+      }
+
+      function reviewEvidence(architectTurnId: string, criticTurnId: string): Record<string, unknown> {
+        return {
+          ralplan_consensus_gate: {
+            complete: true,
+            sequence: ['architect-review', 'critic-review'],
+            ralplan_architect_review: {
+              agent_role: 'architect',
+              provenance_kind: 'native_subagent',
+              verdict: 'approve',
+              session_id: sessionId,
+              thread_id: 'thread-architect',
+              completed_turn_id: architectTurnId,
+              completed_at: '2026-07-07T00:05:00.000Z',
+            },
+            ralplan_critic_review: {
+              agent_role: 'critic',
+              provenance_kind: 'native_subagent',
+              verdict: 'approve',
+              session_id: sessionId,
+              thread_id: 'thread-critic',
+              completed_turn_id: criticTurnId,
+              completed_at: '2026-07-07T00:06:00.000Z',
+            },
+          },
+        };
+      }
+
+      await writeFile(runtimeTrackerPath, JSON.stringify(tracker(
+        'turn-architect-2',
+        'turn-critic-2',
+        '2026-07-07T00:03:00.000Z',
+        '2026-07-07T00:04:00.000Z',
+        true,
+      ), null, 2));
+      await writeFile(workspaceTrackerPath, JSON.stringify(tracker(
+        'turn-architect-1',
+        'turn-critic-1',
+        '2026-07-07T00:01:00.000Z',
+        '2026-07-07T00:02:00.000Z',
+      ), null, 2));
+
+      const staleFallbackGate = buildRalplanConsensusGateFromSources([{
+        source: 'stale-workspace-review',
+        value: reviewEvidence('turn-architect-1', 'turn-critic-1'),
+      }], {
+        cwd,
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(staleFallbackGate.complete, false);
+      assert.match(staleFallbackGate.blockedDetails?.join(' ') ?? '', /architect tracker thread thread-architect is not completed/);
+      assert.equal(staleFallbackGate.diagnostic?.architect.tracker_path, runtimeTrackerPath);
+      assert.equal(staleFallbackGate.diagnostic?.architect.tracker_last_turn_id, 'turn-architect-2');
+      assert.equal(staleFallbackGate.diagnostic?.architect.tracker_has_current_turn, true);
+
+      await writeFile(runtimeTrackerPath, JSON.stringify(tracker(
+        'turn-architect-1',
+        'turn-critic-1',
+        '2026-07-07T00:03:00.000Z',
+        '2026-07-07T00:04:00.000Z',
+        false,
+        { architect: 'turn-architect-2', critic: 'turn-critic-2' },
+      ), null, 2));
+      const retainedCompletionGate = buildRalplanConsensusGateFromSources([{
+        source: 'retained-old-completion',
+        value: reviewEvidence('turn-architect-1', 'turn-critic-1'),
+      }], {
+        cwd,
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(retainedCompletionGate.complete, false);
+      assert.match(retainedCompletionGate.blockedDetails?.join(' ') ?? '', /current last_turn_id=turn-architect-2 after last_completed_turn_id=turn-architect-1/);
+      assert.equal(retainedCompletionGate.diagnostic?.architect.tracker_has_current_turn, true);
+
+      await writeFile(runtimeTrackerPath, JSON.stringify(tracker(
+        'turn-architect-1',
+        'turn-critic-1',
+        '2026-07-07T00:03:00.000Z',
+        '2026-07-07T00:04:00.000Z',
+      ), null, 2));
+      const completedSameTurnGate = buildRalplanConsensusGateFromSources([{
+        source: 'same-turn-completion',
+        value: reviewEvidence('turn-architect-1', 'turn-critic-1'),
+      }], {
+        cwd,
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(completedSameTurnGate.complete, true);
+      assert.equal(completedSameTurnGate.source, 'same-turn-completion');
+
+      await writeFile(runtimeTrackerPath, JSON.stringify(tracker(
+        'turn-architect-2',
+        'turn-critic-2',
+        '2026-07-07T00:03:00.000Z',
+        '2026-07-07T00:04:00.000Z',
+      ), null, 2));
+      await writeFile(workspaceTrackerPath, JSON.stringify(tracker(
+        'turn-architect-1',
+        'turn-critic-1',
+        '2026-07-07T00:03:00.000Z',
+        '2026-07-07T00:04:00.000Z',
+      ), null, 2));
+      const expectedTieGate = buildRalplanConsensusGateFromSources([{
+        source: 'equal-time-stale-workspace-review',
+        value: reviewEvidence('turn-architect-1', 'turn-critic-1'),
+      }], {
+        cwd,
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(expectedTieGate.complete, false);
+      assert.match(expectedTieGate.blockedDetails?.join(' ') ?? '', /completed_turn_id=turn-architect-1 does not match tracker last_completed_turn_id=turn-architect-2/);
+      assert.equal(expectedTieGate.diagnostic?.architect.tracker_path, runtimeTrackerPath);
+
+      await writeFile(runtimeTrackerPath, JSON.stringify(tracker(
+        'turn-architect-1',
+        'turn-critic-1',
+        '2026-07-07T00:03:00.000Z',
+        '2026-07-07T00:04:00.000Z',
+      ), null, 2));
+      await writeFile(workspaceTrackerPath, JSON.stringify(tracker(
+        'turn-architect-2',
+        'turn-critic-2',
+        '2026-07-07T00:03:00.000Z',
+        '2026-07-07T00:04:00.000Z',
+        true,
+      ), null, 2));
+      const currentTurnTieGate = buildRalplanConsensusGateFromSources([{
+        source: 'equal-time-current-workspace-review',
+        value: reviewEvidence('turn-architect-1', 'turn-critic-1'),
+      }], {
+        cwd,
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(currentTurnTieGate.complete, false);
+      assert.match(currentTurnTieGate.blockedDetails?.join(' ') ?? '', /architect tracker thread thread-architect is not completed/);
+      assert.equal(currentTurnTieGate.diagnostic?.architect.tracker_path, workspaceTrackerPath);
+      assert.equal(currentTurnTieGate.diagnostic?.architect.tracker_has_current_turn, true);
+
+      await writeFile(runtimeTrackerPath, JSON.stringify(tracker(
+        'turn-architect-1',
+        'turn-critic-1',
+        '2026-07-07T00:01:00.000Z',
+        '2026-07-07T00:02:00.000Z',
+      ), null, 2));
+      await writeFile(workspaceTrackerPath, JSON.stringify(tracker(
+        'turn-architect-2',
+        'turn-critic-2',
+        '2026-07-07T00:03:00.000Z',
+        '2026-07-07T00:04:00.000Z',
+      ), null, 2));
+
+      const workspaceNewerGate = buildRalplanConsensusGateFromSources([{
+        source: 'fresh-workspace-review',
+        value: reviewEvidence('turn-architect-2', 'turn-critic-2'),
+      }], {
+        cwd,
+        sessionId,
+        requireNativeSubagents: true,
+      });
+      assert.equal(workspaceNewerGate.complete, true);
+      assert.equal(workspaceNewerGate.source, 'fresh-workspace-review');
     } finally {
       if (typeof previousOmxRoot === 'string') process.env.OMX_ROOT = previousOmxRoot;
       else delete process.env.OMX_ROOT;
@@ -508,17 +1014,27 @@ describe('ralplan consensus gate state roots', () => {
               'thread-architect': {
                 thread_id: 'thread-architect',
                 kind: 'subagent',
+                role: 'architect',
+                thread_source: 'subagent',
+                parent_thread_id: 'thread-leader',
+                depth: 1,
                 first_seen_at: '2026-06-12T10:02:00.000Z',
                 last_seen_at: '2026-06-12T10:02:00.000Z',
                 completed_at: '2026-06-12T10:02:00.000Z',
+                last_completed_turn_id: 'turn-architect-1',
                 turn_count: 1,
               },
               'thread-critic': {
                 thread_id: 'thread-critic',
                 kind: 'subagent',
+                role: 'critic',
+                thread_source: 'subagent',
+                parent_thread_id: 'thread-leader',
+                depth: 1,
                 first_seen_at: '2026-06-12T10:03:00.000Z',
                 last_seen_at: '2026-06-12T10:03:00.000Z',
                 completed_at: '2026-06-12T10:03:00.000Z',
+                last_completed_turn_id: 'turn-critic-1',
                 turn_count: 1,
               },
             },
@@ -534,6 +1050,7 @@ describe('ralplan consensus gate state roots', () => {
             provenance_kind: 'native_subagent',
             verdict: 'approve',
             thread_id: 'thread-architect',
+            completed_turn_id: 'turn-architect-1',
             completed_at: '2026-06-12T10:02:00.000Z',
           },
           ralplan_critic_review: {
@@ -541,6 +1058,7 @@ describe('ralplan consensus gate state roots', () => {
             provenance_kind: 'native_subagent',
             verdict: 'approve',
             thread_id: 'thread-critic',
+            completed_turn_id: 'turn-critic-1',
             completed_at: '2026-06-12T10:03:00.000Z',
           },
         },

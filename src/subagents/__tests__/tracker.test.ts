@@ -1,12 +1,51 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   buildSubagentResumeLedger,
   createSubagentTrackingState,
+  hasVerifiedNativeSubagentLineage,
   recordSubagentTurn,
+  recordSubagentTurnForSession,
+  readSubagentTrackingState,
   selectReusableSubagentEntry,
+  subagentTrackingPath,
   summarizeSubagentSession,
 } from '../tracker.js';
+
+async function runTrackerWriter(cwd: string, input: Record<string, unknown>): Promise<void> {
+  const trackerModule = new URL('../tracker.js', import.meta.url).href;
+  const source = [
+    `import { recordSubagentTurnForSession } from ${JSON.stringify(trackerModule)};`,
+    `await recordSubagentTurnForSession(${JSON.stringify(cwd)}, ${JSON.stringify(input)});`,
+  ].join('\n');
+  await new Promise<void>((resolveRun, rejectRun) => {
+    const child = spawn(process.execPath, ['--input-type=module', '--eval', source], { stdio: 'ignore' });
+    child.on('error', rejectRun);
+    child.on('exit', (status, signal) => {
+      if (status === 0) resolveRun();
+      else rejectRun(new Error(`tracker writer exited status=${status ?? 'null'} signal=${signal ?? 'none'}`));
+    });
+  });
+}
+
+function currentProcessStartIdentity(): string {
+  const result = process.platform === 'win32'
+    ? spawnSync('powershell.exe', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `(Get-Process -Id ${process.pid} -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o')`,
+      ], { encoding: 'utf-8', timeout: 1_000, windowsHide: true })
+    : spawnSync('/bin/ps', ['-o', 'lstart=', '-p', String(process.pid)], { encoding: 'utf-8', timeout: 1_000 });
+  assert.equal(result.status, 0);
+  assert.ok(result.stdout.trim());
+  return result.stdout.trim();
+}
 
 describe('subagents/tracker', () => {
   it('tracks leader and subagent threads per session and computes active windows', () => {
@@ -341,6 +380,257 @@ describe('subagents/tracker', () => {
     assert.equal(thread?.last_completed_turn_id, undefined);
     assert.equal(thread?.completion_source, undefined);
     assert.equal(thread?.last_turn_id, 'turn-3');
+  });
+
+  it('enriches a native-first turn with fallback completion without double-counting it', () => {
+    let state = createSubagentTrackingState();
+    state = recordSubagentTurn(state, {
+      sessionId: 'session-1',
+      threadId: 'subagent-1',
+      turnId: 'turn-1',
+      timestamp: '2026-07-15T01:00:00.000Z',
+      kind: 'subagent',
+      role: 'architect',
+    });
+    state = recordSubagentTurn(state, {
+      sessionId: 'session-1',
+      threadId: 'subagent-1',
+      turnId: 'turn-1',
+      timestamp: '2026-07-15T01:00:01.000Z',
+      kind: 'subagent',
+      role: 'architect',
+      completed: true,
+      completionSource: 'notify-fallback-watcher',
+    });
+
+    const thread = state.sessions['session-1']?.threads['subagent-1'];
+    assert.equal(thread?.turn_count, 1);
+    assert.equal(thread?.completed_at, '2026-07-15T01:00:01.000Z');
+    assert.equal(thread?.last_completed_turn_id, 'turn-1');
+  });
+
+  it('replaces a stale session leader only when authoritative identity requests it', () => {
+    let state = createSubagentTrackingState();
+    state = recordSubagentTurn(state, {
+      sessionId: 'session-1',
+      threadId: 'stale-leader',
+      kind: 'leader',
+    });
+    state = recordSubagentTurn(state, {
+      sessionId: 'session-1',
+      threadId: 'current-leader',
+      kind: 'leader',
+      replaceLeader: true,
+    });
+
+    assert.equal(state.sessions['session-1']?.leader_thread_id, 'current-leader');
+    assert.equal(state.sessions['session-1']?.threads['current-leader']?.kind, 'leader');
+    assert.equal(state.sessions['session-1']?.threads['stale-leader']?.kind, 'leader');
+  });
+
+  it('reclassifies a stale leader when authoritative subagent provenance arrives', () => {
+    let state = createSubagentTrackingState();
+    state = recordSubagentTurn(state, {
+      sessionId: 'session-1',
+      threadId: 'stale-leader',
+      kind: 'leader',
+    });
+    state = recordSubagentTurn(state, {
+      sessionId: 'session-1',
+      threadId: 'current-leader',
+      kind: 'leader',
+      replaceLeader: true,
+    });
+    state = recordSubagentTurn(state, {
+      sessionId: 'session-1',
+      threadId: 'stale-leader',
+      kind: 'subagent',
+      leaderThreadId: 'current-leader',
+      parentThreadId: 'current-leader',
+      depth: 1,
+      threadSource: 'subagent',
+    });
+
+    assert.equal(state.sessions['session-1']?.leader_thread_id, 'current-leader');
+    assert.equal(state.sessions['session-1']?.threads['current-leader']?.kind, 'leader');
+    assert.equal(state.sessions['session-1']?.threads['stale-leader']?.kind, 'subagent');
+  });
+
+  it('requires recursive native provenance before trusting nested lineage', () => {
+    let state = createSubagentTrackingState();
+    state = recordSubagentTurn(state, {
+      sessionId: 'session-1',
+      threadId: 'leader',
+      kind: 'leader',
+    });
+    state = recordSubagentTurn(state, {
+      sessionId: 'session-1',
+      threadId: 'parent',
+      kind: 'subagent',
+      leaderThreadId: 'leader',
+      threadSource: 'subagent',
+      parentThreadId: 'leader',
+      depth: 1,
+    });
+    state = recordSubagentTurn(state, {
+      sessionId: 'session-1',
+      threadId: 'nested',
+      kind: 'subagent',
+      leaderThreadId: 'leader',
+      threadSource: 'subagent',
+      parentThreadId: 'parent',
+      depth: 2,
+    });
+
+    const session = state.sessions['session-1'];
+    assert.equal(hasVerifiedNativeSubagentLineage(session, 'nested'), true);
+    if (session?.threads.parent) delete session.threads.parent.thread_source;
+    assert.equal(hasVerifiedNativeSubagentLineage(session, 'nested'), false);
+  });
+
+  it('serializes concurrent cross-process writers without losing threads', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-subagent-tracker-concurrent-'));
+    try {
+      await recordSubagentTurnForSession(cwd, {
+        sessionId: 'session-1',
+        threadId: 'leader',
+        kind: 'leader',
+      });
+      const threadIds = Array.from({ length: 16 }, (_, index) => `child-${index}`);
+      await Promise.all(threadIds.map((threadId, index) => runTrackerWriter(cwd, {
+        sessionId: 'session-1',
+        threadId,
+        turnId: `turn-${threadId}`,
+        kind: 'subagent',
+        leaderThreadId: 'leader',
+        threadSource: 'subagent',
+        parentThreadId: 'leader',
+        depth: 1,
+      })));
+
+      const tracking = JSON.parse(await readFile(subagentTrackingPath(cwd), 'utf-8'));
+      assert.deepEqual(
+        threadIds.filter((threadId) => tracking.sessions?.['session-1']?.threads?.[threadId]).sort(),
+        threadIds.sort(),
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps same-turn fallback and native writes idempotent across processes', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-subagent-tracker-same-turn-'));
+    try {
+      const nativeInput = {
+        sessionId: 'session-1',
+        threadId: 'architect',
+        turnId: 'turn-1',
+        kind: 'subagent',
+        leaderThreadId: 'leader',
+        role: 'architect',
+      };
+      const fallbackInput = {
+        ...nativeInput,
+        threadSource: 'subagent',
+        parentThreadId: 'leader',
+        depth: 1,
+        completed: true,
+        completionSource: 'notify-fallback-watcher',
+      };
+      await recordSubagentTurnForSession(cwd, {
+        sessionId: 'session-1',
+        threadId: 'leader',
+        kind: 'leader',
+      });
+      await Promise.all(Array.from({ length: 20 }, (_, index) => (
+        runTrackerWriter(cwd, index % 2 === 0 ? nativeInput : fallbackInput)
+      )));
+
+      const thread = (await readSubagentTrackingState(cwd)).sessions['session-1']?.threads.architect;
+      assert.equal(thread?.turn_count, 1);
+      assert.equal(thread?.role, 'architect');
+      assert.equal(thread?.thread_source, 'subagent');
+      assert.equal(thread?.parent_thread_id, 'leader');
+      assert.equal(thread?.depth, 1);
+      assert.equal(thread?.last_completed_turn_id, 'turn-1');
+      assert.equal(thread?.completion_source, 'notify-fallback-watcher');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers dead-owner locks and atomically replaces malformed state', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-subagent-tracker-stale-lock-'));
+    try {
+      const path = subagentTrackingPath(cwd);
+      const lockPath = `${path}.lock`;
+      const recoveryDir = `${lockPath}.recovery`;
+      await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
+      await writeFile(lockPath, JSON.stringify({
+        pid: process.pid,
+        process_start_identity: 'reused-process',
+        token: 'stale',
+      }));
+      await mkdir(recoveryDir, { recursive: true });
+      await writeFile(
+        join(recoveryDir, 'candidate-00000000000000000000-stale'),
+        JSON.stringify({ pid: process.pid, process_start_identity: 'reused-process' }),
+      );
+      const agedCandidate = join(recoveryDir, 'candidate-00000000000000000001-aged');
+      await writeFile(agedCandidate, JSON.stringify({ pid: process.pid }));
+      const agedAt = new Date(Date.now() - 10_000);
+      await utimes(agedCandidate, agedAt, agedAt);
+      await writeFile(path, '{malformed');
+
+      const threadIds = Array.from({ length: 12 }, (_, index) => `recovered-${index}`);
+      await Promise.all(threadIds.map((threadId, index) => runTrackerWriter(cwd, {
+        sessionId: 'session-1',
+        threadId,
+        kind: index === 0 ? 'leader' : 'subagent',
+      })));
+
+      const tracking = JSON.parse(await readFile(path, 'utf-8'));
+      assert.deepEqual(
+        threadIds.filter((threadId) => tracking.sessions?.['session-1']?.threads?.[threadId]).sort(),
+        threadIds.sort(),
+      );
+      assert.equal((await readdir(join(cwd, '.omx', 'state'))).some((name) => name.includes('.tmp.')), false);
+      assert.deepEqual(await readdir(recoveryDir), []);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not evict an aged identity-verified live recovery candidate', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-subagent-tracker-live-reaper-'));
+    try {
+      const path = subagentTrackingPath(cwd);
+      const lockPath = `${path}.lock`;
+      const recoveryDir = `${lockPath}.recovery`;
+      const liveCandidate = join(recoveryDir, 'candidate-00000000000000000000-live');
+      await mkdir(recoveryDir, { recursive: true });
+      await writeFile(lockPath, JSON.stringify({ pid: process.pid + 1_000_000, token: 'stale' }));
+      await writeFile(liveCandidate, JSON.stringify({
+        pid: process.pid,
+        process_start_identity: currentProcessStartIdentity(),
+      }));
+      const agedAt = new Date(Date.now() - 10_000);
+      await utimes(liveCandidate, agedAt, agedAt);
+
+      const writer = runTrackerWriter(cwd, {
+        sessionId: 'session-1',
+        threadId: 'leader',
+        kind: 'leader',
+      });
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+      assert.equal(existsSync(liveCandidate), true);
+      await rm(liveCandidate, { force: true });
+      await writer;
+      const tracking = await readSubagentTrackingState(cwd);
+      assert.equal(tracking.sessions['session-1']?.leader_thread_id, 'leader');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 
   it('records role and lane metadata for restart resume/reuse summaries', () => {

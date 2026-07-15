@@ -10,6 +10,7 @@ dist/
 
 # Local agent/worktree artifacts (never commit)
 .ch5/state/
+.ch5/timing/
 .claude/
 .claire/
 .agents/*
