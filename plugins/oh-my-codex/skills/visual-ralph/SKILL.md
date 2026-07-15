@@ -17,6 +17,8 @@ For live URL cloning requests, Visual Ralph owns the migrated `$web-clone` use c
 
 This is an orchestration skill. It composes existing skills and must not add runtime commands, dependencies, or app-specific assumptions by itself.
 
+When the repository exposes generic review authority, Visual Ralph produces visual-plane observations for that authority. It does not own finding identity, mutable status, or release readiness.
+
 ## Use when
 
 - The user describes a desired web/app UI and wants implementation, not just design advice.
@@ -56,7 +58,11 @@ Live URL reference artifacts must include:
 - interaction parity notes for visible controls,
 - known exclusions such as backend/API/auth, personalized data, multi-page crawling, and third-party widget parity.
 
+Before capture or judgment, record data policy for the exact reference, screenshot, source context, and evaluator destination. Never transmit private product source, authenticated/personalized screenshots, secrets, or runtime data to an external evaluator without explicit policy authority. When no permitted evaluator exists, use an approved local/private path or report blocked/`unknown`; never silently weaken the review.
+
 For generated UI concepts, use `$imagegen` to produce the reference from the user's UI description.
+
+Treat image generation as an external data boundary unless the active tool is explicitly documented otherwise. Send only the approved design prompt and allowed reference inputs; never include private repository source, secrets, authenticated screenshots, or unrelated user/runtime data.
 
 Prompt requirements:
 - classify as `ui-mockup`, unless another imagegen taxonomy is clearly better,
@@ -104,18 +110,42 @@ For each visual iteration:
 1. Capture the current generated screenshot with recorded viewport/state.
 2. Run the Visual Ralph verdict step comparing the approved reference and generated screenshot. Use the `vision` agent for image understanding when needed.
 3. Treat the JSON verdict as authoritative.
-4. If `score < 90`, convert `differences[]` and `suggestions[]` into the next edit plan.
-5. Rerun before the next edit.
+4. Pass only when `score >= 90`, `verdict` explicitly passes, and `category_match` is true.
+5. Otherwise, convert `differences[]` and `suggestions[]` into the next edit plan.
+6. Rerun before the next edit.
 
 Required verdict shape: `score`, `verdict`, `category_match`, `differences[]`, `suggestions[]`, and `reasoning`.
 
-### 6. Use pixel diff only as secondary debug evidence
+### 6. Preserve generic findings through repair and re-review
+
+When a generic review system reports a visual finding:
+
+1. Preserve its finding ID, rule/version, target, source/design/render identity, viewport, capture identity, evaluator identity, and evidence refs.
+2. Convert the accepted edit into a repair assertion; do not mark the finding closed.
+3. Capture a fresh matching screenshot and rerun the required evaluator against current source and the same canonical target.
+4. Append the raw re-review observation. Let review authority derive `verified-resolved` only from matching pass evidence.
+5. If the violation recurs after verified closure, append the new observation and let review authority derive `regressed`.
+
+A Visual Ralph score, source edit, screenshot, or human statement alone cannot claim generic verified closure. Zero targets, all-skipped runs, capture errors, missing artifact hashes/identities, stale evidence, or wrong evaluator capability remain blocked/`unknown`.
+
+An enforcing visual result artifact must carry a non-empty result schema/version and bind a stable target-partition/census identity plus hash, canonical target identity plus hash, source/design/render revisions, viewpoint, viewport, capture identity, producer/evaluator identity, and reference/current/diff artifact hashes. It must partition pass, skipped, and error outcomes explicitly. Missing partitions or identities cannot satisfy generic review closure.
+
+The runtime `passes_threshold` field follows the same composite gate: score threshold, explicit passing verdict, and category match. A score-only threshold flag cannot satisfy Visual Ralph completion or generic review closure.
+
+### 7. Keep proof planes separate
+
+- Visual evidence proves only the exact visual target, viewpoint, capture, design/render revision, and source identity it binds.
+- Source review, behavioral assertions, and certification evidence require their own producers.
+- Pixel diffs are visual debug evidence, not behavioral proof or release certification.
+- A proof envelope may certify a review artifact; it does not create or repair missing underlying evidence.
+
+### 8. Use pixel diff only as secondary debug evidence
 
 When mismatch diagnosis is hard, generate a pixel diff or pixelmatch overlay to locate hotspots. Pixel diff does not replace the Visual Ralph verdict; it only helps translate visual hotspots into concrete edits.
 
 Record final diff evidence with the reference/screenshot artifacts so the result can be audited.
 
-### 7. Build a reproducible design system
+### 9. Build a reproducible design system
 
 The implementation is incomplete unless the visual match is encoded in repo-native reusable artifacts. Depending on the project, this may mean CSS variables, theme tokens, Tailwind config, component variants, Storybook stories, updates that align with DESIGN.md, or existing equivalents.
 
@@ -134,12 +164,16 @@ Prefer existing token/component patterns. Do not introduce a new design-system l
 Do not declare done until all are true:
 - Approved reference image or URL-derived reference artifact is saved in the workspace.
 - Screenshot reproduction command, viewport, route, seed/state, and output paths are documented.
-- Visual Ralph verdict final score is `>= 90` against the approved reference.
+- Visual Ralph verdict has final `score >= 90`, explicit passing `verdict`, and `category_match: true` against the approved reference.
 - Pixel diff or overlay evidence is recorded as secondary debug evidence.
 - Design-system tokens/components are repo-native and reusable.
 - Build/lint/test or the repo's equivalent verification passes.
 - No unapproved major design pivot occurred after reference approval.
 - Remaining visual differences, if any, are explicitly documented with rationale.
+- Generic findings preserve immutable identity through repair and fresh matching re-review.
+- Generic closure comes from derived review status; edit-only, skipped, error, stale, zero-target, or missing-identity evidence remains blocked/`unknown`.
+- Visual, source, behavioral, and certification proof remain separate.
+- External evaluator inputs comply with explicit data/no-egress policy.
 
 ## Handoff template
 
@@ -151,9 +185,12 @@ Viewport/content state: <viewport, route/state, seed/login assumptions>
 Interaction parity notes: <visible controls and known exclusions>
 Route/surface: <route or component>
 Screenshot command: <command and viewport>
-Use the Visual Ralph verdict step before every next edit; pass threshold score >= 90.
+Use the Visual Ralph verdict step before every next edit; pass requires score >= 90, an explicit passing verdict, and category_match: true.
 Use pixel diff only as secondary debug evidence.
 Extract reusable design tokens/components for colors, spacing, typography, radii, shadows, and key variants.
+If generic findings exist, preserve finding/target/rule identities, record repair assertions, rerun matching evaluators, and accept only derived verified closure.
+Keep visual, source, behavioral, and certification evidence separate. Missing, skipped, error, stale, or zero-target evidence is UNKNOWN.
+Honor explicit evaluator data policy; never send private source or screenshots externally without authority.
 Run build/lint/test before completion.
 Do not make major design pivots unless explicitly requested."
 ```

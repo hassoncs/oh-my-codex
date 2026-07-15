@@ -1517,7 +1517,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
         status: ultragoalReconciliation.status,
         message: ultragoalReconciliation.warning.message,
       }
-      : ultragoalContext
+      : ultragoalContext && ultragoalReconciliation.status !== 'valid'
         ? {
           status: ultragoalReconciliation.status,
           message: `Persisted Ultragoal context is not currently valid (${ultragoalReconciliation.status}); checkpoint guidance suppressed.`,

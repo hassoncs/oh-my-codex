@@ -5,6 +5,7 @@ import { join } from 'path';
 import { comparePlanningArtifactPaths, planningArtifactTimestamp } from '../planning/artifact-names.js';
 import { getStateDir } from '../state/paths.js';
 import { VISUAL_NEXT_ACTIONS_LIMIT, type VisualVerdictStatus } from '../visual/constants.js';
+import { passesVisualThreshold } from '../visual/verdict.js';
 
 const LEGACY_PRD_PATH = '.omx/prd.json';
 const LEGACY_PROGRESS_PATH = '.omx/progress.txt';
@@ -302,7 +303,7 @@ export async function recordRalphVisualFeedback(
     verdict: feedback.verdict,
     category_match: feedback.category_match,
     threshold,
-    passes_threshold: feedback.score >= threshold,
+    passes_threshold: passesVisualThreshold(feedback, threshold),
     differences: feedback.differences,
     suggestions: feedback.suggestions,
     reasoning: feedback.reasoning ?? '',

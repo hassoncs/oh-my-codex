@@ -103,7 +103,7 @@ describe('ensureCanonicalRalphArtifacts', () => {
     try {
       const artifacts = await ensureCanonicalRalphArtifacts(cwd, 'sessVisual');
       await recordRalphVisualFeedback(cwd, {
-        score: 82,
+        score: 95,
         verdict: 'revise',
         category_match: true,
         differences: ['CTA alignment drifts by 4px'],
@@ -114,7 +114,8 @@ describe('ensureCanonicalRalphArtifacts', () => {
       const progress = JSON.parse(await readFile(artifacts.canonicalProgressPath, 'utf-8'));
       assert.equal(Array.isArray(progress.visual_feedback), true);
       assert.equal(progress.visual_feedback.length, 1);
-      assert.equal(progress.visual_feedback[0].score, 82);
+      assert.equal(progress.visual_feedback[0].score, 95);
+      assert.equal(progress.visual_feedback[0].passes_threshold, false);
       assert.equal(progress.visual_feedback[0].qualitative_feedback.summary, 'Layout is close but CTA still misaligned.');
       assert.equal(Array.isArray(progress.visual_feedback[0].qualitative_feedback.next_actions), true);
       assert.equal(progress.visual_feedback[0].qualitative_feedback.next_actions.length > 0, true);

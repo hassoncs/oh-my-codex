@@ -2973,6 +2973,7 @@ describe('teamCommand status', () => {
       await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'ultragoal-json-team', '--json']));
 
       const payload = JSON.parse(logs[0] ?? '{}') as {
+        ultragoal_context_warning?: unknown;
         ultragoal_checkpoint_guidance?: {
           goal_id?: string;
           goals_path?: string;
@@ -2982,6 +2983,7 @@ describe('teamCommand status', () => {
           evidence_requirements?: string[];
         } | null;
       };
+      assert.equal('ultragoal_context_warning' in payload, false);
       assert.equal(payload.ultragoal_checkpoint_guidance?.goal_id, 'G001-team-runtime-bridge');
       assert.equal(payload.ultragoal_checkpoint_guidance?.goals_path, '.omx/ultragoal/goals.json');
       assert.equal(payload.ultragoal_checkpoint_guidance?.ledger_path, '.omx/ultragoal/ledger.jsonl');
@@ -3091,6 +3093,7 @@ describe('teamCommand status', () => {
       await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'ultragoal-text-team']));
 
       const output = logs.join('\n');
+      assert.doesNotMatch(output, /ultragoal_context_warning/);
       assert.match(output, /ultragoal_checkpoint_guidance/);
       assert.match(output, /G001-team-runtime-bridge/);
       assert.match(output, /\.omx\/ultragoal\/goals\.json/);

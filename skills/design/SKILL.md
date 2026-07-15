@@ -37,6 +37,19 @@ The output is not a pixel-matching loop and not a one-off visual critique. It is
 
 If both are needed, run `$design` first to establish the design contract, then run `$visual-ralph` only after the visual reference/baseline is approved.
 
+## Relationship to generic design review
+
+`DESIGN.md` is authored design truth, not finding history or closure authority. When the repository has a generic review system, keep these records separate:
+
+- The review authority owns immutable findings, raw observations, repair assertions, decisions, and derived status.
+- Editing source or `DESIGN.md` may assert a repair, but cannot close a finding.
+- Verified closure requires a fresh re-review against the matching current source, rule/version, target, evaluator capability, and evidence identity.
+- Only derived review status may claim verified resolution or regression. Missing identity/evidence, zero executed targets, skipped work, evaluator errors, or stale observations remain `unknown` or blocked, never pass.
+
+Keep source, visual, behavioral, and certification planes distinct. `DESIGN.md`, a Visual Ralph verdict, pixel-diff output, runtime assertions, and a proof envelope may reference one another, but none substitutes for another plane's evidence.
+
+Before using external judgment, record the repository's data policy and exact allowed inputs. Never send private product source, screenshots, or runtime data to an external evaluator without explicit policy authority for that data and destination. If no permitted evaluator exists, report blocked/`unknown`; do not silently downgrade or invent closure.
+
 ## Workflow
 
 ### 1. Discover local design evidence
@@ -149,6 +162,13 @@ Use the structure below. Preserve useful existing content, remove contradictions
 - Compatibility constraints:
 - Test/screenshot expectations:
 
+## Review and proof contract
+- Required review rules/planes:
+- Canonical review targets and states:
+- Evidence identities/commands:
+- Data policy and no-egress constraints:
+- Closure requirement: fresh matching re-review; edits alone do not close findings
+
 ## Open questions
 - [ ] Question / owner / impact
 ```
@@ -161,11 +181,13 @@ For UI/UX/frontend work after the refresh:
 - Prefer existing components, tokens, and documented constraints.
 - If implementation reveals a design contradiction, update `DESIGN.md` or add an open question before proceeding.
 - Do not introduce a new design-system layer when existing repo-native patterns can be extended.
+- Preserve finding IDs and review evidence references when implementation repairs a reported issue.
 
 ### 5. Handoff to implementation or Visual Ralph when appropriate
 
 - For normal frontend implementation, hand off with the relevant `DESIGN.md` sections, repo evidence, and acceptance criteria.
 - For visual-reference/image/live-URL matching, hand off to `$visual-ralph` with the approved reference/baseline and note that `DESIGN.md` is supporting context, not the visual verdict target.
+- For generic review findings, hand off the finding identity, current source/target identity, required evaluator/planes, repair assertion, and fresh re-review requirement. Never hand off an edit-only closure claim.
 
 ## Completion checklist
 
@@ -176,5 +198,7 @@ Do not declare the design workflow complete until:
 - `DESIGN.md` exists at the repo root and contains all required checklist sections.
 - UI/UX/frontend recommendations cite `DESIGN.md` rather than relying on unstated preferences.
 - Any `$visual-ralph` handoff is clearly separated as visual implementation matching, not DESIGN.md governance.
+- Generic findings remain open until fresh matching observations derive verified closure; skipped/error/unknown evidence is not reported as success.
+- Required proof planes and data/no-egress constraints are explicit.
 
 Task: {{ARGUMENTS}}

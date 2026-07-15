@@ -43,6 +43,23 @@ describe('buildVisualLoopFeedback smoke samples', () => {
     assert.equal(result.next_actions.length <= VISUAL_NEXT_ACTIONS_LIMIT, true);
   });
 
+  it('does not pass a high score with revise verdict or category mismatch', () => {
+    for (const input of [
+      { verdict: 'revise', category_match: true },
+      { verdict: 'pass', category_match: false },
+    ] as const) {
+      const result = buildVisualLoopFeedback({
+        score: 95,
+        ...input,
+        differences: [],
+        suggestions: [],
+        reasoning: 'Score alone cannot satisfy the visual gate.',
+      });
+
+      assert.equal(result.passes_threshold, false);
+    }
+  });
+
   it('rejects malformed payloads missing required arrays', () => {
     assert.throws(
       () => buildVisualLoopFeedback({

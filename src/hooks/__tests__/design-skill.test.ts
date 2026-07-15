@@ -32,6 +32,7 @@ describe('design skill contract', () => {
       'Interaction states',
       'Content voice',
       'Implementation constraints',
+      'Review and proof contract',
       'Open questions',
     ]) {
       assert.match(designSkill, new RegExp(`## ${section.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i'));
@@ -43,6 +44,16 @@ describe('design skill contract', () => {
     assert.match(designSkill, /does not replace the `DESIGN\.md` discovery\/interview\/refresh workflow/i);
     assert.doesNotMatch(visualRalphSkill, /use `\$frontend-ui-ux`/i);
     assert.match(visualRalphSkill, /use `\$design`/i);
+  });
+
+  it('keeps generic findings, closure, proof planes, and data policy separate', () => {
+    assert.match(designSkill, /not finding history or closure authority/i);
+    assert.match(designSkill, /Editing source or `DESIGN\.md`.*cannot close a finding/i);
+    assert.match(designSkill, /fresh re-review.*matching current source, rule\/version, target/i);
+    assert.match(designSkill, /zero executed targets, skipped work, evaluator errors.*unknown/i);
+    assert.match(designSkill, /source, visual, behavioral, and certification planes distinct/i);
+    assert.match(designSkill, /Never send private product source, screenshots, or runtime data.*external evaluator/i);
+    assert.match(designSkill, /report blocked\/`unknown`/i);
   });
 
   it('routes explicit $design while keeping frontend-ui-ux as deprecated compatibility guidance', () => {

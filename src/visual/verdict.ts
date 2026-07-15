@@ -79,7 +79,14 @@ export function buildVisualLoopFeedback(input: unknown, threshold = 90): VisualL
   return {
     ...verdict,
     threshold,
-    passes_threshold: verdict.score >= threshold,
+    passes_threshold: passesVisualThreshold(verdict, threshold),
     next_actions,
   };
+}
+
+export function passesVisualThreshold(
+  verdict: Pick<VisualVerdict, 'score' | 'verdict' | 'category_match'>,
+  threshold = 90,
+): boolean {
+  return verdict.score >= threshold && verdict.verdict === 'pass' && verdict.category_match;
 }
