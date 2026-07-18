@@ -294,6 +294,10 @@ interface CycleActivitySummary {
 }
 
 const fileState = new Map<string, WatcherFileMeta>();
+const rejectedRolloutFiles = new Set<string>();
+let rolloutMetadataReads = 0;
+let rolloutMetadataBytesRead = 0;
+let rolloutCandidateStats = 0;
 const seenTurnKeys = new Set<string>();
 const pendingTurnEvents = new Map<string, { meta: WatcherFileMeta; line: string; filePath: string }>();
 let trustedLeaderThreadId = '';
@@ -1336,6 +1340,12 @@ async function writeState(extra: Record<string, unknown> = {}): Promise<void> {
     tracked_files: fileState.size,
     seen_turns: seenTurnKeys.size,
     pending_turns: pendingTurnEvents.size,
+    rollout_discovery: {
+      metadata_read_count: rolloutMetadataReads,
+      metadata_bytes_read: rolloutMetadataBytesRead,
+      candidate_stat_count: rolloutCandidateStats,
+      rejected_files: rejectedRolloutFiles.size,
+    },
     trusted_leader_session_id: trustedLeaderSessionId || null,
     trusted_leader_thread_id: trustedLeaderThreadId || null,
     dispatch_drain: {
@@ -1610,10 +1620,28 @@ function sessionDirs(): string[] {
   return Array.from(new Set([today, yesterday]));
 }
 
-async function readFirstLine(path: string): Promise<string> {
-  const content = await readFile(path, 'utf-8');
-  const idx = content.indexOf('\n');
-  return idx >= 0 ? content.slice(0, idx) : content;
+async function readFirstLine(path: string): Promise<string | null> {
+  const handle = await open(path, 'r');
+  rolloutMetadataReads += 1;
+  try {
+    const chunks: Buffer[] = [];
+    let offset = 0;
+    const maxBytes = 256 * 1024;
+    while (offset < maxBytes) {
+      const buffer = Buffer.allocUnsafe(Math.min(16 * 1024, maxBytes - offset));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
+      if (bytesRead === 0) break;
+      rolloutMetadataBytesRead += bytesRead;
+      const chunk = buffer.subarray(0, bytesRead);
+      const newline = chunk.indexOf(0x0a);
+      chunks.push(newline >= 0 ? chunk.subarray(0, newline) : chunk);
+      if (newline >= 0) return Buffer.concat(chunks).toString('utf-8');
+      offset += bytesRead;
+    }
+    return offset >= maxBytes ? '' : null;
+  } finally {
+    await handle.close().catch(() => {});
+  }
 }
 
 function asObject(value: unknown): Record<string, unknown> | null {
@@ -1681,9 +1709,12 @@ async function discoverRolloutFiles(): Promise<string[]> {
     for (const name of names) {
       if (!name.startsWith('rollout-') || !name.endsWith('.jsonl')) continue;
       const path = join(dir, name);
-      const st = await stat(path).catch(() => null);
-      if (!st) continue;
-      if (st.mtimeMs < startedAt - fileWindowMs) continue;
+      if (fileState.has(path) || rejectedRolloutFiles.has(path)) continue;
+      if (runOnce) {
+        rolloutCandidateStats += 1;
+        const st = await stat(path).catch(() => null);
+        if (!st || st.mtimeMs < startedAt - fileWindowMs) continue;
+      }
       discovered.push(path);
     }
   }
@@ -1945,10 +1976,13 @@ async function ensureTrackedFiles(): Promise<void> {
   const files = await discoverRolloutFiles();
   const discovered: Array<{ path: string; meta: WatcherSessionMeta }> = [];
   for (const path of files) {
-    if (fileState.has(path)) continue;
-    const line = await readFirstLine(path).catch(() => '');
+    const line = await readFirstLine(path).catch(() => null);
+    if (line === null) continue;
     const sessionMeta = shouldTrackSessionMeta(line);
-    if (!sessionMeta) continue;
+    if (!sessionMeta) {
+      rejectedRolloutFiles.add(path);
+      continue;
+    }
     discovered.push({ path, meta: sessionMeta });
   }
   await resolveTrustedLeader(discovered.map((entry) => entry.meta));
@@ -2158,9 +2192,18 @@ async function shouldSuppressInteractiveFallbackTicks(): Promise<boolean> {
   return deepInterviewStateActive || deepInterviewInputLockActive;
 }
 
-async function pumpTeamControlPlaneTick(): Promise<CycleActivitySummary> {
+async function pumpTeamControlPlaneTick(interactiveSuppressed: boolean): Promise<CycleActivitySummary> {
+  if (!runOnce && !existsSync(join(stateDir, 'team'))) {
+    if (interactiveSuppressed) return { active: false, reason: 'deep_interview_locked' };
+    await runFallbackAutoNudgeTick();
+    const autoNudgeActive = lastFallbackAutoNudge.last_reason === 'sent';
+    return {
+      active: autoNudgeActive,
+      reason: autoNudgeActive ? 'fallback_auto_nudge' : lastFallbackAutoNudge.last_reason || 'no_team',
+    };
+  }
   const dispatchActive = await runDispatchDrainTick();
-  if (await shouldSuppressInteractiveFallbackTicks()) {
+  if (interactiveSuppressed) {
     return { active: dispatchActive, reason: dispatchActive ? 'dispatch_drain' : 'deep_interview_locked' };
   }
   const leaderActive = await runLeaderNudgeTick();
@@ -2191,8 +2234,9 @@ async function runWatcherCycle(): Promise<number> {
     processedRolloutCount = await pollFiles();
     await retryPendingTurnEvents();
   }
-  const controlPlaneSummary = await pumpTeamControlPlaneTick();
-  if (!authorityOnly && !(await shouldSuppressInteractiveFallbackTicks())) {
+  const interactiveSuppressed = await shouldSuppressInteractiveFallbackTicks();
+  const controlPlaneSummary = await pumpTeamControlPlaneTick(interactiveSuppressed);
+  if (!authorityOnly && !interactiveSuppressed) {
     await runRalphWatcherBehaviorTick();
   }
   const ralphActive = lastRalphContinueSteer.last_reason === 'sent';

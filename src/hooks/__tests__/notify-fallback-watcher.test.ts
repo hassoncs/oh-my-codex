@@ -1,7 +1,7 @@
 import { after, before, describe, it } from 'node:test';
 import { once } from 'node:events';
 import assert from 'node:assert/strict';
-import { appendFile, chmod, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdtemp, mkdir, readFile, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -473,6 +473,10 @@ describe('notify-fallback watcher', () => {
   it('uses offset-bounded rollout reads instead of re-reading whole tracked files', async () => {
     const source = await readFile(new URL('../../scripts/notify-fallback-watcher.js', import.meta.url), 'utf-8');
 
+    assert.match(source, /async function readFirstLine[\s\S]*handle\.read\(/);
+    assert.match(source, /if \(newline >= 0\)\s*return Buffer\.concat\(chunks\)\.toString\('utf-8'\)/);
+    assert.match(source, /return null;/);
+    assert.doesNotMatch(source, /async function readFirstLine[\s\S]*readFile\(path, 'utf-8'\)/);
     assert.match(source, /async function readFileDelta/);
     assert.match(source, /while \(totalBytesRead < length\)/);
     assert.match(source, /nextOffset: offset \+ totalBytesRead/);
@@ -482,6 +486,148 @@ describe('notify-fallback watcher', () => {
     assert.match(source, /if \(currentSize < meta\.offset\) \{\s*meta\.offset = 0;\s*meta\.partial = '';/);
     assert.doesNotMatch(source, /const content = await readFile\(path, 'utf-8'\)[\s\S]*const delta = content\.slice\(meta\.offset\)/);
     assert.doesNotMatch(source, /stat\(path\)\.catch\(\(\) => \(\{ size: 0 \}\)\)/);
+  });
+
+  it('caches foreign rollout metadata and skips team scans while deeply idle', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-deep-idle-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-deep-idle-home-'));
+    const sid = randomUUID();
+    const sessionDir = todaySessionDir(tempHome);
+    const foreignRolloutPath = join(sessionDir, `rollout-test-fallback-deep-idle-${sid}.jsonl`);
+    const oversizedRolloutPath = join(sessionDir, `rollout-test-fallback-deep-idle-oversized-${sid}.jsonl`);
+    const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+    const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+    const watcherStatePath = join(wd, '.omx', 'state', 'notify-fallback-state.json');
+    let child: ReturnType<typeof spawn> | undefined;
+
+    try {
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(foreignRolloutPath, `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        type: 'session_meta',
+        payload: { id: `foreign-${sid}`, cwd: `${wd}-foreign` },
+      })}\n${'x'.repeat(2 * 1024 * 1024)}`);
+      await writeFile(oversizedRolloutPath, 'x'.repeat(300 * 1024));
+      const oldTime = new Date(Date.now() - 60 * 60 * 1000);
+      await utimes(foreignRolloutPath, oldTime, oldTime);
+      await utimes(oversizedRolloutPath, oldTime, oldTime);
+
+      child = spawn(
+        process.execPath,
+        [
+          watcherScript,
+          '--cwd',
+          wd,
+          '--notify-script',
+          notifyHook,
+          '--poll-ms',
+          '50',
+          '--idle-max-poll-ms',
+          '200',
+          '--parent-pid',
+          String(process.pid),
+          '--max-lifetime-ms',
+          '5000',
+        ],
+        {
+          cwd: wd,
+          stdio: 'ignore',
+          env: buildCleanNotifyEnv({ HOME: tempHome }),
+        },
+      );
+
+      await waitFor(async () => {
+        const state = await readFile(watcherStatePath, 'utf-8').then(JSON.parse).catch(() => null);
+        return state?.adaptive_poll?.current_ms === 200 && state?.adaptive_poll?.idle_streak >= 3;
+      }, 4000, 50);
+
+      const firstState = JSON.parse(await readFile(watcherStatePath, 'utf-8'));
+      const firstRunCount = firstState.leader_nudge?.run_count ?? -1;
+      await sleep(500);
+      const nextState = JSON.parse(await readFile(watcherStatePath, 'utf-8'));
+      assert.equal(nextState.tracked_files, 0);
+      assert.equal(nextState.seen_turns, 0);
+      assert.equal(firstRunCount, 0);
+      assert.equal(nextState.leader_nudge?.run_count, 0);
+      assert.equal(nextState.dispatch_drain?.run_count, 0);
+      assert.ok(nextState.adaptive_poll?.idle_streak > firstState.adaptive_poll?.idle_streak);
+      assert.equal(nextState.last_cycle_activity, 'hud_state_missing');
+      assert.equal(firstState.rollout_discovery?.metadata_read_count, 2);
+      assert.ok(firstState.rollout_discovery?.metadata_bytes_read > 256 * 1024);
+      assert.ok(firstState.rollout_discovery?.metadata_bytes_read <= 272 * 1024);
+      assert.equal(firstState.rollout_discovery?.candidate_stat_count, 0);
+      assert.equal(firstState.rollout_discovery?.rejected_files, 2);
+      assert.deepEqual(nextState.rollout_discovery, firstState.rollout_discovery);
+    } finally {
+      if (child && isPidAlive(child.pid)) {
+        child.kill('SIGTERM');
+        await waitForExit(child, 4000).catch(() => {});
+      }
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves deep-interview suppression without a team directory', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-deep-idle-locked-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-deep-idle-locked-home-'));
+    const stateDir = join(wd, '.omx', 'state');
+    const watcherStatePath = join(stateDir, 'notify-fallback-state.json');
+    const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+    const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+    let child: ReturnType<typeof spawn> | undefined;
+
+    try {
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, 'deep-interview-state.json'), JSON.stringify({
+        active: true,
+        mode: 'deep-interview',
+        current_phase: 'deep-interview',
+      }));
+
+      child = spawn(
+        process.execPath,
+        [
+          watcherScript,
+          '--cwd',
+          wd,
+          '--notify-script',
+          notifyHook,
+          '--poll-ms',
+          '50',
+          '--idle-max-poll-ms',
+          '200',
+          '--parent-pid',
+          String(process.pid),
+          '--max-lifetime-ms',
+          '5000',
+        ],
+        {
+          cwd: wd,
+          stdio: 'ignore',
+          env: buildCleanNotifyEnv({ HOME: tempHome }),
+        },
+      );
+
+      await waitFor(async () => {
+        const state = await readFile(watcherStatePath, 'utf-8').then(JSON.parse).catch(() => null);
+        return state?.last_cycle_activity === 'deep_interview_locked'
+          && state?.adaptive_poll?.current_ms === 200;
+      }, 4000, 50);
+
+      const state = JSON.parse(await readFile(watcherStatePath, 'utf-8'));
+      assert.equal(state.dispatch_drain?.run_count, 0);
+      assert.equal(state.leader_nudge?.run_count, 0);
+      assert.equal(state.fallback_auto_nudge?.last_tick_at, null);
+    } finally {
+      if (child && isPidAlive(child.pid)) {
+        child.kill('SIGTERM');
+        await waitForExit(child, 4000).catch(() => {});
+      }
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+    }
   });
 
   it('one-shot mode preserves current-session subagent provenance and rejects foreign lineage', async () => {
