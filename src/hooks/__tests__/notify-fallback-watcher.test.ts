@@ -4546,7 +4546,7 @@ exit 0
     }
   });
 
-  it('backs off idle polling and resets to the base cadence after fresh rollout activity', async () => {
+  it('backs off idle polling despite a stale non-team leader signal and resets after fresh rollout activity', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-idle-backoff-'));
     const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-idle-backoff-home-'));
     const sid = randomUUID();
@@ -4562,6 +4562,10 @@ exit 0
       await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
       await mkdir(join(wd, '.omx', 'state'), { recursive: true });
       await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(wd, '.omx', 'state', 'hud-state.json'), JSON.stringify({
+        last_turn_at: new Date(Date.now() - 300_000).toISOString(),
+        turn_count: 0,
+      }));
       await writeFile(rolloutPath, `${JSON.stringify({
         timestamp: new Date().toISOString(),
         type: 'session_meta',

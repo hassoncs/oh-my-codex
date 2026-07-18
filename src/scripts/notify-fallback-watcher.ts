@@ -1917,7 +1917,9 @@ async function runLeaderNudgeTick(): Promise<boolean> {
         reason,
       });
     }
-    return preComputedLeaderStale;
+    // Staleness is a check result, not watcher activity. Keeping it "active"
+    // pins idle sessions to the hot poll cadence.
+    return false;
   } catch (err) {
     leaderNudgeRuns += 1;
     lastLeaderNudge = {
