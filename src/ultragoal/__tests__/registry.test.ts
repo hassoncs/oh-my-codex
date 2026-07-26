@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -139,6 +140,39 @@ describe('ultragoal run namespacing', () => {
     });
   });
 
+  it('--new-namespace preserves the previous registry instead of destroying it', async () => {
+    await withTempRepo(async (cwd) => {
+      await seedStaleFlatRegistry(cwd);
+      await writeFile(join(cwd, '.omx', 'ultragoal', 'ledger.jsonl'), `${JSON.stringify({ ts: 'x', event: 'plan_created' })}\n`);
+
+      const plan = await createUltragoalPlan(cwd, { brief: BRIEF_A, newNamespace: true });
+      assert.ok(plan.runId);
+      assert.ok(!plan.goals.some((goal) => goal.id === 'G001-legacy-governance'));
+
+      // Creating a run truncates the flat ledger and overwrites the flat plan;
+      // a pre-namespacing registry has no run directory behind those files.
+      const archivedDir = ultragoalRunDir(cwd, legacyRunIdForPlan({
+        createdAt: '2026-07-12T09:26:58.842Z',
+        goals: [{ id: 'G001-legacy-governance' }],
+      }));
+      const archived = JSON.parse(await readFile(join(archivedDir, 'goals.json'), 'utf-8'));
+      assert.equal(archived.goals[0].id, 'G001-legacy-governance');
+      assert.match(await readFile(join(archivedDir, 'ledger.jsonl'), 'utf-8'), /plan_created/);
+    });
+  });
+
+  it('--new-namespace leaves an existing namespaced run intact', async () => {
+    await withTempRepo(async (cwd) => {
+      const first = await createUltragoalPlan(cwd, { brief: BRIEF_A });
+      const second = await createUltragoalPlan(cwd, { brief: BRIEF_B, newNamespace: true });
+
+      assert.notEqual(second.runId, first.runId);
+      const priorRun = JSON.parse(await readFile(join(ultragoalRunDir(cwd, first.runId as string), 'goals.json'), 'utf-8'));
+      assert.equal(priorRun.runId, first.runId);
+      assert.equal((await readActiveRunPointer(cwd))?.runId, second.runId);
+    });
+  });
+
   it('--adopt-existing continues the existing registry as this run', async () => {
     await withTempRepo(async (cwd) => {
       await seedStaleFlatRegistry(cwd);
@@ -182,6 +216,28 @@ describe('ultragoal registries inherited by CoW clones', () => {
 
       // Shutdown gates read HUD state; an inherited registry must not gate this tree.
       assert.equal(await readUltragoalState(cwd), null);
+    });
+  });
+
+  it('treats a git-tracked registry as delivered, not inherited', async () => {
+    await withTempRepo(async (cwd) => {
+      await seedStaleFlatRegistry(cwd, {
+        runId: 'run-20260712T092658Z-deadbeef',
+        briefHash: 'deadbeefdeadbeef',
+        origin: { worktreePath: '/some/other/worktree', createdAt: '2026-07-12T09:26:58.842Z' },
+      });
+      // A repo that commits .omx/ultragoal/goals.json bakes an absolute origin
+      // path into the commit; every fresh worktree would otherwise refuse forever.
+      const git = (...args: string[]) => execFileSync('git', args, { cwd, stdio: 'ignore' });
+      git('init', '-q');
+      git('config', 'user.email', 'test@example.com');
+      git('config', 'user.name', 'test');
+      git('add', '.omx/ultragoal/goals.json');
+      git('commit', '-q', '-m', 'track registry');
+
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.runId, 'run-20260712T092658Z-deadbeef');
+      assert.ok(await readUltragoalState(cwd), 'HUD still counts a git-delivered registry');
     });
   });
 

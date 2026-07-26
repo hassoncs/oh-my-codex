@@ -25,6 +25,7 @@ import {
   computeUltragoalBriefHash,
   describeRegistryConflict,
   isInheritedOrigin,
+  isUnownedInheritedRegistry,
   readActiveRunPointer,
   ultragoalDir,
   ultragoalRunDir,
@@ -915,7 +916,7 @@ export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
   if (parsed.version !== 1 || !Array.isArray(parsed.goals)) {
     throw new UltragoalError(`Invalid ultragoal plan at ${repoRelative(cwd, path)}.`);
   }
-  if (isInheritedOrigin(parsed.origin, cwd)) {
+  if (await isUnownedInheritedRegistry(parsed.origin, cwd)) {
     throw new UltragoalRegistryConflictError(
       [
         `Refusing to read an ultragoal registry created by a different worktree.`,
@@ -996,12 +997,14 @@ async function resolveRegistryDisposition(
   if (!existing) return { adopt: null, archivedTo: null };
 
   const pointer = await readActiveRunPointer(cwd);
+  const existingOrigin = existing.origin ?? pointer?.origin;
   const conflict = describeRegistryConflict({
     cwd,
     briefHash,
     existingBriefHash: existing.briefHash,
     existingRunId: existing.runId ?? pointer?.runId,
-    existingOrigin: existing.origin ?? pointer?.origin,
+    existingOrigin,
+    originInherited: await isUnownedInheritedRegistry(existingOrigin, cwd),
     unnamespacedLegacyRegistry: !existing.runId,
   });
 
@@ -1016,12 +1019,13 @@ async function resolveRegistryDisposition(
       reason: conflict.reason,
       runId: existing.runId ?? pointer?.runId,
       briefHash: existing.briefHash,
-      originWorktreePath: (existing.origin ?? pointer?.origin)?.worktreePath,
+      originWorktreePath: existingOrigin?.worktreePath,
     });
   }
-  const archivedTo = archive
-    ? await archiveFlatRegistry(cwd, existing.runId ?? legacyRunIdForPlan(existing))
-    : null;
+  // Creating a new run overwrites the flat files and truncates the flat ledger.
+  // Archive first, on every path that reaches here: a pre-namespacing registry
+  // has no run directory behind those files, so skipping this destroys it.
+  const archivedTo = await archiveFlatRegistry(cwd, existing.runId ?? legacyRunIdForPlan(existing));
   return { adopt: null, archivedTo };
 }
 

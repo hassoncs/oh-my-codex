@@ -54,6 +54,15 @@ The refusal names three explicit choices:
 - `--new-namespace` — start fresh, leaving the existing run registered but
   inactive.
 
+Whichever option is chosen, the existing flat registry is archived to
+`runs/<runId>/` **before** the new run overwrites `goals.json`, `brief.md` and
+the ledger. A pre-namespacing registry has no run directory behind those files,
+so skipping that copy would destroy it.
+
+Archived runs are a durable record, not browsable state: `active-run.json` moves
+forward only, and every reader consumes the flat projection. To go back to an
+archived run, copy its files into place and re-point the pointer deliberately.
+
 ## Grove CoW clones
 
 A Grove Tree is CoW-cloned from its source, so it inherits the source's `.omx/`
@@ -67,6 +76,13 @@ the plan records the worktree that created it, an inherited registry is:
 
 `omx ultragoal adopt-run` takes ownership explicitly and records this worktree in
 `origin.adoptedWorktreePaths`.
+
+A CoW clone inherits **untracked** runtime state; git delivers **tracked** state
+on purpose. Repos that commit `.omx/ultragoal/goals.json` bake an absolute
+`origin.worktreePath` into the commit, so every fresh worktree or clone of that
+branch would read as inherited forever. A registry that `git ls-files` reports as
+tracked is therefore treated as delivered, not inherited — `omx status --json`
+still reports it as `origin.deliveredViaGit: true`.
 
 Plans written before namespacing carry no `origin`, so they stay readable; the
 first `create-goals` against them backfills a namespace or refuses per the table

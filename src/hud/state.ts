@@ -13,7 +13,7 @@ import { getDefaultBridge, isBridgeEnabled } from '../runtime/bridge.js';
 import type { RuntimeSnapshot } from '../runtime/bridge.js';
 import { getBaseStateDir, getStateFilePath, readCurrentSessionId, resolveRuntimeStateScope } from '../mcp/state-paths.js';
 import { teamReadPhase as readTeamPhase } from '../team/team-ops.js';
-import { isInheritedOrigin, type UltragoalRunOrigin } from '../ultragoal/registry.js';
+import { isUnownedInheritedRegistry, type UltragoalRunOrigin } from '../ultragoal/registry.js';
 
 import { listActiveSkills, readVisibleSkillActiveStateForStateDir } from '../state/skill-active.js';
 import {
@@ -183,7 +183,7 @@ export async function readUltragoalState(cwd: string): Promise<UltragoalStateFor
   if (!plan || typeof plan !== 'object' || !Array.isArray(plan.goals)) return null;
   // A registry created by another worktree (Grove CoW clone) is not this tree's
   // run; counting its goals is what let a stale registry gate a new lane.
-  if (isInheritedOrigin((plan as { origin?: UltragoalRunOrigin }).origin, cwd)) return null;
+  if (await isUnownedInheritedRegistry((plan as { origin?: UltragoalRunOrigin }).origin, cwd)) return null;
 
   const goals = plan.goals.map(normalizeUltragoalGoal).filter((goal): goal is NormalizedUltragoalGoal => goal !== null);
   if (goals.length === 0) return null;

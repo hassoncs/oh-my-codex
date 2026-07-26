@@ -934,7 +934,9 @@ describe('RALPLAN Stage', () => {
     const artifacts = result.artifacts as Record<string, unknown>;
 
     assert.equal(result.status, 'failed');
-    assert.equal(result.error, 'ralplan_consensus_not_reached_after_1_iterations');
+    // A spent review budget still fails the stage, but says what decision it needs.
+    assert.equal(result.artifacts?.needsUserDecision, true);
+    assert.match(String(result.error), /^ralplan_needs_user_decision: ralplan used all 1 review rounds/);
     assert.deepEqual(artifacts.ralplanConsensusGate, {
       complete: false,
       sequence: ['architect-review', 'critic-review'],

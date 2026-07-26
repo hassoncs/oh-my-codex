@@ -10,7 +10,7 @@
 import { existsSync } from 'node:fs';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { isInheritedOrigin, type UltragoalRunOrigin } from '../ultragoal/registry.js';
+import { isInheritedOrigin, isRegistryGitTracked, type UltragoalRunOrigin } from '../ultragoal/registry.js';
 
 export const SUPERVISION_STATUS_SCHEMA = 'omx.supervision.status.v1';
 
@@ -42,7 +42,13 @@ export interface SupervisionUltragoalStatus {
   present: boolean;
   runId: string | null;
   briefHash: string | null;
-  origin: { worktreePath: string | null; inherited: boolean };
+  origin: {
+    worktreePath: string | null;
+    /** Created by another worktree AND not delivered by git. */
+    inherited: boolean;
+    /** The registry is tracked in git, so another worktree's path is expected. */
+    deliveredViaGit: boolean;
+  };
   activeGoalId: string | null;
   aggregateComplete: boolean;
   counts: Record<string, number>;
@@ -181,7 +187,7 @@ async function collectUltragoal(cwd: string): Promise<SupervisionUltragoalStatus
       present: true,
       runId: null,
       briefHash: null,
-      origin: { worktreePath: null, inherited: false },
+      origin: { worktreePath: null, inherited: false, deliveredViaGit: false },
       activeGoalId: null,
       aggregateComplete: false,
       counts: {},
@@ -194,6 +200,7 @@ async function collectUltragoal(cwd: string): Promise<SupervisionUltragoalStatus
   }
 
   const origin = plan.origin as UltragoalRunOrigin | undefined;
+  const deliveredViaGit = isInheritedOrigin(origin, cwd) ? await isRegistryGitTracked(cwd) : false;
   const runId = optionalString(plan.runId);
   const goals: SupervisionGoalStatus[] = (plan.goals as Array<Record<string, unknown>>).map((goal) => ({
     id: optionalString(goal.id) ?? 'unknown',
@@ -212,7 +219,8 @@ async function collectUltragoal(cwd: string): Promise<SupervisionUltragoalStatus
     briefHash: optionalString(plan.briefHash),
     origin: {
       worktreePath: origin?.worktreePath ?? null,
-      inherited: isInheritedOrigin(origin, cwd),
+      inherited: isInheritedOrigin(origin, cwd) && !deliveredViaGit,
+      deliveredViaGit,
     },
     activeGoalId: optionalString(plan.activeGoalId),
     aggregateComplete: aggregateCompletion?.status === 'complete',

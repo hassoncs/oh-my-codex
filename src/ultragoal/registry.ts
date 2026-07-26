@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { copyFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
@@ -144,6 +145,32 @@ export function isInheritedOrigin(origin: UltragoalRunOrigin | undefined, cwd: s
   return !(origin.adoptedWorktreePaths ?? []).includes(cwd);
 }
 
+/**
+ * A CoW clone inherits UNTRACKED runtime state; git delivers TRACKED state on
+ * purpose. Repos that commit `.omx/ultragoal/goals.json` would otherwise see
+ * every fresh worktree or clone of the branch refuse forever, because
+ * `origin.worktreePath` is an absolute local path baked into the commit.
+ */
+export async function isRegistryGitTracked(cwd: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile(
+      'git',
+      ['ls-files', '--error-unmatch', '--', `${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS}`],
+      { cwd },
+      (error) => resolve(!error),
+    );
+  });
+}
+
+/** True only for a registry this tree inherited rather than one git delivered. */
+export async function isUnownedInheritedRegistry(
+  origin: UltragoalRunOrigin | undefined,
+  cwd: string,
+): Promise<boolean> {
+  if (!isInheritedOrigin(origin, cwd)) return false;
+  return !(await isRegistryGitTracked(cwd));
+}
+
 export interface RegistryConflictInput {
   cwd: string;
   /** Brief hash of the run that is about to start. */
@@ -151,6 +178,8 @@ export interface RegistryConflictInput {
   existingBriefHash?: string;
   existingRunId?: string;
   existingOrigin?: UltragoalRunOrigin;
+  /** Precomputed by the caller: inherited AND not delivered by git. */
+  originInherited?: boolean;
   /** True when a flat goals.json exists with no namespaced run behind it. */
   unnamespacedLegacyRegistry?: boolean;
 }
@@ -164,7 +193,8 @@ export function describeRegistryConflict(
     '  --new-namespace      start a fresh namespace, leaving the existing run registered but inactive',
   ].join('\n');
 
-  if (input.existingOrigin && isInheritedOrigin(input.existingOrigin, input.cwd)) {
+  const inherited = input.originInherited ?? isInheritedOrigin(input.existingOrigin, input.cwd);
+  if (input.existingOrigin && inherited) {
     return {
       reason: 'inherited_worktree',
       message: [

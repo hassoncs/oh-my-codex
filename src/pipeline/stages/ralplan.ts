@@ -89,10 +89,19 @@ export function createRalplanStage(options: CreateRalplanStageOptions = {}): Pip
               architectReviews: runtimeResult.architectReviews,
               criticReviews: runtimeResult.criticReviews,
               ralplanConsensusGate: consensusGate,
+              // A spent review budget is a decision for the user, not a bug;
+              // the pipeline still stops, but it stops saying what it needs.
+              needsUserDecision: runtimeResult.status === 'needs_user_decision',
+              requiredUserDecision: runtimeResult.requiredUserDecision,
+              reviewBudget: runtimeResult.reviewBudget,
               ...runtimeResult.artifacts,
             },
             duration_ms: Date.now() - startTime,
-            error: runtimeResult.error ?? (consensusComplete ? undefined : 'ralplan_consensus_evidence_missing'),
+            error: runtimeResult.error
+              ?? (runtimeResult.status === 'needs_user_decision'
+                ? `ralplan_needs_user_decision: ${runtimeResult.requiredUserDecision ?? 'review budget exhausted'}`
+                : undefined)
+              ?? (consensusComplete ? undefined : 'ralplan_consensus_evidence_missing'),
           };
         }
 
