@@ -71,14 +71,8 @@ import { resolveCanonicalTeamStateRoot } from './state-root.js';
 import { normalizeTeamTaskCoordinationPlanForStorage } from './coordination-protocol.js';
 import { readModeState, startMode, updateModeState } from '../modes/base.js';
 import { reconcilePhaseStateForMonitor } from './phase-controller.js';
-import {
-  getBaseStateDir,
-  getReadScopedStatePaths,
-  getStateFilePath,
-  resolveStateScope,
-} from '../mcp/state-paths.js';
+import { getBaseStateDir, resolveStateScope } from '../mcp/state-paths.js';
 import { preflightWorkflowTransition } from '../state/workflow-transition-reconcile.js';
-import { getSkillActiveStatePathsForStateDir } from '../state/skill-active.js';
 
 export type { TeamDispatchRequestStatus, TeamWorkerIntegrationStatus } from './contracts.js';
 
@@ -1485,38 +1479,161 @@ export async function releaseTaskClaim(
   });
 }
 
-async function snapshotRetryWorkflowState(
+interface FailedTaskRetryIntent {
+  version: 1;
+  task_id: string;
+  expected_version: number;
+  retry_version: number;
+  created_at: string;
+}
+
+function retryIntentPath(teamName: string, taskId: string, cwd: string): string {
+  validateTaskId(taskId);
+  return join(teamDir(teamName, cwd), 'retry-intents', `task-${taskId}.json`);
+}
+
+async function writeRetryIntent(
+  teamName: string,
+  previous: TeamTaskV2,
+  next: TeamTaskV2,
+  cwd: string,
+): Promise<{ path: string; intent: FailedTaskRetryIntent }> {
+  const path = retryIntentPath(teamName, previous.id, cwd);
+  const intent: FailedTaskRetryIntent = {
+    version: 1,
+    task_id: previous.id,
+    expected_version: previous.version,
+    retry_version: next.version,
+    created_at: new Date().toISOString(),
+  };
+  await writeAtomic(path, JSON.stringify(intent, null, 2));
+  return { path, intent };
+}
+
+async function reactivateTeamWorkflowForRetry(
+  teamName: string,
+  taskId: string,
+  cwd: string,
+): Promise<void> {
+  const modeState = await readModeState('team', cwd);
+  const stateTeamName = typeof modeState?.team_name === 'string' ? modeState.team_name.trim() : '';
+  if (stateTeamName && stateTeamName !== teamName) {
+    throw new Error(`team_retry_mode_state_mismatch:${stateTeamName}:${teamName}`);
+  }
+
+  const scope = await resolveStateScope(cwd);
+  const transition = await preflightWorkflowTransition(cwd, 'team', {
+    action: 'start',
+    sessionId: scope.sessionId,
+    baseStateDir: getBaseStateDir(cwd),
+    allowNestedAutopilotTeam: true,
+  });
+  const config = await readTeamConfig(teamName, cwd);
+  await startMode('team', config?.task ?? `Retry failed task ${taskId}`, 50, cwd, {
+    allowNestedAutopilotTeam: true,
+    preflightTransition: transition,
+  });
+  await updateModeState('team', {
+    current_phase: 'team-exec',
+    team_name: teamName,
+  }, cwd, undefined, {
+    allowNestedAutopilotTeam: true,
+  });
+  const phase = await readTeamPhase(teamName, cwd);
+  await writeTeamPhase(teamName, reconcilePhaseStateForMonitor(phase, 'team-exec'), cwd);
+}
+
+async function hasRetryEvent(
+  teamName: string,
+  intent: FailedTaskRetryIntent,
+  cwd: string,
+): Promise<boolean> {
+  const raw = await readFile(teamEventLogPath(teamName, cwd), 'utf-8').catch(() => '');
+  return raw.split('\n').some((line) => {
+    if (!line.trim()) return false;
+    try {
+      const event = JSON.parse(line) as TeamEvent;
+      return event.type === 'task_retried'
+        && event.task_id === intent.task_id
+        && event.metadata?.retry_version === intent.retry_version;
+    } catch {
+      return false;
+    }
+  });
+}
+
+async function recordRetryEvent(
+  teamName: string,
+  intent: FailedTaskRetryIntent,
+  cwd: string,
+): Promise<void> {
+  if (await hasRetryEvent(teamName, intent, cwd)) return;
+  await appendTeamEvent(teamName, {
+    type: 'task_retried',
+    worker: 'leader-fixed',
+    task_id: intent.task_id,
+    reason: 'failed_task_requeued',
+    metadata: {
+      previous_version: intent.expected_version,
+      retry_version: intent.retry_version,
+    },
+  }, cwd);
+}
+
+function parseRetryIntent(raw: string): FailedTaskRetryIntent | null {
+  try {
+    const intent = JSON.parse(raw) as Partial<FailedTaskRetryIntent>;
+    if (
+      intent.version !== 1
+      || typeof intent.task_id !== 'string'
+      || !Number.isInteger(intent.expected_version)
+      || !Number.isInteger(intent.retry_version)
+      || typeof intent.created_at !== 'string'
+    ) {
+      return null;
+    }
+    return intent as FailedTaskRetryIntent;
+  } catch {
+    return null;
+  }
+}
+
+async function reconcileFailedTaskRetryIntentsUnlocked(
   teamName: string,
   cwd: string,
-): Promise<() => Promise<void>> {
-  const scope = await resolveStateScope(cwd);
-  const baseStateDir = getBaseStateDir(cwd);
-  const modePaths = await getReadScopedStatePaths('team', cwd, scope.sessionId);
-  const skillPaths = getSkillActiveStatePathsForStateDir(baseStateDir, scope.sessionId);
-  const paths = [...new Set([
-    teamPhasePath(teamName, cwd),
-    ...modePaths,
-    getStateFilePath('run-state.json', cwd, scope.sessionId),
-    skillPaths.rootPath,
-    ...(skillPaths.sessionPath ? [skillPaths.sessionPath] : []),
-  ])];
-  const snapshots = await Promise.all(paths.map(async (path) => ({
-    path,
-    content: await readFile(path, 'utf-8').catch((error: NodeJS.ErrnoException) => {
-      if (error.code === 'ENOENT') return null;
-      throw error;
-    }),
-  })));
-
-  return async () => {
-    for (const snapshot of snapshots) {
-      if (snapshot.content === null) {
-        await rm(snapshot.path, { force: true });
-      } else {
-        await writeAtomic(snapshot.path, snapshot.content);
-      }
+): Promise<void> {
+  const dir = join(teamDir(teamName, cwd), 'retry-intents');
+  const entries = await readdir(dir).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  });
+  for (const entry of entries.filter((name) => name.endsWith('.json')).sort()) {
+    const path = join(dir, entry);
+    const intent = parseRetryIntent(await readFile(path, 'utf-8'));
+    if (!intent) throw new Error(`retry_intent_invalid:${path}`);
+    const task = await readTask(teamName, intent.task_id, cwd);
+    if (!task) throw new Error(`retry_intent_task_missing:${teamName}:${intent.task_id}`);
+    const current = normalizeTask(task);
+    if (current.version < intent.retry_version) {
+      await rm(path, { force: true });
+      continue;
     }
-  };
+    if (
+      current.version === intent.retry_version
+      && (current.status === 'pending' || current.status === 'blocked' || current.status === 'in_progress')
+    ) {
+      await reactivateTeamWorkflowForRetry(teamName, intent.task_id, cwd);
+    }
+    await recordRetryEvent(teamName, intent, cwd);
+    await rm(path, { force: true });
+  }
+}
+
+export async function reconcileFailedTaskRetryIntents(
+  teamName: string,
+  cwd: string,
+): Promise<void> {
+  await withTeamLock(teamName, cwd, () => reconcileFailedTaskRetryIntentsUnlocked(teamName, cwd));
 }
 
 export async function retryFailedTask(
@@ -1525,85 +1642,30 @@ export async function retryFailedTask(
   expectedVersion: number,
   cwd: string
 ): Promise<RetryFailedTaskResult> {
-  const result = await retryFailedTaskImpl(taskId, expectedVersion, {
-    teamName,
-    cwd,
-    readTask,
-    readTeamConfig,
-    withTaskClaimLock,
-    normalizeTask,
-    isTerminalTaskStatus,
-    taskFilePath,
-    writeAtomic,
-    beforeRetry: async () => {
-      const rollback = await snapshotRetryWorkflowState(teamName, cwd);
-      try {
-        const phase = await readTeamPhase(teamName, cwd);
-        await writeTeamPhase(teamName, reconcilePhaseStateForMonitor(phase, 'team-exec'), cwd);
-
-        const modeState = await readModeState('team', cwd);
-        const stateTeamName = typeof modeState?.team_name === 'string' ? modeState.team_name.trim() : '';
-        if (stateTeamName && stateTeamName !== teamName) {
-          throw new Error(`team_retry_mode_state_mismatch:${stateTeamName}:${teamName}`);
-        }
-        if (modeState) {
-          await updateModeState('team', {
-            active: true,
-            current_phase: 'team-exec',
-            completed_at: undefined,
-            error: undefined,
-            cancel_reason: undefined,
-            lifecycle_outcome: undefined,
-            terminal_outcome: undefined,
-            terminal_reason: undefined,
-            team_name: teamName,
-          }, cwd);
-          return rollback;
-        }
-
-        const scope = await resolveStateScope(cwd);
-        const transition = await preflightWorkflowTransition(cwd, 'team', {
-          action: 'start',
-          sessionId: scope.sessionId,
-          baseStateDir: getBaseStateDir(cwd),
-          allowNestedAutopilotTeam: true,
-        });
-        const config = await readTeamConfig(teamName, cwd);
-        await startMode('team', config?.task ?? `Retry failed task ${taskId}`, 50, cwd, {
-          allowNestedAutopilotTeam: transition.currentModes.includes('autopilot'),
-          preflightTransition: transition,
-        });
-        await updateModeState('team', {
-          current_phase: 'team-exec',
-          team_name: teamName,
-        }, cwd);
-        return rollback;
-      } catch (error) {
-        try {
-          await rollback();
-        } catch (rollbackError) {
-          throw new AggregateError(
-            [error, rollbackError],
-            'retry_failed_task_workflow_reactivation_and_rollback_failed',
-          );
-        }
-        throw error;
-      }
-    },
+  return withTeamLock(teamName, cwd, async () => {
+    await reconcileFailedTaskRetryIntentsUnlocked(teamName, cwd);
+    let retryIntent!: Awaited<ReturnType<typeof writeRetryIntent>>;
+    return retryFailedTaskImpl(taskId, expectedVersion, {
+      teamName,
+      cwd,
+      readTask,
+      readTeamConfig,
+      withTaskClaimLock,
+      normalizeTask,
+      isTerminalTaskStatus,
+      taskFilePath,
+      writeAtomic,
+      beforeRetry: async (previous, next) => {
+        retryIntent = await writeRetryIntent(teamName, previous, next, cwd);
+        return async () => rm(retryIntent.path, { force: true });
+      },
+      afterRetry: async () => {
+        await reactivateTeamWorkflowForRetry(teamName, taskId, cwd);
+        await recordRetryEvent(teamName, retryIntent.intent, cwd);
+        await rm(retryIntent.path, { force: true });
+      },
+    });
   });
-  if (!result.ok) return result;
-
-  await appendTeamEvent(teamName, {
-    type: 'task_retried',
-    worker: 'leader-fixed',
-    task_id: taskId,
-    reason: 'failed_task_requeued',
-    metadata: {
-      previous_version: expectedVersion,
-      retry_version: result.task.version,
-    },
-  }, cwd);
-  return result;
 }
 
 export async function reclaimExpiredTaskClaim(

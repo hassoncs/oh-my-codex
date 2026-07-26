@@ -27,6 +27,8 @@ import {
   transitionTaskStatus,
   readWorkerStatus,
   writeWorkerStatus,
+  readTeamManifestV2,
+  writeTeamManifestV2,
 } from '../state.js';
 import {
   monitorTeam,
@@ -43,6 +45,7 @@ import {
   waitForClaudeStartupEvidence,
   cleanupTeamWorkerLaunchOrphanedMcpProcesses,
   settleStartupAttemptResults,
+  setPromptWorkerTeardownForTests,
   TEAM_LOW_COMPLEXITY_DEFAULT_MODEL,
   type TeamRuntime,
 } from '../runtime.js';
@@ -55,6 +58,7 @@ import { readTeamEvents } from '../state/events.js';
 import { sanitizeTeamName } from '../tmux-session.js';
 import { buildInternalTeamName, resolveTeamIdentityScope } from '../team-identity.js';
 import { writePersistedApprovedTeamExecutionBinding } from '../approved-execution.js';
+import { readModeState, startMode } from '../../modes/base.js';
 
 const coverageRun = process.env.NODE_V8_COVERAGE ? true : false;
 const skipSlowLifecycleUnderCoverage = coverageRun
@@ -556,6 +560,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setPromptWorkerTeardownForTests();
   if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
   else delete process.env.OMX_TEAM_STATE_ROOT;
   if (typeof ORIGINAL_OMX_TEAM_CHILD_MODEL === 'string') process.env.OMX_TEAM_CHILD_MODEL = ORIGINAL_OMX_TEAM_CHILD_MODEL;
@@ -2478,7 +2483,7 @@ esac
     }
   });
 
-  it('startTeam treats a confirmed ready prompt as startup evidence after hook notification', async () => {
+  it('startTeam treats a ready receiver plus hook notification as settlement, not task consumption', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-ready-prompt-evidence-'));
     const previousTmux = process.env.TMUX;
     const previousTmuxPane = process.env.TMUX_PANE;
@@ -2562,7 +2567,7 @@ esac
           const runtime = await withoutTeamWorkerEnv(() =>
             startTeam(
               'team-ready-prompt-evidence',
-              'interactive ready prompt should settle startup evidence after notification',
+              'interactive ready receiver should settle startup after notification',
               'executor',
               1,
               [{ subject: 'w1', description: 'worker one', owner: 'worker-1' }],
@@ -2583,9 +2588,19 @@ esac
 
           const timingPath = join(cwd, '.omx', 'state', 'team', runtime.teamName, 'startup-timing.json');
           assert.equal(existsSync(timingPath), true, 'startup timing must record the ready-prompt evidence path');
-          const timing = JSON.parse(await readFile(timingPath, 'utf-8')) as { events: Array<{ phase: string; ok?: boolean }> };
+          const timing = JSON.parse(await readFile(timingPath, 'utf-8')) as {
+            events: Array<{ phase: string; ok?: boolean; reason?: string }>;
+          };
           assert.ok(timing.events.some((event) => event.phase === 'ready_wait_start'));
           assert.ok(timing.events.some((event) => event.phase === 'ready_wait_end' && event.ok === true));
+          assert.ok(timing.events.some(
+            (event) => event.phase === 'receiver_ready_and_notified'
+              && event.reason === 'receiver_ready_and_notified',
+          ));
+          assert.equal(timing.events.some(
+            (event) => event.phase === 'startup_evidence'
+              && /ready_prompt/.test(event.reason ?? ''),
+          ), false);
         },
       );
     } finally {
@@ -3673,6 +3688,65 @@ setTimeout(() => {}, 5000);`,
       else delete process.env.OMX_PROMPT_CLEANUP_CAPTURE_PATH;
       if (typeof prevAllowNonTty === 'string') process.env.OMX_TEST_ALLOW_NONTTY_CODEX_PROMPT = prevAllowNonTty;
       else delete process.env.OMX_TEST_ALLOW_NONTTY_CODEX_PROMPT;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam rolls back prompt workers and team state when mode-state commit fails', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-mode-commit-rollback-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    await mkdir(binDir, { recursive: true });
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      `
+process.stdin.resume();
+setInterval(() => {}, 1000);
+process.on('SIGTERM', () => process.exit(0));
+`,
+    );
+
+    let runtimeTeamName = '';
+    let workerPid = 0;
+    try {
+      await assert.rejects(
+        withPromptModeCodexEnv(binDir, {}, () =>
+          withoutTeamWorkerEnv(() =>
+            startTeam(
+              'team-mode-commit-rollback',
+              'mode-state commit failure must tear down runtime',
+              'executor',
+              1,
+              [{ subject: 's', description: 'd', owner: 'worker-1' }],
+              cwd,
+              {
+                commitModeState: async (runtime) => {
+                  runtimeTeamName = runtime.teamName;
+                  workerPid = runtime.config.workers[0]?.pid ?? 0;
+                  assert.ok(workerPid > 0, 'prompt worker must exist before mode-state commit');
+                  assert.equal(
+                    existsSync(join(cwd, '.omx', 'state', 'team', runtime.teamName)),
+                    true,
+                  );
+                  throw new Error('simulated_mode_state_commit_failure');
+                },
+              },
+            ))),
+        /simulated_mode_state_commit_failure/,
+      );
+
+      assert.ok(runtimeTeamName);
+      assert.equal(
+        existsSync(join(cwd, '.omx', 'state', 'team', runtimeTeamName)),
+        false,
+      );
+      assert.throws(() => process.kill(workerPid, 0));
+    } finally {
+      if (workerPid > 0) {
+        try {
+          process.kill(workerPid, 'SIGKILL');
+        } catch {}
+      }
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -6123,6 +6197,44 @@ esac
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-force');
       assert.equal(existsSync(teamRoot), false);
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('shutdownTeam reports prompt teardown failure after completing state and mode cleanup', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-prompt-failure-'));
+    const teamName = 'team-prompt-teardown-failure';
+    try {
+      await initTeamState(teamName, 'prompt teardown failure cleanup', 'executor', 1, cwd);
+      const config = await readTeamConfig(teamName, cwd);
+      assert.ok(config);
+      if (!config) return;
+      config.worker_launch_mode = 'prompt';
+      config.workers[0]!.pid = process.pid;
+      await saveTeamConfig(config, cwd);
+      const manifest = await readTeamManifestV2(teamName, cwd);
+      assert.ok(manifest);
+      if (!manifest) return;
+      manifest.policy.worker_launch_mode = 'prompt';
+      await writeTeamManifestV2(manifest, cwd);
+      await startMode('team', 'prompt teardown failure cleanup', 5, cwd);
+      setPromptWorkerTeardownForTests(async () => ({
+        terminated: false,
+        forcedKill: true,
+        trackedPids: [],
+      }));
+
+      await assert.rejects(
+        () => shutdownTeam(teamName, cwd, { force: true }),
+        /shutdown_prompt_teardown_failed:worker-1:still_alive_after_sigkill/,
+      );
+
+      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', teamName)), false);
+      const modeState = await readModeState('team', cwd);
+      assert.equal(modeState?.active, false);
+      assert.equal(modeState?.current_phase, 'cancelled');
+    } finally {
+      setPromptWorkerTeardownForTests();
       await rm(cwd, { recursive: true, force: true });
     }
   });

@@ -45,7 +45,8 @@ these phase markers for each worker:
 | `hook_receipt` | hook-preferred path observed `notified`, `delivered`, `failed`, or timeout. |
 | `direct_trigger_attempt` | direct tmux trigger injection was attempted. |
 | `direct_trigger_result` | direct injection result was recorded. |
-| `startup_evidence` | worker startup evidence (`task_claim`, `worker_progress`, `leader_ack`, `none`) was observed. |
+| `receiver_ready_and_notified` | receiver showed a ready prompt and transport notification succeeded; this does not prove task consumption. |
+| `startup_evidence` | task-consumption evidence (`task_claim`, `worker_progress`, qualifying `leader_ack`, `none`) was observed. |
 
 A useful operator-facing summary is the per-worker delta from
 `pane_id_captured` to first trigger attempt, plus whether the final startup
@@ -65,6 +66,9 @@ conditions hold:
   existing explicit auto-accept path has handled the prompt first.
 - It does not mark hook delivery as successful merely because a direct trigger
   was attempted.
+- A ready prompt proves only receiver readiness. Startup may settle from ready
+  receiver plus confirmed notification, but task consumption requires a claim,
+  progress state, or qualifying acknowledgement.
 - Lack of startup evidence is reported as recoverable observability when the
   worker pane is alive; it must not prevent sibling workers from receiving their
   startup triggers.

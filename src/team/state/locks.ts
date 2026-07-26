@@ -84,7 +84,7 @@ export async function withTeamLock<T>(
   deps: TeamPathDeps,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const lockDir = join(deps.teamDir(teamName, cwd), '.lock.create-task');
+  const lockDir = join(deps.teamDir(teamName, cwd), '.lock.lifecycle');
   const ownerPath = join(lockDir, 'owner');
   const ownerToken = lockOwnerToken();
   const deadline = Date.now() + 5000;
@@ -103,7 +103,7 @@ export async function withTeamLock<T>(
       if (err.code !== 'EEXIST') throw error;
       if (await maybeRecoverStaleLock(lockDir, lockStaleMs)) continue;
       if (Date.now() > deadline) {
-        throw new Error(`Timed out acquiring team task lock for ${teamName}`);
+        throw new Error(`Timed out acquiring team lifecycle lock for ${teamName}`);
       }
       await sleep(LOCK_OWNER_RETRY_MS);
     }

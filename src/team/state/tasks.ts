@@ -285,6 +285,10 @@ interface RetryFailedTaskDeps extends ReleaseDeps {
     previous: TeamTaskV2,
     next: TeamTaskV2,
   ) => Promise<(() => Promise<void>) | void>;
+  afterRetry?: (
+    previous: TeamTaskV2,
+    next: TeamTaskV2,
+  ) => Promise<void>;
 }
 
 export async function releaseTaskClaim(
@@ -378,6 +382,7 @@ export async function retryFailedTask(
       }
       throw error;
     }
+    await deps.afterRetry?.(v, updated);
     return { ok: true as const, task: updated };
   });
 

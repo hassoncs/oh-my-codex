@@ -53,6 +53,7 @@ import {
   teamNormalizePolicy as normalizeTeamPolicy,
   teamClaimTask as claimTask,
   teamReleaseTaskClaim as releaseTaskClaim,
+  teamReconcileFailedTaskRetryIntents as reconcileFailedTaskRetryIntents,
   teamReclaimExpiredTaskClaim as reclaimExpiredTaskClaim,
   teamAppendEvent as appendTeamEvent,
   teamReadTaskApproval as readTaskApproval,
@@ -1369,6 +1370,7 @@ export interface TeamStartOptions {
   cleanupLaunchOrphanedMcpProcesses?: () => Promise<CleanupResult>;
   writeCleanupWarning?: (message: string) => void;
   approvedExecution?: ApprovedTeamExecutionBinding | null;
+  commitModeState?: (runtime: TeamRuntime) => Promise<void>;
 }
 
 interface ShutdownGateCounts {
@@ -1556,6 +1558,7 @@ type StartupTimingPhase =
   | 'dispatch_queued'
   | 'hook_receipt'
   | 'direct_fallback'
+  | 'receiver_ready_and_notified'
   | 'startup_evidence';
 
 interface StartupTimingEvent {
@@ -1735,7 +1738,7 @@ async function assertNestedTeamAllowed(cwd: string): Promise<void> {
   throw new Error('nested_team_disallowed');
 }
 
-type WorkerStartupEvidence = 'task_claim' | 'worker_progress' | 'leader_ack' | 'ready_prompt' | 'none';
+type WorkerStartupEvidence = 'task_claim' | 'worker_progress' | 'leader_ack' | 'none';
 
 function resolveStartupEvidenceStateRoots(cwd: string): string[] {
   return [...new Set([
@@ -2225,6 +2228,14 @@ async function terminateTrackedProcessTree(
   };
 }
 
+let terminatePromptWorkerProcessTree = terminateTrackedProcessTree;
+
+export function setPromptWorkerTeardownForTests(
+  teardown: typeof terminateTrackedProcessTree = terminateTrackedProcessTree,
+): void {
+  terminatePromptWorkerProcessTree = teardown;
+}
+
 async function teardownPromptWorker(
   teamName: string,
   workerName: string,
@@ -2244,7 +2255,7 @@ async function teardownPromptWorker(
     return { terminated: true, forcedKill: false, pid: null };
   }
 
-  const teardown = await terminateTrackedProcessTree(pid ?? 0, processGroupId);
+  const teardown = await terminatePromptWorkerProcessTree(pid ?? 0, processGroupId);
   const processGone = processGroupId ? !isProcessGroupAlive(processGroupId) : !isPidAlive(pid!);
   if (teardown.terminated && processGone) {
     removePromptWorkerHandle(teamName, workerName);
@@ -3102,7 +3113,11 @@ export async function startTeam(
             cwd: leaderCwd,
             teamName: sanitized,
             workerName,
-            event: dispatchOutcome.ok ? 'startup_evidence' : 'startup_attempt_failed',
+            event: dispatchOutcome.ok
+              ? (dispatchOutcome.reason.includes('receiver_ready')
+                ? 'receiver_ready_and_notified'
+                : 'startup_evidence')
+              : 'startup_attempt_failed',
             paneId,
             elapsedMs: performance.now() - startupStartedAt,
             reason: dispatchOutcome.reason,
@@ -3168,15 +3183,17 @@ export async function startTeam(
       throw firstStartupError.error;
     }
     await saveTeamConfig(config, leaderCwd);
-    await startupTiming.flush();
-
-    return {
+    const runtime = {
       teamName: sanitized,
       sanitizedName: sanitized,
       sessionName,
       config,
       cwd: leaderCwd,
     };
+    await options.commitModeState?.(runtime);
+    await startupTiming.flush();
+
+    return runtime;
   } catch (error) {
     const rollbackErrors: string[] = [];
 
@@ -3305,6 +3322,7 @@ export async function monitorTeam(teamName: string, cwd: string): Promise<TeamSn
   const sanitized = resolveTeamNameForCurrentContext(teamName, cwd);
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) return null;
+  await reconcileFailedTaskRetryIntents(sanitized, cwd);
   const manifest = await readTeamManifestV2(sanitized, cwd);
   const dispatchPolicy = resolveDispatchPolicy(manifest?.policy, config.worker_launch_mode);
   const previousSnapshot = await readMonitorSnapshot(sanitized, cwd);
@@ -3793,6 +3811,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   const sessionName = config.tmux_session;
   const dispatchPolicy = resolveDispatchPolicy(manifest?.policy, config.worker_launch_mode);
   const shutdownRequestTimes = new Map<string, string>();
+  const cleanupErrors: string[] = [];
 
   if (!skipWorkerAcks) {
     // 1. Send shutdown inbox to each worker
@@ -4008,7 +4027,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       }
     }
     if (promptTeardownFailures.length > 0) {
-      throw new Error(`shutdown_prompt_teardown_failed:${promptTeardownFailures.join(',')}`);
+      cleanupErrors.push(`shutdown_prompt_teardown_failed:${promptTeardownFailures.join(',')}`);
     }
   }
 
@@ -4089,7 +4108,6 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   }
   restoreTeamModelInstructionsFile(sanitized);
 
-  const cleanupErrors: string[] = [];
   const provisionedWorktrees = collectProvisionedShutdownWorktrees(config);
   if (provisionedWorktrees.length > 0) {
     try {
@@ -4127,6 +4145,7 @@ export async function resumeTeam(teamName: string, cwd: string): Promise<TeamRun
   const sanitized = resolveTeamNameForCurrentContext(teamName, cwd);
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) return null;
+  await reconcileFailedTaskRetryIntents(sanitized, cwd);
   config.lifecycle_profile = 'default';
   const leaderCwd = config.leader_cwd ?? cwd;
   const approvedExecutionState = await resolvePersistedApprovedTeamExecutionContinuityState(
@@ -4707,10 +4726,16 @@ async function dispatchCriticalInboxInstruction(params: {
       return { ok: true, transport: 'hook', reason: 'hook_receipt_notified', request_id: queued.request_id };
     }
     if (startupReadyPromptObserved) {
+      noteTiming('receiver_ready_and_notified', {
+        ok: true,
+        reason: 'receiver_ready_and_notified',
+        transport: 'hook',
+        request_id: queued.request_id,
+      });
       return {
         ok: true,
         transport: 'hook',
-        reason: 'hook_receipt_notified_with_ready_prompt',
+        reason: 'hook_receipt_notified_with_receiver_ready',
         request_id: queued.request_id,
       };
     }
@@ -4740,7 +4765,7 @@ async function dispatchCriticalInboxInstruction(params: {
     const fallback = await notifyWorkerOutcome(config, workerIndex, triggerMessage, paneId);
     if (fallback.ok) {
       const fallbackStartupEvidence = startupReadyPromptObserved
-        ? 'ready_prompt'
+        ? 'receiver_ready_and_notified'
         : await waitForRequiredStartupEvidenceAfterDirectFallback({
           requireWorkerStartupEvidence,
           workerCli,
@@ -4749,12 +4774,17 @@ async function dispatchCriticalInboxInstruction(params: {
           cwd,
           timeoutMs: startupEvidenceTimeoutMs,
         });
-      noteTiming('startup_evidence', {
+      noteTiming(
+        fallbackStartupEvidence === 'receiver_ready_and_notified'
+          ? 'receiver_ready_and_notified'
+          : 'startup_evidence',
+        {
         ok: fallbackStartupEvidence !== 'none',
         reason: fallbackStartupEvidence,
         transport: fallback.transport,
         request_id: queued.request_id,
-      });
+        },
+      );
       if (requiresObservedStartupEvidence && fallbackStartupEvidence === 'none') {
         await transitionDispatchRequest(
           teamName,
@@ -4820,7 +4850,7 @@ async function dispatchCriticalInboxInstruction(params: {
     : `fallback_attempted_but_unconfirmed:${fallback.reason}`;
   if (fallback.ok) {
     const fallbackStartupEvidence = startupReadyPromptObserved
-      ? 'ready_prompt'
+      ? 'receiver_ready_and_notified'
       : await waitForRequiredStartupEvidenceAfterDirectFallback({
         requireWorkerStartupEvidence,
         workerCli,
@@ -4829,12 +4859,17 @@ async function dispatchCriticalInboxInstruction(params: {
         cwd,
         timeoutMs: startupEvidenceTimeoutMs,
       });
-    noteTiming('startup_evidence', {
+    noteTiming(
+      fallbackStartupEvidence === 'receiver_ready_and_notified'
+        ? 'receiver_ready_and_notified'
+        : 'startup_evidence',
+      {
       ok: fallbackStartupEvidence !== 'none',
       reason: fallbackStartupEvidence,
       transport: fallback.transport,
       request_id: queued.request_id,
-    });
+      },
+    );
     if (requiresObservedStartupEvidence && fallbackStartupEvidence === 'none') {
       const current = await readDispatchRequest(teamName, queued.request_id, cwd);
       if (current && current.status !== 'failed') {

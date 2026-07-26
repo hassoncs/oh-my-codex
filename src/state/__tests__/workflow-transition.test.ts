@@ -14,6 +14,8 @@ import {
   preflightWorkflowTransition,
   reconcileWorkflowTransition,
 } from '../workflow-transition-reconcile.js';
+import { readModeState, startMode } from '../../modes/base.js';
+import { getBaseStateDir } from '../../mcp/state-paths.js';
 
 const STATE_ENV_KEYS = [
   'OMX_ROOT',
@@ -446,6 +448,39 @@ describe('workflow transition rules', () => {
         );
       } finally {
         await rm(root, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('rejects a stale preflight before writing requested workflow state', async () => {
+    await withIsolatedStateEnv(async () => {
+      const wd = await mkdtemp(join(tmpdir(), 'omx-workflow-preflight-drift-'));
+      try {
+        const preflight = await preflightWorkflowTransition(wd, 'team', {
+          action: 'start',
+          baseStateDir: getBaseStateDir(wd),
+        });
+        await startMode('autopilot', 'concurrent parent', 5, wd);
+
+        const stateDir = join(wd, '.omx', 'state');
+        const canonicalPath = join(stateDir, 'skill-active-state.json');
+        const runStatePath = join(stateDir, 'run-state.json');
+        const canonicalBefore = await readFile(canonicalPath, 'utf-8');
+        const runStateBefore = await readFile(runStatePath, 'utf-8');
+
+        await assert.rejects(
+          () => startMode('team', 'stale preflight team', 5, wd, {
+            allowNestedAutopilotTeam: preflight.currentModes.includes('autopilot'),
+            preflightTransition: preflight,
+          }),
+          /workflow_transition_preflight_state_drift/,
+        );
+
+        assert.equal(await readModeState('team', wd), null);
+        assert.equal(await readFile(canonicalPath, 'utf-8'), canonicalBefore);
+        assert.equal(await readFile(runStatePath, 'utf-8'), runStateBefore);
+      } finally {
+        await rm(wd, { recursive: true, force: true });
       }
     });
   });

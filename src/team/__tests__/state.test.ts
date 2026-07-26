@@ -21,6 +21,7 @@ import {
   transitionTaskStatus,
   releaseTaskClaim,
   retryFailedTask,
+  reconcileFailedTaskRetryIntents,
   reclaimExpiredTaskClaim,
   sendDirectMessage,
   broadcastMessage,
@@ -49,6 +50,7 @@ import {
   teamEventLogPath,
   writeTeamPhase,
   writeTeamManifestV2,
+  type TeamTaskV2,
 } from '../state.js';
 import { normalizeDispatchRequest } from '../state/dispatch.js';
 import { readModeState, startMode, updateModeState } from '../../modes/base.js';
@@ -1582,6 +1584,70 @@ exit 1
     }
   });
 
+  it('retryFailedTask reactivates Team inside valid Autopilot Ultragoal', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-nested-autopilot-'));
+    try {
+      const teamName = 'nested-retry';
+      await initTeamState(teamName, 'nested retry', 'executor', 1, cwd);
+      const task = await createTask(teamName, {
+        subject: 'retry',
+        description: 'retry',
+        status: 'pending',
+      }, cwd);
+      const claim = await claimTask(teamName, task.id, 'worker-1', task.version, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+      const failed = await transitionTaskStatus(
+        teamName,
+        task.id,
+        'in_progress',
+        'failed',
+        claim.claimToken,
+        cwd,
+        { error: 'failed once' },
+      );
+      assert.equal(failed.ok, true);
+      if (!failed.ok) return;
+
+      await startMode('team', 'nested retry', 5, cwd);
+      await updateModeState('team', {
+        active: false,
+        current_phase: 'failed',
+        completed_at: new Date().toISOString(),
+        error: 'failed once',
+        team_name: teamName,
+      }, cwd);
+      await writeTeamPhase(teamName, {
+        current_phase: 'failed',
+        max_fix_attempts: 3,
+        current_fix_attempt: 3,
+        transitions: [],
+        updated_at: new Date().toISOString(),
+      }, cwd);
+      await startMode('autopilot', 'parent lifecycle', 5, cwd);
+      await updateModeState('autopilot', { current_phase: 'ultragoal' }, cwd);
+      const ultragoalDir = join(cwd, '.omx', 'ultragoal');
+      await mkdir(ultragoalDir, { recursive: true });
+      await writeFile(join(ultragoalDir, 'goals.json'), JSON.stringify({
+        activeGoalId: 'G001',
+        codexGoalMode: 'aggregate',
+        goals: [{ id: 'G001', title: 'Nested work', status: 'in_progress' }],
+      }, null, 2));
+
+      const retried = await retryFailedTask(teamName, task.id, failed.task.version, cwd);
+      assert.equal(retried.ok, true);
+      assert.equal((await readTask(teamName, task.id, cwd))?.status, 'pending');
+      assert.equal((await readModeState('autopilot', cwd))?.active, true);
+      assert.equal((await readModeState('team', cwd))?.active, true);
+      const canonical = await readVisibleSkillActiveState(cwd);
+      const activeSkills = listActiveSkills(canonical ?? {}).map((entry) => entry.skill);
+      assert.equal(activeSkills.includes('autopilot'), true);
+      assert.equal(activeSkills.includes('team'), true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('retryFailedTask restores terminal workflow state when task rewrite fails', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-write-failure-'));
     try {
@@ -1644,6 +1710,158 @@ exit 1
       assert.equal(await readFile(modePath, 'utf-8'), beforeMode);
       assert.equal(await readFile(phasePath, 'utf-8'), beforePhase);
       assert.equal(await readFile(canonicalPath, 'utf-8'), beforeCanonical);
+    } finally {
+      resetWriteAtomicRenameForTests();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes different-task retries so one failure cannot terminalize a successful retry', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-concurrent-'));
+    try {
+      const teamName = 'retry-concurrent';
+      await initTeamState(teamName, 'retry concurrent', 'executor', 1, cwd);
+      const failedTasks: TeamTaskV2[] = [];
+      for (const subject of ['first', 'second']) {
+        const task = await createTask(teamName, { subject, description: subject, status: 'pending' }, cwd);
+        const claim = await claimTask(teamName, task.id, 'worker-1', task.version, cwd);
+        assert.equal(claim.ok, true);
+        if (!claim.ok) return;
+        const failed = await transitionTaskStatus(
+          teamName,
+          task.id,
+          'in_progress',
+          'failed',
+          claim.claimToken,
+          cwd,
+          { error: `${subject} failed` },
+        );
+        assert.equal(failed.ok, true);
+        if (!failed.ok) return;
+        failedTasks.push(failed.task);
+      }
+      await startMode('team', 'retry concurrent', 5, cwd);
+      await updateModeState('team', {
+        active: false,
+        current_phase: 'failed',
+        completed_at: new Date().toISOString(),
+        team_name: teamName,
+      }, cwd);
+      await writeTeamPhase(teamName, {
+        current_phase: 'failed',
+        max_fix_attempts: 3,
+        current_fix_attempt: 3,
+        transitions: [],
+        updated_at: new Date().toISOString(),
+      }, cwd);
+
+      let releaseFirstWrite!: () => void;
+      let firstWriteReached!: () => void;
+      const firstWriteReady = new Promise<void>((resolve) => {
+        firstWriteReached = resolve;
+      });
+      const firstWriteGate = new Promise<void>((resolve) => {
+        releaseFirstWrite = resolve;
+      });
+      setWriteAtomicRenameForTests(async (from, to) => {
+        const destination = String(to);
+        if (destination.endsWith(`/tasks/task-${failedTasks[0]!.id}.json`)) {
+          firstWriteReached();
+          await firstWriteGate;
+        }
+        if (destination.endsWith(`/tasks/task-${failedTasks[1]!.id}.json`)) {
+          throw Object.assign(new Error('simulated second retry write failure'), { code: 'ENOSPC' });
+        }
+        await rename(from, to);
+      });
+
+      const firstRetry = retryFailedTask(teamName, failedTasks[0]!.id, failedTasks[0]!.version, cwd);
+      await firstWriteReady;
+      const secondRetry = retryFailedTask(teamName, failedTasks[1]!.id, failedTasks[1]!.version, cwd);
+      releaseFirstWrite();
+      const [firstResult, secondResult] = await Promise.allSettled([firstRetry, secondRetry]);
+      resetWriteAtomicRenameForTests();
+
+      assert.equal(firstResult.status, 'fulfilled');
+      assert.equal(secondResult.status, 'rejected');
+      assert.equal((await readTask(teamName, failedTasks[0]!.id, cwd))?.status, 'pending');
+      assert.equal((await readTask(teamName, failedTasks[1]!.id, cwd))?.status, 'failed');
+      assert.equal((await readTeamPhase(teamName, cwd))?.current_phase, 'team-exec');
+      assert.equal((await readModeState('team', cwd))?.active, true);
+    } finally {
+      resetWriteAtomicRenameForTests();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers a committed retry intent after workflow reactivation interruption', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-recovery-'));
+    try {
+      const teamName = 'retry-recovery';
+      await initTeamState(teamName, 'retry recovery', 'executor', 1, cwd);
+      const task = await createTask(teamName, {
+        subject: 'retry',
+        description: 'retry',
+        status: 'pending',
+      }, cwd);
+      const claim = await claimTask(teamName, task.id, 'worker-1', task.version, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+      const failed = await transitionTaskStatus(
+        teamName,
+        task.id,
+        'in_progress',
+        'failed',
+        claim.claimToken,
+        cwd,
+        { error: 'failed once' },
+      );
+      assert.equal(failed.ok, true);
+      if (!failed.ok) return;
+      await startMode('team', 'retry recovery', 5, cwd);
+      await updateModeState('team', {
+        active: false,
+        current_phase: 'failed',
+        completed_at: new Date().toISOString(),
+        team_name: teamName,
+      }, cwd);
+      await writeTeamPhase(teamName, {
+        current_phase: 'failed',
+        max_fix_attempts: 3,
+        current_fix_attempt: 3,
+        transitions: [],
+        updated_at: new Date().toISOString(),
+      }, cwd);
+
+      setWriteAtomicRenameForTests(async (from, to) => {
+        if (String(to).endsWith(`/team/${teamName}/phase.json`)) {
+          throw Object.assign(new Error('simulated retry reactivation interruption'), { code: 'EIO' });
+        }
+        await rename(from, to);
+      });
+      await assert.rejects(
+        () => retryFailedTask(teamName, task.id, failed.task.version, cwd),
+        /simulated retry reactivation interruption/,
+      );
+      resetWriteAtomicRenameForTests();
+
+      const intentPath = join(cwd, '.omx', 'state', 'team', teamName, 'retry-intents', `task-${task.id}.json`);
+      assert.equal((await readTask(teamName, task.id, cwd))?.status, 'pending');
+      assert.equal(existsSync(intentPath), true);
+
+      await reconcileFailedTaskRetryIntents(teamName, cwd);
+
+      assert.equal(existsSync(intentPath), false);
+      assert.equal((await readTeamPhase(teamName, cwd))?.current_phase, 'team-exec');
+      assert.equal((await readModeState('team', cwd))?.active, true);
+      const events = (await readFile(teamEventLogPath(teamName, cwd), 'utf-8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      assert.equal(
+        events.filter((event) => event.type === 'task_retried' && event.task_id === task.id).length,
+        1,
+      );
     } finally {
       resetWriteAtomicRenameForTests();
       await rm(cwd, { recursive: true, force: true });

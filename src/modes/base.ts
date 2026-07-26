@@ -32,6 +32,7 @@ import {
   resolveStateScope,
 } from '../mcp/state-paths.js';
 import { completeRalplanSession, validateRalplanTerminalConsensus } from '../state/operations.js';
+import { withWorkflowStateLock } from '../state/workflow-state-lock.js';
 
 export interface ModeState {
   active: boolean;
@@ -53,12 +54,14 @@ export type ModeName = 'autopilot' | 'autoresearch' | 'deep-interview' | 'ralph'
 /** @deprecated These mode names were removed in v4.6. Use the canonical modes instead. */
 export type DeprecatedModeName = 'ultrapilot' | 'pipeline' | 'ecomode';
 
-export interface UpdateModeStateOptions {
+export interface UpdateModeStateOptions extends WorkflowTransitionOptions {
   trustedPipelineProgress?: boolean;
+  workflowLockHeld?: boolean;
 }
 
 export interface StartModeOptions extends WorkflowTransitionOptions {
   preflightTransition?: PreflightedWorkflowTransition;
+  workflowLockHeld?: boolean;
 }
 
 const DEPRECATED_MODES: Record<DeprecatedModeName, string> = {
@@ -142,10 +145,6 @@ function normalizeModeStateOrThrow(mode: string, state: ModeState): ModeState {
   return applySharedRunOutcomeContractOrThrow(normalized);
 }
 
-function stateDir(projectRoot?: string): string {
-  return getBaseStateDir(projectRoot);
-}
-
 export async function assertModeStartAllowed(
   mode: ModeName,
   projectRoot?: string,
@@ -172,11 +171,18 @@ export async function startMode(
   projectRoot?: string,
   options: StartModeOptions = {},
 ): Promise<ModeState> {
-  const dir = stateDir(projectRoot);
-  await mkdir(dir, { recursive: true });
-
   const scope = await resolveStateScope(projectRoot);
   const baseStateDir = getBaseStateDir(projectRoot);
+  if (isTrackedWorkflowMode(mode) && !options.workflowLockHeld) {
+    return withWorkflowStateLock(
+      baseStateDir,
+      () => startMode(mode, taskDescription, maxIterations, projectRoot, {
+        ...options,
+        workflowLockHeld: true,
+      }),
+    );
+  }
+  await mkdir(baseStateDir, { recursive: true });
   let transitionMessage: string | undefined;
   if (isTrackedWorkflowMode(mode)) {
     const transition = await reconcileWorkflowTransition(projectRoot ?? process.cwd(), mode, {
@@ -186,6 +192,7 @@ export async function startMode(
       baseStateDir,
       allowNestedAutopilotTeam: options.allowNestedAutopilotTeam,
       preflight: options.preflightTransition,
+      workflowLockHeld: true,
     });
     transitionMessage = transition.transitionMessage;
   }
@@ -299,6 +306,15 @@ export async function updateModeState(
 ): Promise<ModeState> {
   const scope = await resolveStateScope(projectRoot, explicitSessionId);
   const baseStateDir = getBaseStateDir(projectRoot);
+  if (isTrackedWorkflowMode(mode) && !options.workflowLockHeld) {
+    return withWorkflowStateLock(
+      baseStateDir,
+      () => updateModeState(mode, updates, projectRoot, explicitSessionId, {
+        ...options,
+        workflowLockHeld: true,
+      }),
+    );
+  }
   const current = mode === 'ralph' && scope.sessionId
     ? await readModeStateForActiveDecision(mode, scope.sessionId, projectRoot)
     : explicitSessionId
@@ -400,6 +416,7 @@ export async function updateModeState(
         currentPhase: typeof updated.current_phase === 'string' ? updated.current_phase : undefined,
         sessionId: scope.sessionId,
         source: 'updateModeState',
+        workflowTransitionOptions: options,
       });
     }
   }

@@ -1318,7 +1318,7 @@ export async function preflightTeamModeStart(cwd: string = process.cwd()): Promi
     allowNestedAutopilotTeam: true,
   });
   return {
-    allowNestedAutopilotTeam: transition.currentModes.includes('autopilot'),
+    allowNestedAutopilotTeam: transition.allowNestedAutopilotTeam,
     workflowTransition: transition,
   };
 }
@@ -1797,13 +1797,18 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       worktreeMode,
       decompositionMetadata: executionPlan.metadata,
       approvedExecution: parsed.approvedExecution ?? null,
+      commitModeState: async (startedRuntime) => {
+        await ensureTeamModeState(
+          {
+            ...effectiveParsed,
+            teamName: startedRuntime.teamName,
+            displayName: startedRuntime.config.display_name ?? effectiveParsed.displayName,
+          },
+          tasks,
+          modePreflight,
+        );
+      },
     },
-  );
-
-  await ensureTeamModeState(
-    { ...effectiveParsed, teamName: runtime.teamName, displayName: runtime.config.display_name ?? effectiveParsed.displayName },
-    tasks,
-    modePreflight,
   );
   if (executionPlan.overOrchestrationNotice) {
     console.log(`${executionPlan.overOrchestrationNotice.code}: ${executionPlan.overOrchestrationNotice.message}`);

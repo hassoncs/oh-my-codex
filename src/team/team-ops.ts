@@ -80,6 +80,7 @@ export { updateTask as teamUpdateTask } from './state.js';
 export { claimTask as teamClaimTask } from './state.js';
 export { releaseTaskClaim as teamReleaseTaskClaim } from './state.js';
 export { retryFailedTask as teamRetryFailedTask } from './state.js';
+export { reconcileFailedTaskRetryIntents as teamReconcileFailedTaskRetryIntents } from './state.js';
 export { reclaimExpiredTaskClaim as teamReclaimExpiredTaskClaim } from './state.js';
 export { transitionTaskStatus as teamTransitionTaskStatus } from './state.js';
 export { computeTaskReadiness as teamComputeTaskReadiness } from './state.js';

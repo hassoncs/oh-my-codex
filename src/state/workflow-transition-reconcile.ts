@@ -1,7 +1,8 @@
 import { existsSync } from 'fs';
+import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import { dirname, join, resolve } from 'path';
-import { getStatePath } from '../mcp/state-paths.js';
+import { getBaseStateDir, getStatePath } from '../mcp/state-paths.js';
 import {
   buildWorkflowTransitionError,
   evaluateWorkflowTransition,
@@ -26,6 +27,7 @@ import {
 } from '../autopilot/deep-interview-gate.js';
 import { isAutopilotSupervisingChild } from '../autopilot/fsm.js';
 import { resolveLeaderOwnedUltragoalContextOutcome } from '../team/ultragoal-context.js';
+import { withWorkflowStateLock } from './workflow-state-lock.js';
 
 interface TransitionStateLike {
   active?: unknown;
@@ -43,12 +45,50 @@ export interface ReconciledWorkflowTransition {
 
 export interface PreflightedWorkflowTransition {
   action: WorkflowTransitionAction;
+  allowNestedAutopilotTeam: boolean;
+  authorityDigest: string;
   baseStateDir?: string;
   cwd: string;
+  currentModesSource: 'authoritative' | 'override';
   decision: WorkflowTransitionDecision;
   currentModes: TrackedWorkflowMode[];
   requestedMode: TrackedWorkflowMode;
   sessionId?: string;
+}
+
+async function workflowAuthorityDigest(
+  cwd: string,
+  sessionId?: string,
+  baseStateDir?: string,
+): Promise<string> {
+  const resolvedBaseStateDir = baseStateDir ? resolve(baseStateDir) : getBaseStateDir(cwd);
+  const canonicalPaths = [
+    join(resolvedBaseStateDir, 'skill-active-state.json'),
+    ...(sessionId
+      ? [join(resolvedBaseStateDir, 'sessions', sessionId, 'skill-active-state.json')]
+      : []),
+  ];
+  const paths = [
+    ...TRACKED_WORKFLOW_MODES.map((mode) => modeStatePathForRoot(
+      mode,
+      cwd,
+      sessionId,
+      baseStateDir,
+    )),
+    ...canonicalPaths,
+  ];
+  const hash = createHash('sha256');
+  for (const path of [...new Set(paths)].sort()) {
+    const content = await readFile(path, 'utf-8').catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    hash.update(path);
+    hash.update('\0');
+    hash.update(content ?? '<absent>');
+    hash.update('\0');
+  }
+  return hash.digest('hex');
 }
 
 function safeString(value: unknown): string {
@@ -266,6 +306,7 @@ export async function preflightWorkflowTransition(
     baseStateDir?: string;
     currentModes?: Iterable<string>;
     allowNestedAutopilotTeam?: boolean;
+    workflowLockHeld?: boolean;
   } = {},
 ): Promise<PreflightedWorkflowTransition> {
   const {
@@ -273,6 +314,15 @@ export async function preflightWorkflowTransition(
     sessionId,
     baseStateDir,
   } = options;
+  if (!options.workflowLockHeld) {
+    return withWorkflowStateLock(
+      baseStateDir ? resolve(baseStateDir) : getBaseStateDir(cwd),
+      () => preflightWorkflowTransition(cwd, requestedMode, {
+        ...options,
+        workflowLockHeld: true,
+      }),
+    );
+  }
   if (!options.currentModes) {
     await assertAuthoritativeWorkflowStateReadable(cwd, sessionId, baseStateDir);
   }
@@ -294,8 +344,11 @@ export async function preflightWorkflowTransition(
 
   return {
     action,
+    allowNestedAutopilotTeam: options.allowNestedAutopilotTeam === true,
+    authorityDigest: await workflowAuthorityDigest(cwd, sessionId, baseStateDir),
     baseStateDir: baseStateDir ? resolve(baseStateDir) : undefined,
     cwd: resolve(cwd),
+    currentModesSource: options.currentModes ? 'override' : 'authoritative',
     decision,
     currentModes,
     requestedMode,
@@ -315,6 +368,7 @@ export async function reconcileWorkflowTransition(
     currentModes?: Iterable<string>;
     allowNestedAutopilotTeam?: boolean;
     preflight?: PreflightedWorkflowTransition;
+    workflowLockHeld?: boolean;
   } = {},
 ): Promise<ReconciledWorkflowTransition> {
   const {
@@ -324,6 +378,16 @@ export async function reconcileWorkflowTransition(
     source = 'workflow-transition',
     baseStateDir,
   } = options;
+  if (!options.workflowLockHeld) {
+    return withWorkflowStateLock(
+      baseStateDir ? resolve(baseStateDir) : getBaseStateDir(cwd),
+      () => reconcileWorkflowTransition(cwd, requestedMode, {
+        ...options,
+        workflowLockHeld: true,
+      }),
+    );
+  }
+  let decision: WorkflowTransitionDecision;
   if (options.preflight) {
     const expectedBaseStateDir = baseStateDir ? resolve(baseStateDir) : undefined;
     if (options.preflight.requestedMode !== requestedMode) {
@@ -341,14 +405,38 @@ export async function reconcileWorkflowTransition(
     if (options.preflight.baseStateDir !== expectedBaseStateDir) {
       throw new Error('workflow_transition_preflight_state_root_mismatch');
     }
-  }
-  const { decision } = options.preflight ?? await preflightWorkflowTransition(cwd, requestedMode, {
+    if (options.preflight.allowNestedAutopilotTeam !== (options.allowNestedAutopilotTeam === true)) {
+      throw new Error('workflow_transition_preflight_nested_team_mismatch');
+    }
+    const currentDigest = await workflowAuthorityDigest(cwd, sessionId, baseStateDir);
+    if (currentDigest !== options.preflight.authorityDigest) {
+      throw new Error('workflow_transition_preflight_state_drift');
+    }
+    const currentModes = options.preflight.currentModesSource === 'override'
+      ? options.preflight.currentModes
+      : await visibleTrackedModes(cwd, sessionId, baseStateDir);
+    await assertAuthoritativeWorkflowStateReadable(cwd, sessionId, baseStateDir);
+    await assertWorkflowTransitionContextAllowed(cwd, currentModes, requestedMode, {
+      sessionId,
+      baseStateDir,
+      allowNestedAutopilotTeam: options.allowNestedAutopilotTeam,
+    });
+    decision = evaluateWorkflowTransition(currentModes, requestedMode, {
+      allowNestedAutopilotTeam: options.allowNestedAutopilotTeam,
+    });
+    if (!decision.allowed) {
+      throw new Error(buildWorkflowTransitionError(currentModes, requestedMode, action));
+    }
+  } else {
+    decision = (await preflightWorkflowTransition(cwd, requestedMode, {
       action,
       sessionId,
       baseStateDir,
       currentModes: options.currentModes,
       allowNestedAutopilotTeam: options.allowNestedAutopilotTeam,
-    });
+      workflowLockHeld: true,
+    })).decision;
+  }
 
   const completedPaths: string[] = [];
   for (const sourceMode of decision.autoCompleteModes) {
