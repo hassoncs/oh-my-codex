@@ -287,6 +287,11 @@ Usage:
                 (also used as an adaptive backend for qualifying read-only explore tasks)
   omx help      Show this help message
   omx status    Show active modes and state
+  omx status --json [--cwd <path>]
+                Machine-readable supervision surface (schema omx.supervision.status.v1):
+                phase, goal registry + run namespace, per-goal status, teams/workers,
+                last checkpoint. Readable from OUTSIDE the session by path.
+                Supervise OMX lanes with this, never by scraping tmux panes.
   omx cancel    Cancel active execution modes
   omx reasoning Show or set model reasoning effort (low|medium|high|xhigh)
 
@@ -2858,7 +2863,7 @@ export async function main(args: string[]): Promise<void> {
         await hooksCommand(args.slice(1));
         break;
       case "status":
-        await showStatus();
+        await showStatus(args.slice(1));
         break;
       case "cancel":
         await cancelModes(args.slice(1));
@@ -2928,9 +2933,21 @@ function formatDurableUltragoalStatusForCli(status: string): string {
     : `ultragoal: ACTIVE (phase: ${status})`;
 }
 
-async function showStatus(): Promise<void> {
+function readStatusOption(args: readonly string[], flag: string): string | undefined {
+  const index = args.indexOf(flag);
+  if (index >= 0) return args[index + 1];
+  const prefix = `${flag}=`;
+  return args.find((arg) => arg.startsWith(prefix))?.slice(prefix.length);
+}
+
+async function showStatus(args: string[] = []): Promise<void> {
   const { readFile } = await import("fs/promises");
-  const cwd = process.cwd();
+  const cwd = resolve(readStatusOption(args, "--cwd") ?? process.cwd());
+  if (args.includes("--json")) {
+    const { buildSupervisionStatus } = await import("../state/supervision-status.js");
+    console.log(JSON.stringify(await buildSupervisionStatus(cwd), null, 2));
+    return;
+  }
   try {
     let refs = await listModeStateFilesWithScopePreference(cwd);
     // Reconcile with hook-visible run-dir state when the worktree-scoped state

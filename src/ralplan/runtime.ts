@@ -11,7 +11,7 @@ export const RALPLAN_ACTIVE_PHASES = [
 ] as const;
 
 export type RalplanActivePhase = (typeof RALPLAN_ACTIVE_PHASES)[number];
-export type RalplanTerminalPhase = 'complete' | 'cancelled' | 'failed';
+export type RalplanTerminalPhase = 'complete' | 'cancelled' | 'failed' | 'needs_user_decision';
 export type RalplanReviewVerdict = 'approve' | 'iterate' | 'reject';
 export type RalplanExecutionLane = 'ultragoal' | 'team' | 'ralph' | 'conductor' | 'execution' | 'none';
 
@@ -98,13 +98,31 @@ export interface RunRalplanConsensusOptions {
   task: string;
   cwd?: string;
   maxIterations?: number;
+  /**
+   * Wall-clock stop-loss for the whole consensus gate. Round counting alone did
+   * not stop a lane that kept re-reviewing for hours; when this elapses the run
+   * emits needs_user_decision instead of starting another round.
+   */
+  maxWallClockMs?: number;
   sessionId?: string;
   requireNativeSubagents?: boolean;
   selectedExecutionLane?: RalplanExecutionLane;
+  /** Injectable clock for deterministic budget tests. */
+  now?: () => number;
+}
+
+export type RalplanReviewBudgetKind = 'iterations' | 'wall_clock';
+
+export interface RalplanReviewBudgetStatus {
+  maxIterations: number;
+  maxWallClockMs: number | null;
+  iterationsUsed: number;
+  elapsedMs: number;
+  exhausted: RalplanReviewBudgetKind | null;
 }
 
 export interface RalplanRuntimeResult {
-  status: 'completed' | 'failed' | 'cancelled';
+  status: 'completed' | 'failed' | 'cancelled' | 'needs_user_decision';
   iteration: number;
   phase: RalplanTerminalPhase;
   planningComplete: boolean;
@@ -136,6 +154,50 @@ interface RalplanModeUpdates {
   status_message?: string;
   review_history?: Array<Record<string, unknown>>;
   [key: string]: unknown;
+}
+
+export const RALPLAN_BRIEF_ADDENDA_STATE_KEY = 'pending_brief_addenda';
+
+export interface RalplanBriefAddendum {
+  text: string;
+  receivedAt: string;
+  source?: string;
+}
+
+/**
+ * Queue a mid-gate brief addendum. Addenda are drained as ONE batch at the next
+ * iteration boundary: each addendum used to force its own re-review round, which
+ * is how a single gate ran four architect rounds.
+ */
+export async function queueRalplanBriefAddendum(
+  cwd: string,
+  addendum: { text: string; source?: string; now?: Date },
+): Promise<RalplanBriefAddendum[]> {
+  const state = await readModeState('ralplan', cwd);
+  const pending = readPendingAddenda(state);
+  pending.push({
+    text: addendum.text,
+    source: addendum.source,
+    receivedAt: (addendum.now ?? new Date()).toISOString(),
+  });
+  await updateModeState('ralplan', { [RALPLAN_BRIEF_ADDENDA_STATE_KEY]: pending }, cwd);
+  return pending;
+}
+
+function readPendingAddenda(state: Record<string, unknown> | null | undefined): RalplanBriefAddendum[] {
+  const raw = state?.[RALPLAN_BRIEF_ADDENDA_STATE_KEY];
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((entry): entry is RalplanBriefAddendum =>
+    Boolean(entry) && typeof entry === 'object' && typeof (entry as RalplanBriefAddendum).text === 'string');
+}
+
+/** Drain every queued addendum at once so one batch costs one re-review. */
+async function drainPendingAddenda(cwd: string): Promise<RalplanBriefAddendum[]> {
+  const state = await readModeState('ralplan', cwd);
+  const pending = readPendingAddenda(state);
+  if (pending.length === 0) return [];
+  await updateModeState('ralplan', { [RALPLAN_BRIEF_ADDENDA_STATE_KEY]: [] }, cwd);
+  return pending;
 }
 
 function buildReviewHistory(
