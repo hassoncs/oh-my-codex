@@ -5,8 +5,10 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { getStateFilePath, getStatePath } from '../mcp/state-paths.js';
 import { TRACKED_WORKFLOW_MODES } from './workflow-transition.js';
 import type { WorkflowStateLockLease } from './workflow-state-lock.js';
+import { getWorkflowStateTransactionFaults } from '../testing/state-fault-injection.js';
 
 const WORKFLOW_STATE_TRANSACTION_FILE = '.workflow-state-transaction.json';
+export const WORKFLOW_STATE_RECOVERY_OWNER_FILE = '.workflow-state-recovery-owner.json';
 
 export interface WorkflowStateSnapshot {
   files: Array<{ path: string; content: Buffer | null }>;
@@ -20,17 +22,17 @@ interface PersistedWorkflowStateTransactionEntry {
 }
 
 interface PersistedWorkflowStateTransaction {
-  version: 2;
+  version: 3;
   transaction_id: string;
   lock_token: string;
+  lock_generation: string;
   files: PersistedWorkflowStateTransactionEntry[];
 }
 
-interface WorkflowStateTransactionTestConfig {
-  hook?: (
-    stage: 'before-file-sync' | 'before-directory-sync' | 'before-journal-delete',
-    path: string,
-  ) => void | Promise<void>;
+interface PersistedWorkflowStateRecoveryOwner {
+  version: 1;
+  lock_token: string;
+  lock_generation: string;
 }
 
 export interface WorkflowStateTransactionLease {
@@ -43,15 +45,8 @@ export interface WorkflowStateMutationAuthority {
   transactionLease: WorkflowStateTransactionLease;
 }
 
-let testConfig: WorkflowStateTransactionTestConfig = {};
 const activeLeases = new WeakSet<object>();
 const activeTransactions = new Map<string, WorkflowStateTransactionLease>();
-
-export function setWorkflowStateTransactionTestConfig(
-  config: WorkflowStateTransactionTestConfig = {},
-): void {
-  testConfig = config;
-}
 
 export async function captureWorkflowStateSnapshot(
   cwd: string,
@@ -95,6 +90,10 @@ function transactionPath(baseStateDir: string): string {
   return join(resolve(baseStateDir), WORKFLOW_STATE_TRANSACTION_FILE);
 }
 
+function recoveryOwnerPath(baseStateDir: string): string {
+  return join(resolve(baseStateDir), WORKFLOW_STATE_RECOVERY_OWNER_FILE);
+}
+
 function relativeTransactionPath(baseStateDir: string, path: string): string {
   const normalized = relative(resolve(baseStateDir), resolve(path));
   if (!normalized || isAbsolute(normalized) || normalized === '..' || normalized.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)) {
@@ -112,11 +111,13 @@ function snapshotFromPersisted(
   }
   const record = persisted as Partial<PersistedWorkflowStateTransaction>;
   if (
-    record.version !== 2
+    record.version !== 3
     || typeof record.transaction_id !== 'string'
     || !/^[0-9a-f-]{36}$/.test(record.transaction_id)
     || typeof record.lock_token !== 'string'
     || record.lock_token.length === 0
+    || typeof record.lock_generation !== 'string'
+    || !/^[0-9a-f-]{36}$/.test(record.lock_generation)
     || !Array.isArray(record.files)
   ) {
     throw new Error('workflow_state_transaction_invalid:version');
@@ -188,12 +189,14 @@ async function writeWorkflowStateTransaction(
   snapshot: WorkflowStateSnapshot,
   transactionId: string,
   lockToken: string,
+  lockGeneration: string,
 ): Promise<void> {
   const path = transactionPath(baseStateDir);
   const persisted: PersistedWorkflowStateTransaction = {
-    version: 2,
+    version: 3,
     transaction_id: transactionId,
     lock_token: lockToken,
+    lock_generation: lockGeneration,
     files: snapshot.files.map((file) => ({
       path: relativeTransactionPath(baseStateDir, file.path),
       content_base64: file.content?.toString('base64') ?? null,
@@ -212,7 +215,7 @@ async function writeDurableFile(path: string, content: Buffer): Promise<void> {
   try {
     try {
       await handle.writeFile(content);
-      await testConfig.hook?.('before-file-sync', path);
+      await getWorkflowStateTransactionFaults().hook?.('before-file-sync', path);
       await handle.sync();
     } finally {
       await handle.close();
@@ -237,7 +240,7 @@ async function syncDirectory(path: string): Promise<void> {
     return;
   }
   try {
-    await testConfig.hook?.('before-directory-sync', path);
+    await getWorkflowStateTransactionFaults().hook?.('before-directory-sync', path);
     await handle.sync();
   } finally {
     await handle.close();
@@ -246,7 +249,7 @@ async function syncDirectory(path: string): Promise<void> {
 
 async function removeWorkflowStateTransaction(baseStateDir: string): Promise<void> {
   const path = transactionPath(baseStateDir);
-  await testConfig.hook?.('before-journal-delete', path);
+  await getWorkflowStateTransactionFaults().hook?.('before-journal-delete', path);
   await rm(path, { force: true });
   await syncDirectory(baseStateDir);
 }
@@ -255,6 +258,7 @@ async function assertWorkflowStateTransactionOwned(
   baseStateDir: string,
   transactionId: string,
   lockToken: string,
+  lockGeneration: string,
 ): Promise<void> {
   const path = transactionPath(baseStateDir);
   let parsed: unknown;
@@ -269,6 +273,7 @@ async function assertWorkflowStateTransactionOwned(
     || Array.isArray(parsed)
     || (parsed as { transaction_id?: unknown }).transaction_id !== transactionId
     || (parsed as { lock_token?: unknown }).lock_token !== lockToken
+    || (parsed as { lock_generation?: unknown }).lock_generation !== lockGeneration
   ) {
     throw new Error(`workflow_state_transaction_displaced:${transactionId}`);
   }
@@ -279,7 +284,7 @@ async function syncWorkflowStatePaths(snapshot: WorkflowStateSnapshot): Promise<
     try {
       const handle = await open(file.path, 'r');
       try {
-        await testConfig.hook?.('before-file-sync', file.path);
+        await getWorkflowStateTransactionFaults().hook?.('before-file-sync', file.path);
         await handle.sync();
       } finally {
         await handle.close();
@@ -291,13 +296,72 @@ async function syncWorkflowStatePaths(snapshot: WorkflowStateSnapshot): Promise<
   }
 }
 
-export async function recoverWorkflowStateTransaction(baseStateDir: string): Promise<boolean> {
+function parseRecoveryOwner(raw: string): PersistedWorkflowStateRecoveryOwner | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (
+    !parsed
+    || typeof parsed !== 'object'
+    || Array.isArray(parsed)
+    || (parsed as { version?: unknown }).version !== 1
+    || typeof (parsed as { lock_token?: unknown }).lock_token !== 'string'
+    || typeof (parsed as { lock_generation?: unknown }).lock_generation !== 'string'
+    || !/^[0-9a-f-]{36}$/.test((parsed as { lock_generation: string }).lock_generation)
+  ) {
+    return null;
+  }
+  return parsed as PersistedWorkflowStateRecoveryOwner;
+}
+
+function transactionOwner(persisted: unknown): PersistedWorkflowStateRecoveryOwner | null {
+  if (!persisted || typeof persisted !== 'object' || Array.isArray(persisted)) return null;
+  const lockToken = (persisted as { lock_token?: unknown }).lock_token;
+  const lockGeneration = (persisted as { lock_generation?: unknown }).lock_generation;
+  if (
+    typeof lockToken !== 'string'
+    || lockToken.length === 0
+    || typeof lockGeneration !== 'string'
+    || !/^[0-9a-f-]{36}$/.test(lockGeneration)
+  ) {
+    return null;
+  }
+  return {
+    version: 1,
+    lock_token: lockToken,
+    lock_generation: lockGeneration,
+  };
+}
+
+async function quarantineWorkflowStateTransaction(
+  baseStateDir: string,
+  reason: 'foreign' | 'ownerless',
+): Promise<string> {
+  const path = transactionPath(baseStateDir);
+  const quarantinePath = `${path}.${reason}.${Date.now()}.${randomUUID()}.rejected`;
+  await rename(path, quarantinePath);
+  await syncDirectory(baseStateDir);
+  return quarantinePath;
+}
+
+export async function recoverWorkflowStateTransactionUnderLock(
+  baseStateDir: string,
+  lockLease: WorkflowStateLockLease,
+): Promise<boolean> {
+  await lockLease.assertOwned();
   const path = transactionPath(baseStateDir);
   let raw: string;
   try {
     raw = await readFile(path, 'utf-8');
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      await rm(recoveryOwnerPath(baseStateDir), { force: true });
+      await syncDirectory(baseStateDir);
+      return false;
+    }
     throw error;
   }
   let persisted: unknown;
@@ -306,9 +370,35 @@ export async function recoverWorkflowStateTransaction(baseStateDir: string): Pro
   } catch {
     throw new Error('workflow_state_transaction_corrupt:json');
   }
+  const owner = transactionOwner(persisted);
+  if (!owner) {
+    await lockLease.assertOwned();
+    const quarantinePath = await quarantineWorkflowStateTransaction(baseStateDir, 'ownerless');
+    throw new Error(`workflow_state_transaction_recovery_rejected:ownerless:${quarantinePath}`);
+  }
+  const recoveryOwnerRaw = await readFile(recoveryOwnerPath(baseStateDir), 'utf-8').catch(
+    (error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    },
+  );
+  const recoveryOwner = recoveryOwnerRaw ? parseRecoveryOwner(recoveryOwnerRaw) : null;
+  if (
+    !recoveryOwner
+    || recoveryOwner.lock_token !== owner.lock_token
+    || recoveryOwner.lock_generation !== owner.lock_generation
+  ) {
+    await lockLease.assertOwned();
+    const quarantinePath = await quarantineWorkflowStateTransaction(baseStateDir, 'foreign');
+    throw new Error(`workflow_state_transaction_recovery_rejected:foreign:${quarantinePath}`);
+  }
   const snapshot = snapshotFromPersisted(baseStateDir, persisted);
+  await lockLease.assertOwned();
   await restoreWorkflowStateSnapshot(snapshot);
+  await lockLease.assertOwned();
   await removeWorkflowStateTransaction(baseStateDir);
+  await rm(recoveryOwnerPath(baseStateDir), { force: true });
+  await syncDirectory(baseStateDir);
   return true;
 }
 
@@ -347,6 +437,7 @@ export async function withWorkflowStateTransaction<T>(
     snapshot,
     transactionId,
     options.lockLease.token,
+    options.lockLease.generation,
   );
   const acquiredLease: WorkflowStateTransactionLease = Object.freeze({
     journalPath: path,
@@ -359,21 +450,49 @@ export async function withWorkflowStateTransaction<T>(
     try {
       const result = await fn(acquiredLease);
       await options.lockLease.assertOwned();
-      await assertWorkflowStateTransactionOwned(baseStateDir, transactionId, options.lockLease.token);
+      await assertWorkflowStateTransactionOwned(
+        baseStateDir,
+        transactionId,
+        options.lockLease.token,
+        options.lockLease.generation,
+      );
       await syncWorkflowStatePaths(snapshot);
       await options.lockLease.assertOwned();
-      await assertWorkflowStateTransactionOwned(baseStateDir, transactionId, options.lockLease.token);
+      await assertWorkflowStateTransactionOwned(
+        baseStateDir,
+        transactionId,
+        options.lockLease.token,
+        options.lockLease.generation,
+      );
       await removeWorkflowStateTransaction(baseStateDir);
       return result;
     } catch (error) {
       try {
         await options.lockLease.assertOwned();
-        await assertWorkflowStateTransactionOwned(baseStateDir, transactionId, options.lockLease.token);
+        await assertWorkflowStateTransactionOwned(
+          baseStateDir,
+          transactionId,
+          options.lockLease.token,
+          options.lockLease.generation,
+        );
         await restoreWorkflowStateSnapshot(snapshot);
         await options.lockLease.assertOwned();
-        await assertWorkflowStateTransactionOwned(baseStateDir, transactionId, options.lockLease.token);
+        await assertWorkflowStateTransactionOwned(
+          baseStateDir,
+          transactionId,
+          options.lockLease.token,
+          options.lockLease.generation,
+        );
         await removeWorkflowStateTransaction(baseStateDir);
       } catch (rollbackError) {
+        try {
+          await options.lockLease.markRecoveryRequired();
+        } catch (provenanceError) {
+          throw new AggregateError(
+            [error, rollbackError, provenanceError],
+            `workflow_state_transaction_recovery_provenance_failed:${String(error)}`,
+          );
+        }
         throw new AggregateError(
           [error, rollbackError],
           `workflow_state_transaction_rollback_failed:${String(error)}`,

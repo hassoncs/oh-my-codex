@@ -9,6 +9,7 @@ import {
   pickPrimaryWorkflowMode,
   type WorkflowTransitionOptions,
 } from './workflow-transition.js';
+import { getSkillActiveWriteHook } from '../testing/state-fault-injection.js';
 
 export const SKILL_ACTIVE_STATE_MODE = 'skill-active';
 export const SKILL_ACTIVE_STATE_FILE = `${SKILL_ACTIVE_STATE_MODE}-state.json`;
@@ -70,14 +71,6 @@ export interface SyncCanonicalSkillStateOptions {
   source?: string;
   allSessions?: boolean;
   workflowTransitionOptions?: WorkflowTransitionOptions;
-}
-
-let skillActiveWriteHookForTests: ((path: string) => void | Promise<void>) | null = null;
-
-export function setSkillActiveWriteHookForTests(
-  hook?: (path: string) => void | Promise<void>,
-): void {
-  skillActiveWriteHookForTests = hook ?? null;
 }
 
 function safeString(value: unknown): string {
@@ -326,14 +319,14 @@ async function writeSkillActiveStateCopiesToPaths(
   if (normalizedRoot !== null) {
     const rootPayload = JSON.stringify(normalizedRoot, null, 2);
     await mkdir(dirname(rootPath), { recursive: true });
-    await skillActiveWriteHookForTests?.(rootPath);
+    await getSkillActiveWriteHook()?.(rootPath);
     await writeFile(rootPath, rootPayload);
   }
 
   if (sessionPath) {
     const sessionPayload = JSON.stringify(normalized, null, 2);
     await mkdir(dirname(sessionPath), { recursive: true });
-    await skillActiveWriteHookForTests?.(sessionPath);
+    await getSkillActiveWriteHook()?.(sessionPath);
     await writeFile(sessionPath, sessionPayload);
   }
 }

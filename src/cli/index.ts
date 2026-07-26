@@ -4239,7 +4239,10 @@ function buildTmuxExtendedKeysHelperCommand(
     operation === "acquire"
       ? `const mod = await import(${moduleUrlLiteral}); const ownerPid = Number.parseInt(process.argv[1] ?? "", 10); const lease = mod.acquireTmuxExtendedKeysLease(${cwdLiteral}, undefined, Number.isSafeInteger(ownerPid) && ownerPid > 0 ? ownerPid : undefined); if (lease) process.stdout.write(lease);`
       : `const mod = await import(${moduleUrlLiteral}); mod.releaseTmuxExtendedKeysLease(${cwdLiteral}, process.argv[1] ?? "");`;
-  return `${quoteShellArg(process.execPath)} --input-type=module -e ${quoteShellArg(script)}`;
+  const sourceLoader = import.meta.url.endsWith(".ts")
+    ? ` --import ${quoteShellArg(import.meta.resolve("tsx"))}`
+    : "";
+  return `${quoteShellArg(process.execPath)}${sourceLoader} --input-type=module -e ${quoteShellArg(script)}`;
 }
 
 function buildTmuxExtendedKeysAcquireShellSnippet(cwd: string): string {

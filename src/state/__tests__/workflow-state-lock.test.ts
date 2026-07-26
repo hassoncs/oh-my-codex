@@ -3,24 +3,24 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
+import { withWorkflowStateLock } from '../workflow-state-lock.js';
+import { withWorkflowStateTransaction } from '../workflow-state-transaction.js';
 import {
-  setWorkflowStateLockTestConfig,
-  withWorkflowStateLock,
-} from '../workflow-state-lock.js';
-import {
-  setWorkflowStateTransactionTestConfig,
-  withWorkflowStateTransaction,
-} from '../workflow-state-transaction.js';
+  configureWorkflowStateLockFaults,
+  configureWorkflowStateTransactionFaults,
+} from '../../testing/state-fault-injection.js';
 
 const CHILD_NODE_ARGS = import.meta.url.endsWith('.ts') ? ['--import', import.meta.resolve('tsx')] : [];
+const PRIOR_LOCK_TOKEN = 'prior-lock';
+const PRIOR_LOCK_GENERATION = '00000000-0000-4000-8000-000000000001';
 
 afterEach(() => {
-  setWorkflowStateLockTestConfig();
-  setWorkflowStateTransactionTestConfig();
+  configureWorkflowStateLockFaults();
+  configureWorkflowStateTransactionFaults();
 });
 
 function persistedEntry(
@@ -39,12 +39,30 @@ function persistedEntry(
 
 function persistedTransaction(
   entries: Record<string, unknown>[],
+  owner: { token: string; generation: string } = {
+    token: PRIOR_LOCK_TOKEN,
+    generation: PRIOR_LOCK_GENERATION,
+  },
 ): Record<string, unknown> {
   return {
-    version: 2,
+    version: 3,
     transaction_id: '00000000-0000-4000-8000-000000000000',
-    lock_token: 'prior-lock',
+    lock_token: owner.token,
+    lock_generation: owner.generation,
     files: entries,
+  };
+}
+
+function persistedRecoveryOwner(
+  owner: { token: string; generation: string } = {
+    token: PRIOR_LOCK_TOKEN,
+    generation: PRIOR_LOCK_GENERATION,
+  },
+): Record<string, unknown> {
+  return {
+    version: 1,
+    lock_token: owner.token,
+    lock_generation: owner.generation,
   };
 }
 
@@ -96,7 +114,7 @@ describe('workflow state lock', () => {
         });
         assert.equal(existsSync(markerPath), true);
 
-        setWorkflowStateLockTestConfig({
+        configureWorkflowStateLockFaults({
           staleMs: 0,
           timeoutMs: 1_000,
           retryMs: 1,
@@ -145,12 +163,12 @@ describe('workflow state lock', () => {
   });
 
   it('retains malformed or corrupt journals without mutating state', async () => {
-    const cases: Array<{ name: string; journal: string }> = [
+    const cases: Array<{ name: string; journal: string; owner?: Record<string, unknown> }> = [
       { name: 'json', journal: '{' },
-      { name: 'schema', journal: JSON.stringify({}) },
       {
         name: 'path',
         journal: JSON.stringify(persistedTransaction([persistedEntry('../outside', null)])),
+        owner: persistedRecoveryOwner(),
       },
       {
         name: 'base64',
@@ -158,6 +176,7 @@ describe('workflow state lock', () => {
           ...persistedEntry('team-state.json', Buffer.from('before')),
           content_base64: 'AA=A',
         }])),
+        owner: persistedRecoveryOwner(),
       },
       {
         name: 'length',
@@ -165,6 +184,7 @@ describe('workflow state lock', () => {
           ...persistedEntry('team-state.json', Buffer.from('before')),
           byte_length: 99,
         }])),
+        owner: persistedRecoveryOwner(),
       },
       {
         name: 'digest',
@@ -172,6 +192,7 @@ describe('workflow state lock', () => {
           ...persistedEntry('team-state.json', Buffer.from('before')),
           sha256: '0'.repeat(64),
         }])),
+        owner: persistedRecoveryOwner(),
       },
     ];
 
@@ -184,6 +205,12 @@ describe('workflow state lock', () => {
         await mkdir(baseStateDir, { recursive: true });
         await writeFile(teamPath, 'current');
         await writeFile(journalPath, testCase.journal);
+        if (testCase.owner) {
+          await writeFile(
+            join(baseStateDir, '.workflow-state-recovery-owner.json'),
+            JSON.stringify(testCase.owner),
+          );
+        }
 
         await assert.rejects(
           () => withWorkflowStateLock(baseStateDir, async () => {}),
@@ -207,7 +234,7 @@ describe('workflow state lock', () => {
       await mkdir(baseStateDir, { recursive: true });
       await writeFile(teamPath, 'before');
       let mutated = false;
-      setWorkflowStateTransactionTestConfig({
+      configureWorkflowStateTransactionFaults({
         hook: (stage, path) => {
           if (mutated && stage === 'before-directory-sync' && path === baseStateDir) {
             throw new Error('directory_sync_failed');
@@ -231,11 +258,19 @@ describe('workflow state lock', () => {
         /workflow_state_transaction_rollback_failed/,
       );
       assert.equal(existsSync(journalPath), true);
+      assert.equal(
+        existsSync(join(baseStateDir, '.workflow-state-recovery-owner.json')),
+        true,
+      );
 
-      setWorkflowStateTransactionTestConfig();
+      configureWorkflowStateTransactionFaults();
       await withWorkflowStateLock(baseStateDir, async () => {});
       assert.equal(await readFile(teamPath, 'utf-8'), 'before');
       assert.equal(existsSync(journalPath), false);
+      assert.equal(
+        existsSync(join(baseStateDir, '.workflow-state-recovery-owner.json')),
+        false,
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -279,7 +314,7 @@ describe('workflow state lock', () => {
     }
   });
 
-  it('retains a journal displaced by another lock token and recovers it later', async () => {
+  it('quarantines a journal displaced by another lock token without rolling it back', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-workflow-transaction-fence-'));
     try {
       const baseStateDir = join(cwd, '.omx', 'state');
@@ -310,9 +345,234 @@ describe('workflow state lock', () => {
       assert.equal(await readFile(teamPath, 'utf-8'), 'after');
       assert.equal(existsSync(journalPath), true);
 
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, async () => {}),
+        /workflow_state_transaction_recovery_rejected:foreign/,
+      );
+      assert.equal(await readFile(teamPath, 'utf-8'), 'after');
+      assert.equal(existsSync(journalPath), false);
+      assert.equal(
+        (await readdir(baseStateDir))
+          .some((entry) => entry.includes('.foreign.') && entry.endsWith('.rejected')),
+        true,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('quarantines an ownerless journal without mutating current state', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-workflow-transaction-ownerless-'));
+    try {
+      const baseStateDir = join(cwd, '.omx', 'state');
+      const teamPath = join(baseStateDir, 'team-state.json');
+      const journalPath = join(baseStateDir, '.workflow-state-transaction.json');
+      await mkdir(baseStateDir, { recursive: true });
+      await writeFile(teamPath, 'current');
+      await writeFile(journalPath, JSON.stringify({
+        version: 3,
+        transaction_id: '00000000-0000-4000-8000-000000000000',
+        files: [persistedEntry('team-state.json', Buffer.from('older'))],
+      }));
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, async () => {}),
+        /workflow_state_transaction_recovery_rejected:ownerless/,
+      );
+      assert.equal(await readFile(teamPath, 'utf-8'), 'current');
+      assert.equal(existsSync(journalPath), false);
+      assert.equal(
+        (await readdir(baseStateDir))
+          .some((entry) => entry.includes('.ownerless.') && entry.endsWith('.rejected')),
+        true,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a stale generation after a newer same-token commit', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-workflow-transaction-stale-generation-'));
+    try {
+      const baseStateDir = join(cwd, '.omx', 'state');
+      const teamPath = join(baseStateDir, 'team-state.json');
+      const journalPath = join(baseStateDir, '.workflow-state-transaction.json');
+      const token = 'reused-token';
+      const staleGeneration = '00000000-0000-4000-8000-000000000020';
+      const newerGeneration = '00000000-0000-4000-8000-000000000021';
+      await mkdir(baseStateDir, { recursive: true });
+      await writeFile(teamPath, 'newer-commit');
+      await writeFile(
+        journalPath,
+        JSON.stringify(persistedTransaction(
+          [persistedEntry('team-state.json', Buffer.from('older-snapshot'))],
+          { token, generation: staleGeneration },
+        )),
+      );
+      await writeFile(
+        join(baseStateDir, '.workflow-state-recovery-owner.json'),
+        JSON.stringify(persistedRecoveryOwner({ token, generation: newerGeneration })),
+      );
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, async () => {}),
+        /workflow_state_transaction_recovery_rejected:foreign/,
+      );
+      assert.equal(await readFile(teamPath, 'utf-8'), 'newer-commit');
+      assert.equal(existsSync(journalPath), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers takeover provenance after interruption between stale rename and marker write', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-workflow-takeover-provenance-'));
+    try {
+      const baseStateDir = join(cwd, '.omx', 'state');
+      const lockDir = join(baseStateDir, '.workflow-state.lock');
+      const journalPath = join(baseStateDir, '.workflow-state-transaction.json');
+      const teamPath = join(baseStateDir, 'team-state.json');
+      const owner = {
+        token: 'interrupted-owner',
+        generation: '00000000-0000-4000-8000-000000000030',
+      };
+      await mkdir(lockDir, { recursive: true });
+      await writeFile(join(lockDir, 'owner'), JSON.stringify({
+        ...owner,
+        pid: 999_999,
+        heartbeat_at: new Date(0).toISOString(),
+      }));
+      await utimes(lockDir, new Date(0), new Date(0));
+      await writeFile(teamPath, 'mutated');
+      await writeFile(
+        journalPath,
+        JSON.stringify(persistedTransaction(
+          [persistedEntry('team-state.json', Buffer.from('before'))],
+          owner,
+        )),
+      );
+      configureWorkflowStateLockFaults({
+        staleMs: 0,
+        timeoutMs: 1_000,
+        retryMs: 1,
+        processIsAlive: () => false,
+        hook: (stage) => {
+          if (stage === 'after-stale-rename') throw new Error('takeover_interrupted');
+        },
+      });
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, async () => {}),
+        /takeover_interrupted/,
+      );
+      assert.equal(existsSync(lockDir), false);
+      assert.equal(
+        (await readdir(baseStateDir)).some((entry) => entry.startsWith('.workflow-state.lock.stale.')),
+        true,
+      );
+
+      configureWorkflowStateLockFaults();
       await withWorkflowStateLock(baseStateDir, async () => {});
       assert.equal(await readFile(teamPath, 'utf-8'), 'before');
       assert.equal(existsSync(journalPath), false);
+      assert.equal(
+        (await readdir(baseStateDir)).some((entry) => entry.startsWith('.workflow-state.lock.stale.')),
+        false,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('cleans takeover quarantine after interruption between marker write and quarantine removal', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-workflow-takeover-cleanup-'));
+    try {
+      const baseStateDir = join(cwd, '.omx', 'state');
+      const quarantineDir = join(baseStateDir, '.workflow-state.lock.stale.interrupted-contender');
+      const owner = {
+        token: 'interrupted-owner',
+        generation: '00000000-0000-4000-8000-000000000031',
+      };
+      await mkdir(quarantineDir, { recursive: true });
+      await writeFile(join(quarantineDir, 'owner'), JSON.stringify({
+        ...owner,
+        pid: 999_999,
+        heartbeat_at: new Date(0).toISOString(),
+      }));
+      await writeFile(
+        join(baseStateDir, '.workflow-state-recovery-owner.json'),
+        JSON.stringify(persistedRecoveryOwner(owner)),
+      );
+
+      await withWorkflowStateLock(baseStateDir, async () => {});
+
+      assert.equal(existsSync(quarantineDir), false);
+      assert.equal(
+        existsSync(join(baseStateDir, '.workflow-state-recovery-owner.json')),
+        false,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('takes over immediately when recovery marker survives owner flag write failure', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-workflow-recovery-owner-gap-'));
+    try {
+      const baseStateDir = join(cwd, '.omx', 'state');
+      const teamPath = join(baseStateDir, 'team-state.json');
+      await mkdir(baseStateDir, { recursive: true });
+      await writeFile(teamPath, 'before');
+      let failRollbackSync = false;
+      let failRecoveryOwnerWrite = false;
+      configureWorkflowStateTransactionFaults({
+        hook: (stage, path) => {
+          if (failRollbackSync && stage === 'before-file-sync' && path === teamPath) {
+            failRollbackSync = false;
+            throw new Error('rollback_sync_failed');
+          }
+        },
+      });
+      configureWorkflowStateLockFaults({
+        hook: (stage) => {
+          if (failRecoveryOwnerWrite && stage === 'before-owner-write') {
+            failRecoveryOwnerWrite = false;
+            throw new Error('recovery_owner_write_failed');
+          }
+        },
+      });
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, async (lockLease) => {
+          await withWorkflowStateTransaction(
+            baseStateDir,
+            cwd,
+            undefined,
+            async () => {
+              await writeFile(teamPath, 'mutated');
+              failRollbackSync = true;
+              failRecoveryOwnerWrite = true;
+              throw new Error('mutation_failed');
+            },
+            [],
+            { lockLease },
+          );
+        }),
+        /workflow_state_transaction_recovery_provenance_failed/,
+      );
+      assert.equal(
+        existsSync(join(baseStateDir, '.workflow-state-recovery-owner.json')),
+        true,
+      );
+
+      configureWorkflowStateLockFaults({
+        timeoutMs: 1_000,
+        retryMs: 1,
+      });
+      configureWorkflowStateTransactionFaults();
+      await withWorkflowStateLock(baseStateDir, async () => {});
+      assert.equal(await readFile(teamPath, 'utf-8'), 'before');
+      assert.equal(existsSync(join(baseStateDir, '.workflow-state.lock')), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -321,7 +581,7 @@ describe('workflow state lock', () => {
   it('makes detached lock descendants contend until the owner exits', async () => {
     const baseStateDir = await mkdtemp(join(tmpdir(), 'omx-workflow-lock-detached-'));
     try {
-      setWorkflowStateLockTestConfig({ timeoutMs: 1_000, retryMs: 1 });
+      configureWorkflowStateLockFaults({ timeoutMs: 1_000, retryMs: 1 });
       let descendantEntered = false;
       let descendant!: Promise<void>;
       await withWorkflowStateLock(baseStateDir, async () => {
@@ -346,11 +606,12 @@ describe('workflow state lock', () => {
       await mkdir(lockDir);
       await writeFile(ownerPath, JSON.stringify({
         token: 'live-owner',
+        generation: '00000000-0000-4000-8000-000000000010',
         pid: process.pid,
         heartbeat_at: new Date(0).toISOString(),
       }));
       await utimes(lockDir, new Date(0), new Date(0));
-      setWorkflowStateLockTestConfig({
+      configureWorkflowStateLockFaults({
         staleMs: 0,
         timeoutMs: 20,
         retryMs: 1,
@@ -378,7 +639,7 @@ describe('workflow state lock', () => {
           await writeFile(join(lockDir, 'owner'), '{');
         }
         await utimes(lockDir, new Date(0), new Date(0));
-        setWorkflowStateLockTestConfig({
+        configureWorkflowStateLockFaults({
           staleMs: 0,
           timeoutMs: 20,
           retryMs: 1,
@@ -404,12 +665,13 @@ describe('workflow state lock', () => {
       await mkdir(lockDir);
       await writeFile(ownerPath, JSON.stringify({
         token: 'same-owner',
+        generation: '00000000-0000-4000-8000-000000000011',
         pid: 999_999,
         heartbeat_at: new Date(0).toISOString(),
       }));
       await utimes(lockDir, new Date(0), new Date(0));
       let refreshed = false;
-      setWorkflowStateLockTestConfig({
+      configureWorkflowStateLockFaults({
         staleMs: 0,
         timeoutMs: 20,
         retryMs: 1,
@@ -419,6 +681,7 @@ describe('workflow state lock', () => {
           refreshed = true;
           await writeFile(ownerPath, JSON.stringify({
             token: 'same-owner',
+            generation: '00000000-0000-4000-8000-000000000011',
             pid: 999_999,
             heartbeat_at: new Date().toISOString(),
           }));
@@ -440,7 +703,7 @@ describe('workflow state lock', () => {
     const baseStateDir = await mkdtemp(join(tmpdir(), 'omx-workflow-lock-heartbeat-'));
     try {
       let ownerWrites = 0;
-      setWorkflowStateLockTestConfig({
+      configureWorkflowStateLockFaults({
         heartbeatMs: 1,
         hook: (stage) => {
           if (stage !== 'before-owner-write') return;
@@ -467,12 +730,13 @@ describe('workflow state lock', () => {
       await mkdir(lockDir);
       await writeFile(ownerPath, JSON.stringify({
         token: 'stale-owner',
+        generation: '00000000-0000-4000-8000-000000000012',
         pid: 999_999,
         heartbeat_at: new Date(0).toISOString(),
       }));
       await utimes(lockDir, new Date(0), new Date(0));
       let replaced = false;
-      setWorkflowStateLockTestConfig({
+      configureWorkflowStateLockFaults({
         staleMs: 0,
         timeoutMs: 20,
         retryMs: 1,
@@ -484,6 +748,7 @@ describe('workflow state lock', () => {
           await mkdir(lockDir);
           await writeFile(ownerPath, JSON.stringify({
             token: 'fresh-owner',
+            generation: '00000000-0000-4000-8000-000000000013',
             pid: process.pid,
             heartbeat_at: new Date().toISOString(),
           }));

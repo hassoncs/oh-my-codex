@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { arch, platform, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -12,6 +12,7 @@ import { OMX_FIRST_PARTY_MCP_PLUGIN_TARGETS } from '../../config/omx-first-party
 type PackageJson = {
   files?: string[];
   bin?: string | Record<string, string>;
+  exports?: Record<string, string>;
   scripts?: Record<string, string>;
 };
 
@@ -38,6 +39,10 @@ describe('package bin contract', () => {
     );
 
     assert.deepEqual(pkg.bin, { omx: 'dist/cli/omx.js' });
+    assert.deepEqual(pkg.exports, {
+      '.': './dist/index.js',
+      './package.json': './package.json',
+    });
     assert.equal(pkg.scripts?.build, 'node src/scripts/build.js');
     assert.equal(pkg.scripts?.['build:explore'], 'cargo build -p omx-explore-harness');
     assert.equal(pkg.scripts?.['build:explore:release'], 'node dist/scripts/build-explore-harness.js');
@@ -305,5 +310,43 @@ describe('package bin contract', () => {
     assert.ok(templateEntry, 'expected npm pack output to keep templates');
     assert.equal(rootNativeAgentEntry, undefined, 'did not expect generated root native agent TOMLs in package output');
     assert.equal(pluginScopedHooksEntry, undefined, 'did not expect setup-owned hook assets inside the installable plugin bundle');
+
+    const consumerRoot = mkdtempSync(join(tmpdir(), 'omx-package-exports-'));
+    try {
+      const packagePath = join(consumerRoot, 'node_modules', 'oh-my-codex');
+      mkdirSync(join(consumerRoot, 'node_modules'), { recursive: true });
+      symlinkSync(
+        process.cwd(),
+        packagePath,
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
+      const rootImport = spawnSync(
+        process.execPath,
+        ['--input-type=module', '--eval', "await import('oh-my-codex')"],
+        { cwd: consumerRoot, encoding: 'utf-8' },
+      );
+      assert.equal(rootImport.status, 0, rootImport.stderr || rootImport.stdout);
+      for (const subpath of [
+        'dist/state/workflow-state-lock.js',
+        'dist/state/workflow-state-transaction.js',
+        'dist/state/operations.js',
+        'dist/state/skill-active.js',
+        'dist/testing/state-fault-injection.js',
+      ]) {
+        const blockedImport = spawnSync(
+          process.execPath,
+          ['--input-type=module', '--eval', `await import('oh-my-codex/${subpath}')`],
+          { cwd: consumerRoot, encoding: 'utf-8' },
+        );
+        assert.notEqual(blockedImport.status, 0, `expected packed subpath import to fail: ${subpath}`);
+        assert.match(
+          blockedImport.stderr,
+          /ERR_PACKAGE_PATH_NOT_EXPORTED/,
+          `expected exports fence for ${subpath}`,
+        );
+      }
+    } finally {
+      rmSync(consumerRoot, { recursive: true, force: true });
+    }
   });
 });

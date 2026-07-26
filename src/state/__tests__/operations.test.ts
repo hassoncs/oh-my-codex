@@ -6,11 +6,12 @@ import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { executeStateOperation, setStateWriteCommitHookForTests } from '../operations.js';
-import { setSkillActiveWriteHookForTests } from '../skill-active.js';
+import { executeStateOperation } from '../operations.js';
 import {
-  setWorkflowStateLockTestConfig,
-} from '../workflow-state-lock.js';
+  configureSkillActiveWriteHook,
+  configureStateMutationCommitHook,
+  configureWorkflowStateLockFaults,
+} from '../../testing/state-fault-injection.js';
 import { subagentTrackingPath } from '../../subagents/tracker.js';
 import { startMode, updateModeState } from '../../modes/base.js';
 
@@ -88,7 +89,7 @@ function responsePayload<T extends Record<string, unknown>>(response: { payload:
 
 async function runStateWriteInChild(
   operationsUrl: string,
-  workflowLockUrl: string,
+  faultInjectionUrl: string,
   workingDirectory: string,
   mode: 'team' | 'autopilot',
   state: Record<string, unknown>,
@@ -102,13 +103,13 @@ async function runStateWriteInChild(
   const script = `
     const { existsSync } = await import('node:fs');
     const { writeFile } = await import('node:fs/promises');
-    const { executeStateOperation, setStateWriteCommitHookForTests } = await import(${JSON.stringify(operationsUrl)});
-    const { setWorkflowStateLockTestConfig } = await import(${JSON.stringify(workflowLockUrl)});
+    const { executeStateOperation } = await import(${JSON.stringify(operationsUrl)});
+    const { configureStateMutationCommitHook, configureWorkflowStateLockFaults } = await import(${JSON.stringify(faultInjectionUrl)});
     const detailReadyPath = ${JSON.stringify(barriers.detailReadyPath ?? '')};
     const detailReleasePath = ${JSON.stringify(barriers.detailReleasePath ?? '')};
     const contendedPath = ${JSON.stringify(barriers.contendedPath ?? '')};
     if (detailReadyPath) {
-      setStateWriteCommitHookForTests(async (stage) => {
+      configureStateMutationCommitHook(async (stage) => {
         if (stage !== 'detail-written') return;
         await writeFile(detailReadyPath, 'ready');
         while (!existsSync(detailReleasePath)) {
@@ -117,7 +118,7 @@ async function runStateWriteInChild(
       });
     }
     if (contendedPath) {
-      setWorkflowStateLockTestConfig({
+      configureWorkflowStateLockFaults({
         hook: async (stage) => {
           if (stage === 'contended') await writeFile(contendedPath, 'contended');
         },
@@ -156,7 +157,7 @@ async function runStateWriteInChild(
 
 async function runStateClearInChild(
   operationsUrl: string,
-  workflowLockUrl: string,
+  faultInjectionUrl: string,
   workingDirectory: string,
   mode: 'team' | 'autopilot',
   barriers: {
@@ -169,13 +170,13 @@ async function runStateClearInChild(
   const script = `
     const { existsSync } = await import('node:fs');
     const { writeFile } = await import('node:fs/promises');
-    const { executeStateOperation, setStateWriteCommitHookForTests } = await import(${JSON.stringify(operationsUrl)});
-    const { setWorkflowStateLockTestConfig } = await import(${JSON.stringify(workflowLockUrl)});
+    const { executeStateOperation } = await import(${JSON.stringify(operationsUrl)});
+    const { configureStateMutationCommitHook, configureWorkflowStateLockFaults } = await import(${JSON.stringify(faultInjectionUrl)});
     const detailReadyPath = ${JSON.stringify(barriers.detailReadyPath ?? '')};
     const detailReleasePath = ${JSON.stringify(barriers.detailReleasePath ?? '')};
     const contendedPath = ${JSON.stringify(barriers.contendedPath ?? '')};
     if (detailReadyPath) {
-      setStateWriteCommitHookForTests(async (stage) => {
+      configureStateMutationCommitHook(async (stage) => {
         if (stage !== 'clear-detail-written') return;
         await writeFile(detailReadyPath, 'ready');
         while (!existsSync(detailReleasePath)) {
@@ -184,7 +185,7 @@ async function runStateClearInChild(
       });
     }
     if (contendedPath) {
-      setWorkflowStateLockTestConfig({
+      configureWorkflowStateLockFaults({
         hook: async (stage) => {
           if (stage === 'contended') await writeFile(contendedPath, 'contended');
         },
@@ -1011,18 +1012,18 @@ describe('state operations directory initialization', () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-cross-process-'));
     try {
       const operationsUrl = new URL('../operations.js', import.meta.url).href;
-      const workflowLockUrl = new URL('../workflow-state-lock.js', import.meta.url).href;
+      const faultInjectionUrl = new URL('../../testing/state-fault-injection.js', import.meta.url).href;
       const detailReadyPath = join(wd, 'detail-ready');
       const detailReleasePath = join(wd, 'detail-release');
       const contendedPath = join(wd, 'contended');
-      const first = runStateWriteInChild(operationsUrl, workflowLockUrl, wd, 'team', {
+      const first = runStateWriteInChild(operationsUrl, faultInjectionUrl, wd, 'team', {
         first_field: 'first',
       }, {
         detailReadyPath,
         detailReleasePath,
       });
       await waitForFile(detailReadyPath);
-      const second = runStateWriteInChild(operationsUrl, workflowLockUrl, wd, 'team', {
+      const second = runStateWriteInChild(operationsUrl, faultInjectionUrl, wd, 'team', {
         second_field: 'second',
       }, {
         contendedPath,
@@ -1066,7 +1067,7 @@ describe('state operations directory initialization', () => {
       const canonicalPath = join(stateDir, 'skill-active-state.json');
       const detailBefore = await readFile(detailPath, 'utf-8');
       const canonicalBefore = await readFile(canonicalPath, 'utf-8');
-      setSkillActiveWriteHookForTests((path) => {
+      configureSkillActiveWriteHook((path) => {
         if (path === canonicalPath) {
           throw Object.assign(new Error('simulated state_write canonical EIO'), { code: 'EIO' });
         }
@@ -1086,7 +1087,7 @@ describe('state operations directory initialization', () => {
       assert.equal(await readFile(canonicalPath, 'utf-8'), canonicalBefore);
       assert.equal(existsSync(join(stateDir, '.workflow-state-transaction.json')), false);
     } finally {
-      setSkillActiveWriteHookForTests();
+      configureSkillActiveWriteHook();
       await rm(wd, { recursive: true, force: true });
     }
   });
@@ -1103,16 +1104,16 @@ describe('state operations directory initialization', () => {
       assert.equal(initial.isError, undefined);
 
       const operationsUrl = new URL('../operations.js', import.meta.url).href;
-      const workflowLockUrl = new URL('../workflow-state-lock.js', import.meta.url).href;
+      const faultInjectionUrl = new URL('../../testing/state-fault-injection.js', import.meta.url).href;
       const detailReadyPath = join(wd, 'clear-ready');
       const detailReleasePath = join(wd, 'clear-release');
       const contendedPath = join(wd, 'write-contended');
-      const clear = runStateClearInChild(operationsUrl, workflowLockUrl, wd, 'team', {
+      const clear = runStateClearInChild(operationsUrl, faultInjectionUrl, wd, 'team', {
         detailReadyPath,
         detailReleasePath,
       });
       await waitForFile(detailReadyPath);
-      const write = runStateWriteInChild(operationsUrl, workflowLockUrl, wd, 'team', {
+      const write = runStateWriteInChild(operationsUrl, faultInjectionUrl, wd, 'team', {
         written_after_clear: true,
       }, {
         contendedPath,
@@ -1147,16 +1148,16 @@ describe('state operations directory initialization', () => {
       assert.equal(initial.isError, undefined);
 
       const operationsUrl = new URL('../operations.js', import.meta.url).href;
-      const workflowLockUrl = new URL('../workflow-state-lock.js', import.meta.url).href;
+      const faultInjectionUrl = new URL('../../testing/state-fault-injection.js', import.meta.url).href;
       const detailReadyPath = join(wd, 'clear-ready');
       const detailReleasePath = join(wd, 'clear-release');
       const contendedPath = join(wd, 'start-contended');
-      const clear = runStateClearInChild(operationsUrl, workflowLockUrl, wd, 'team', {
+      const clear = runStateClearInChild(operationsUrl, faultInjectionUrl, wd, 'team', {
         detailReadyPath,
         detailReleasePath,
       });
       await waitForFile(detailReadyPath);
-      setWorkflowStateLockTestConfig({
+      configureWorkflowStateLockFaults({
         hook: async (stage) => {
           if (stage === 'contended') await writeFile(contendedPath, 'contended');
         },
@@ -1175,7 +1176,7 @@ describe('state operations directory initialization', () => {
         true,
       );
     } finally {
-      setWorkflowStateLockTestConfig();
+      configureWorkflowStateLockFaults();
       await rm(wd, { recursive: true, force: true });
     }
   });
@@ -1195,13 +1196,13 @@ describe('state operations directory initialization', () => {
       assert.equal(initial.isError, undefined);
 
       const operationsUrl = new URL('../operations.js', import.meta.url).href;
-      const workflowLockUrl = new URL('../workflow-state-lock.js', import.meta.url).href;
+      const faultInjectionUrl = new URL('../../testing/state-fault-injection.js', import.meta.url).href;
       const detailReadyPath = join(wd, 'clear-all-ready');
       const detailReleasePath = join(wd, 'clear-all-release');
       const contendedPath = join(wd, 'late-session-contended');
       const clear = runStateClearInChild(
         operationsUrl,
-        workflowLockUrl,
+        faultInjectionUrl,
         wd,
         'team',
         {
@@ -1213,7 +1214,7 @@ describe('state operations directory initialization', () => {
       await waitForFile(detailReadyPath);
       const write = runStateWriteInChild(
         operationsUrl,
-        workflowLockUrl,
+        faultInjectionUrl,
         wd,
         'team',
         { late_session: true },
@@ -1274,7 +1275,7 @@ describe('state operations directory initialization', () => {
       ];
       const before = new Map(await Promise.all(paths.map(async (path) => [path, await readFile(path, 'utf-8')] as const)));
       const sessionCanonicalPath = join(sessionDir, 'skill-active-state.json');
-      setSkillActiveWriteHookForTests((path) => {
+      configureSkillActiveWriteHook((path) => {
         if (path === sessionCanonicalPath) throw new Error('simulated clear canonical EIO');
       });
 
@@ -1290,7 +1291,7 @@ describe('state operations directory initialization', () => {
         assert.equal(await readFile(path, 'utf-8'), content);
       }
     } finally {
-      setSkillActiveWriteHookForTests();
+      configureSkillActiveWriteHook();
       await rm(wd, { recursive: true, force: true });
     }
   });
@@ -1318,7 +1319,7 @@ describe('state operations directory initialization', () => {
         ]),
       ];
       const before = new Map(await Promise.all(paths.map(async (path) => [path, await readFile(path, 'utf-8')] as const)));
-      setSkillActiveWriteHookForTests(() => {
+      configureSkillActiveWriteHook(() => {
         throw new Error('simulated all_sessions canonical EIO');
       });
 
@@ -1334,7 +1335,7 @@ describe('state operations directory initialization', () => {
         assert.equal(await readFile(path, 'utf-8'), content);
       }
     } finally {
-      setSkillActiveWriteHookForTests();
+      configureSkillActiveWriteHook();
       await rm(wd, { recursive: true, force: true });
     }
   });

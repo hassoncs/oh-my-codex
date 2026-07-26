@@ -68,6 +68,7 @@ import {
 import {
   isUnsupportedNativeSubagentEvidenceForScope,
 } from '../leader/contract.js';
+import { getStateMutationCommitHook } from '../testing/state-fault-injection.js';
 import {
   buildRalplanConsensusGateFromSources,
 } from '../ralplan/consensus-gate.js';
@@ -129,16 +130,6 @@ export type StateOperationName =
 export interface StateOperationResponse {
   payload: unknown;
   isError?: boolean;
-}
-
-type StateMutationCommitStage = 'detail-written' | 'clear-detail-written';
-
-let stateWriteCommitHookForTests: ((stage: StateMutationCommitStage, mode: string) => void | Promise<void>) | null = null;
-
-export function setStateWriteCommitHookForTests(
-  hook?: (stage: StateMutationCommitStage, mode: string) => void | Promise<void>,
-): void {
-  stateWriteCommitHookForTests = hook ?? null;
 }
 
 const stateWriteQueues = new Map<string, Promise<void>>();
@@ -1012,7 +1003,7 @@ export async function executeStateOperation(
 
           const merged = withModeRuntimeContext(existing, mergedRaw);
           await writeAtomicFile(path, JSON.stringify(merged, null, 2));
-          await stateWriteCommitHookForTests?.('detail-written', mode);
+          await getStateMutationCommitHook()?.('detail-written', mode);
               });
 
               if (validationError) throw new Error(validationError);
@@ -1113,7 +1104,7 @@ export async function executeStateOperation(
               const nativeStopCleared = effectiveSessionId
                 ? await clearSessionNativeStopState(baseStateDir, effectiveSessionId)
                 : [];
-              await stateWriteCommitHookForTests?.('clear-detail-written', mode);
+              await getStateMutationCommitHook()?.('clear-detail-written', mode);
               if (mode !== SKILL_ACTIVE_STATE_MODE) {
                 await syncCanonicalSkillStateForMode({
                   cwd,
@@ -1140,7 +1131,7 @@ export async function executeStateOperation(
               await unlink(path);
               removedPaths.push(path);
             }
-            await stateWriteCommitHookForTests?.('clear-detail-written', mode);
+            await getStateMutationCommitHook()?.('clear-detail-written', mode);
             if (mode !== SKILL_ACTIVE_STATE_MODE) {
               await syncCanonicalSkillStateForMode({
                 cwd,

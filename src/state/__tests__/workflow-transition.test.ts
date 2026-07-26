@@ -16,7 +16,7 @@ import {
 } from '../workflow-transition-reconcile.js';
 import { readModeState, startMode } from '../../modes/base.js';
 import { getBaseStateDir } from '../../mcp/state-paths.js';
-import { setSkillActiveWriteHookForTests } from '../skill-active.js';
+import { configureSkillActiveWriteHook } from '../../testing/state-fault-injection.js';
 
 const STATE_ENV_KEYS = [
   'OMX_ROOT',
@@ -505,7 +505,7 @@ describe('workflow transition rules', () => {
           await writeFile(path, content);
         }
         const sessionCanonicalPath = join(sessionDir, 'skill-active-state.json');
-        setSkillActiveWriteHookForTests((path) => {
+        configureSkillActiveWriteHook((path) => {
           if (path === sessionCanonicalPath) {
             throw Object.assign(new Error('simulated canonical EIO'), { code: 'EIO' });
           }
@@ -520,7 +520,7 @@ describe('workflow transition rules', () => {
           assert.equal(await readFile(path, 'utf-8'), content);
         }
       } finally {
-        setSkillActiveWriteHookForTests();
+        configureSkillActiveWriteHook();
         await rm(wd, { recursive: true, force: true });
       }
     });
