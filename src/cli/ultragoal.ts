@@ -18,6 +18,7 @@ import {
   steerUltragoal,
   summarizeUltragoalPlan,
   type UltragoalItem,
+  type UltragoalReviewBlockerClass,
   type UltragoalSteeringAfterPayload,
   type UltragoalSteeringMutationKind,
   type UltragoalSteeringProposal,
@@ -36,7 +37,7 @@ Usage:
   omx ultragoal complete-goals [--retry-failed] [--json]
   omx ultragoal add-goal --title <title> --objective <text> [--evidence <text>] [--json]
   omx ultragoal steer --kind <mutation-kind> --evidence <text> --rationale <text> [--target-goal-id <id> | --target-goal-ids <id1,id2,...>] [--title <title>] [--objective <text>] [--json]
-  omx ultragoal record-review-blockers --goal-id <id> --title <title> --objective <text> --evidence <review-findings> --codex-goal-json <active-json-or-path> [--json]
+  omx ultragoal record-review-blockers --goal-id <id> --title <title> --objective <text> --evidence <review-findings> --codex-goal-json <active-json-or-path> [--blocker-class <evidence_stale|substantive>] [--json]
   omx ultragoal steer --kind <add_subgoal|split_subgoal|reorder_pending|revise_pending_wording|annotate_ledger|mark_blocked_superseded> --evidence <text> --rationale <text> [--target-goal-id <id>] [--title <text>] [--objective <text>] [--after-json <json-or-path>] [--idempotency-key <key>] [--json]
   omx ultragoal steer --directive-json <json-or-path> [--json]
   omx ultragoal checkpoint --goal-id <id> --status <complete|failed|blocked> [--evidence <text>] [--codex-goal-json <json-or-path>] [--quality-gate-json <json-or-path>] [--json]
@@ -78,6 +79,10 @@ Codex goal integration:
   Final completion is mandatory-gated: run ai-slop-cleaner, rerun verification,
   run $code-review, and pass --quality-gate-json with APPROVE + CLEAR evidence.
   Non-clean final review must use record-review-blockers before update_goal.
+  Review findings that only say the evidence is stale against the just-repaired
+  state are classified evidence_stale: they append an evidence re-capture story
+  and leave the goal in progress instead of a full review-block round-trip.
+  Pass --blocker-class to override the classification.
 `;
 
 function hasFlag(args: readonly string[], flag: string): boolean {
@@ -470,10 +475,21 @@ export async function ultragoalCommand(args: string[]): Promise<void> {
       if (!objective?.trim()) throw new UltragoalError('Missing --objective.');
       if (!evidence?.trim()) throw new UltragoalError('Missing --evidence.');
       const codexGoal = await parseCodexGoalJson(readValue(rest, '--codex-goal-json'));
-      const result = await recordFinalReviewBlockers(cwd, { goalId, title, objective, evidence, codexGoal });
+      const blockerClassRaw = readValue(rest, '--blocker-class');
+      if (blockerClassRaw && blockerClassRaw !== 'evidence_stale' && blockerClassRaw !== 'substantive') {
+        throw new UltragoalError('Invalid --blocker-class; expected evidence_stale or substantive.');
+      }
+      const result = await recordFinalReviewBlockers(cwd, {
+        goalId,
+        title,
+        objective,
+        evidence,
+        codexGoal,
+        blockerClass: blockerClassRaw as UltragoalReviewBlockerClass | undefined,
+      });
       if (json) printJson({ ok: true, plan: result.plan, blockedGoal: result.blockedGoal, addedGoal: result.addedGoal, summary: summarizeUltragoalPlan(result.plan) });
       else {
-        console.log(`ultragoal final review blockers recorded: ${result.blockedGoal.id} -> review_blocked; added ${result.addedGoal.id}`);
+        console.log(`ultragoal final review blockers recorded: ${result.blockedGoal.id} -> ${result.blockedGoal.status}; added ${result.addedGoal.id}`);
         printStatus(result.plan);
       }
       return;

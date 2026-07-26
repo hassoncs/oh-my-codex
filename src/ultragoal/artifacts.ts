@@ -282,9 +282,41 @@ export interface AddUltragoalGoalOptions {
   now?: Date;
 }
 
+export type UltragoalReviewBlockerClass = 'evidence_stale' | 'substantive';
+
 export interface RecordFinalReviewBlockersOptions extends AddUltragoalGoalOptions {
   goalId: string;
   codexGoal?: unknown;
+  /** Omit to classify from the review evidence. */
+  blockerClass?: UltragoalReviewBlockerClass;
+}
+
+const EVIDENCE_STALE_PATTERNS: readonly RegExp[] = [
+  /\bstale evidence\b/i,
+  /\bevidence is stale\b/i,
+  /\bevidence (?:is )?(?:one|1) commit behind\b/i,
+  /\bproof (?:is )?(?:one|1) commit behind\b/i,
+  /\bevidence predates\b/i,
+  /\bevidence was captured before\b/i,
+  /\bre-?capture (?:the )?evidence\b/i,
+];
+
+const SUBSTANTIVE_OVERRIDE_PATTERNS: readonly RegExp[] = [
+  /\bbug\b/i,
+  /\bregression\b/i,
+  /\bincorrect\b/i,
+  /\bunsafe\b/i,
+  /\bmissing (?:test|validation|authz|authorization)\b/i,
+];
+
+/**
+ * "Evidence is stale versus the just-repaired state" is a capture problem, not a
+ * plan problem: it should cost an evidence re-capture task, not a full review
+ * BLOCK round-trip that spawns fresh reviewer teams for hours.
+ */
+export function classifyReviewBlockerEvidence(evidence: string): UltragoalReviewBlockerClass {
+  if (SUBSTANTIVE_OVERRIDE_PATTERNS.some((pattern) => pattern.test(evidence))) return 'substantive';
+  return EVIDENCE_STALE_PATTERNS.some((pattern) => pattern.test(evidence)) ? 'evidence_stale' : 'substantive';
 }
 
 export interface CodexGoalInstructionOptions {
@@ -2083,6 +2115,23 @@ export async function recordFinalReviewBlockers(cwd: string, options: RecordFina
   );
   if (!reconciliation.ok) {
     throw new UltragoalError(formatCodexGoalReconciliation(reconciliation));
+  }
+
+  const blockerClass = options.blockerClass ?? classifyReviewBlockerEvidence(options.evidence ?? '');
+  if (blockerClass === 'evidence_stale') {
+    const recaptureGoal = appendGoalToPlan(plan, { ...options, now: options.now });
+    goal.updatedAt = now;
+    plan.updatedAt = now;
+    await writePlan(cwd, plan);
+    await appendLedger(cwd, {
+      ts: now,
+      event: 'goal_added',
+      goalId: recaptureGoal.id,
+      status: recaptureGoal.status,
+      evidence: options.evidence,
+      message: `Final review reported stale evidence against the repaired state; appended evidence re-capture story ${recaptureGoal.id} and left ${goal.id} in progress instead of a full review-block round-trip.`,
+    });
+    return { plan, blockedGoal: goal, addedGoal: recaptureGoal };
   }
 
   const addedGoal = appendGoalToPlan(plan, { ...options, now: options.now, resolvesReviewBlockedGoalId: goal.id });

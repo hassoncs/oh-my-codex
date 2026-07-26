@@ -79,6 +79,8 @@ export interface RalplanConsensusIterationContext {
     architect?: RalplanReusableRoleLane;
     critic?: RalplanReusableRoleLane;
   };
+  /** Mid-gate brief addenda drained as one batch for this round. */
+  briefAddenda?: RalplanBriefAddendum[];
 }
 
 export interface RalplanConsensusExecutor {
@@ -135,6 +137,8 @@ export interface RalplanRuntimeResult {
   error?: string;
   selectedExecutionLane?: RalplanExecutionLane;
   executionHandoffStarted?: boolean;
+  reviewBudget?: RalplanReviewBudgetStatus;
+  requiredUserDecision?: string;
 }
 
 interface RalplanModeUpdates {
@@ -440,6 +444,9 @@ export async function runRalplanConsensus(
 ): Promise<RalplanRuntimeResult> {
   const cwd = options.cwd ?? process.cwd();
   const maxIterations = options.maxIterations ?? 5;
+  const maxWallClockMs = options.maxWallClockMs ?? null;
+  const clock = options.now ?? (() => Date.now());
+  const startedAtMs = clock();
   const gateOptions = {
     cwd,
     sessionId: options.sessionId,
@@ -459,8 +466,75 @@ export async function runRalplanConsensus(
 
   await startMode('ralplan', options.task, maxIterations, cwd);
 
+  const reviewBudget = (kind: RalplanReviewBudgetKind | null): RalplanReviewBudgetStatus => ({
+    maxIterations,
+    maxWallClockMs,
+    iterationsUsed: iteration,
+    elapsedMs: clock() - startedAtMs,
+    exhausted: kind,
+  });
+
+  const wallClockExhausted = (): boolean =>
+    maxWallClockMs !== null && clock() - startedAtMs >= maxWallClockMs;
+
+  /**
+   * Budget exhaustion is not a failure and not another round: the lane stops and
+   * hands the decision to the user.
+   */
+  const emitNeedsUserDecision = async (
+    kind: RalplanReviewBudgetKind,
+    extra: RalplanModeUpdates = {},
+  ): Promise<RalplanRuntimeResult> => {
+    const budget = reviewBudget(kind);
+    const consensusGate = buildRalplanConsensusGate(architectReviews, criticReviews, gateOptions);
+    const reviewHistory = buildReviewHistory(drafts, architectReviews, criticReviews);
+    const requiredDecision = kind === 'wall_clock'
+      ? `ralplan spent ${Math.round(budget.elapsedMs / 1000)}s of its ${Math.round((maxWallClockMs ?? 0) / 1000)}s review budget without consensus`
+      : `ralplan used all ${maxIterations} review rounds without consensus`;
+    await updateRalplanState(cwd, {
+      active: false,
+      iteration,
+      current_phase: 'needs_user_decision',
+      completed_at: new Date().toISOString(),
+      planning_complete: false,
+      latest_plan_path: latestPlanPath,
+      ralplan_consensus_gate: consensusGate,
+      review_history: reviewHistory,
+      review_budget: budget,
+      required_user_decision: requiredDecision,
+      status_message: `Status: needs_user_decision — ${requiredDecision}. Continue from the best current artifact, raise the budget explicitly, or change approach; do not start another review round.`,
+      ...extra,
+    });
+    return {
+      status: 'needs_user_decision',
+      iteration,
+      phase: 'needs_user_decision',
+      planningComplete: false,
+      drafts,
+      architectReviews,
+      criticReviews,
+      ralplanConsensusGate: consensusGate,
+      latestPlanPath,
+      artifacts: aggregatedArtifacts,
+      reviewBudget: budget,
+      requiredUserDecision: requiredDecision,
+    };
+  };
+
   try {
     while (iteration <= maxIterations) {
+      if (iteration > 1 && wallClockExhausted()) {
+        return await emitNeedsUserDecision('wall_clock');
+      }
+      // One batch of mid-gate addenda costs one re-review, not one per addendum.
+      const briefAddenda = await drainPendingAddenda(cwd);
+      if (briefAddenda.length > 0) {
+        await updateRalplanState(cwd, {
+          iteration,
+          batched_brief_addenda: briefAddenda,
+          status_message: `Status: re-reviewing — ${briefAddenda.length} mid-gate brief addend${briefAddenda.length === 1 ? 'um' : 'a'} batched into this round.`,
+        });
+      }
       const reusableRoleLanes = {
         architect: latestCompatibleRoleLane(architectReviews, 'architect', options.sessionId),
         critic: latestCompatibleRoleLane(criticReviews, 'critic', options.sessionId),
@@ -473,6 +547,7 @@ export async function runRalplanConsensus(
         architectReviews: [...architectReviews],
         criticReviews: [...criticReviews],
         reusableRoleLanes,
+        briefAddenda,
       };
 
       await updateRalplanState(cwd, {
@@ -532,35 +607,11 @@ export async function runRalplanConsensus(
           review_history: reviewHistory,
         });
 
-        if (iteration >= maxIterations) {
-          const error = `ralplan_consensus_not_reached_after_${maxIterations}_iterations`;
-          await updateRalplanState(cwd, {
-            active: false,
-            iteration,
-            current_phase: 'failed',
-            completed_at: new Date().toISOString(),
-            planning_complete: false,
-            latest_plan_path: latestPlanPath,
+        if (iteration >= maxIterations || wallClockExhausted()) {
+          return await emitNeedsUserDecision(iteration >= maxIterations ? 'iterations' : 'wall_clock', {
             latest_architect_verdict: architectReview.verdict,
             latest_architect_summary: architectReview.summary,
-            ralplan_consensus_gate: consensusGate,
-            review_history: reviewHistory,
-            status_message: `Status: paused_for_review — ralplan reached the ${maxIterations}-iteration review limit without Architect approval; continue from the best current artifact or ask the user how to proceed.`,
-            error,
           });
-          return {
-            status: 'failed',
-            iteration,
-            phase: 'failed',
-            planningComplete: false,
-            drafts,
-            architectReviews,
-            criticReviews,
-            ralplanConsensusGate: consensusGate,
-            latestPlanPath,
-            artifacts: aggregatedArtifacts,
-            error,
-          };
         }
 
         iteration += 1;
@@ -683,35 +734,11 @@ export async function runRalplanConsensus(
         };
       }
 
-      if (iteration >= maxIterations) {
-        const error = `ralplan_consensus_not_reached_after_${maxIterations}_iterations`;
-        await updateRalplanState(cwd, {
-          active: false,
-          iteration,
-          current_phase: 'failed',
-          completed_at: new Date().toISOString(),
-          planning_complete: false,
-          latest_plan_path: latestPlanPath,
+      if (iteration >= maxIterations || wallClockExhausted()) {
+        return await emitNeedsUserDecision(iteration >= maxIterations ? 'iterations' : 'wall_clock', {
           latest_critic_verdict: criticReview.verdict,
           latest_critic_summary: criticReview.summary,
-          ralplan_consensus_gate: consensusGate,
-          review_history: reviewHistory,
-          status_message: `Status: paused_for_review — ralplan reached the ${maxIterations}-iteration review limit without approval; continue from the best current artifact or ask the user how to proceed.`,
-          error,
         });
-        return {
-          status: 'failed',
-          iteration,
-          phase: 'failed',
-          planningComplete: false,
-          drafts,
-          architectReviews,
-          criticReviews,
-          ralplanConsensusGate: consensusGate,
-          latestPlanPath,
-          artifacts: aggregatedArtifacts,
-          error,
-        };
       }
 
       iteration += 1;

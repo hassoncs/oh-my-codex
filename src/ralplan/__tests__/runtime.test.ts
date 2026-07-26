@@ -406,7 +406,7 @@ describe('ralplan runtime', () => {
     }
 
     const stale = await runCase(false);
-    assert.equal(stale.status, 'failed');
+    assert.equal(stale.status, 'needs_user_decision');
     assert.equal(stale.ralplanConsensusGate.complete, false);
     assert.match(stale.ralplanConsensusGate.blocked_reason || '', /native_subagent_consensus_evidence_missing/);
 
@@ -657,10 +657,10 @@ describe('ralplan runtime', () => {
         requireNativeSubagents: true,
       });
 
-      assert.equal(result.status, 'failed');
+      assert.equal(result.status, 'needs_user_decision');
       assert.equal(result.ralplanConsensusGate.complete, false);
       assert.equal(result.ralplanConsensusGate.blocked_reason, 'native_subagent_consensus_evidence_missing');
-      assert.equal(result.error, 'ralplan_consensus_not_reached_after_1_iterations');
+      assert.equal(result.reviewBudget?.exhausted, 'iterations');
 
       const tracking = JSON.parse(await readFile(subagentTrackingPath(cwd), 'utf-8')) as {
         sessions?: Record<string, {
@@ -785,10 +785,10 @@ describe('ralplan runtime', () => {
         requireNativeSubagents: true,
       });
 
-      assert.equal(result.status, 'failed');
+      assert.equal(result.status, 'needs_user_decision');
       assert.equal(result.ralplanConsensusGate.complete, false);
       assert.equal(result.ralplanConsensusGate.blocked_reason, 'native_subagent_consensus_evidence_missing');
-      assert.equal(result.error, 'ralplan_consensus_not_reached_after_1_iterations');
+      assert.equal(result.reviewBudget?.exhausted, 'iterations');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -820,13 +820,13 @@ describe('ralplan runtime', () => {
         },
       }, { task: 'reject before critic', cwd, maxIterations: 1 });
 
-      assert.equal(result.status, 'failed');
+      assert.equal(result.status, 'needs_user_decision');
       assert.equal(criticCalls, 0);
       assert.equal(result.ralplanConsensusGate.complete, false);
       assert.equal(result.ralplanConsensusGate.blocked_reason, 'architect_review_missing_or_not_approved');
 
       const finalState = await readModeState('ralplan', cwd);
-      assert.equal(finalState?.current_phase, 'failed');
+      assert.equal(finalState?.current_phase, 'needs_user_decision');
       assert.equal((finalState?.ralplan_consensus_gate as { complete?: boolean } | undefined)?.complete, false);
       assert.equal(
         (finalState?.ralplan_consensus_gate as { ralplan_architect_review?: { agent_role?: string } } | undefined)?.ralplan_architect_review?.agent_role,
@@ -913,11 +913,11 @@ describe('ralplan runtime', () => {
         },
       }, { task: 'reject then approve must fail', cwd, maxIterations: 1 });
 
-      assert.equal(result.status, 'failed');
-      assert.equal(result.phase, 'failed');
+      assert.equal(result.status, 'needs_user_decision');
+      assert.equal(result.phase, 'needs_user_decision');
       assert.equal(result.planningComplete, false);
       const finalState = await readModeState('ralplan', cwd);
-      assert.equal(finalState?.current_phase, 'failed');
+      assert.equal(finalState?.current_phase, 'needs_user_decision');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
