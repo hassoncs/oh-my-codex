@@ -67,6 +67,20 @@ describe('workflow transition rules', () => {
     }
   });
 
+  it('allows autopilot + team only through the validated nested-team option', () => {
+    const standalone = evaluateWorkflowTransition(['autopilot'], 'team');
+    const nested = evaluateWorkflowTransition(
+      ['autopilot'],
+      'team',
+      { allowNestedAutopilotTeam: true },
+    );
+
+    assert.equal(standalone.allowed, false);
+    assert.equal(nested.allowed, true);
+    assert.equal(nested.kind, 'overlap');
+    assert.deepEqual(nested.resultingModes, ['autopilot', 'team']);
+  });
+
   it('builds actionable denial guidance that names both clearing paths', () => {
     const error = buildWorkflowTransitionError(['team'], 'autopilot', 'start');
     assert.match(error, /Cannot start autopilot: team is already active\./);

@@ -28,6 +28,7 @@ const EXPECTED_STATE_RE_EXPORTS = {
   teamUpdateTask: 'updateTask',
   teamClaimTask: 'claimTask',
   teamReleaseTaskClaim: 'releaseTaskClaim',
+  teamRetryFailedTask: 'retryFailedTask',
   teamReclaimExpiredTaskClaim: 'reclaimExpiredTaskClaim',
   teamTransitionTaskStatus: 'transitionTaskStatus',
   teamComputeTaskReadiness: 'computeTaskReadiness',

@@ -35,6 +35,7 @@ import {
   teamClaimTask,
   teamTransitionTaskStatus,
   teamReleaseTaskClaim,
+  teamRetryFailedTask,
   teamCleanup,
   teamReadConfig,
   teamReadManifest,
@@ -109,6 +110,7 @@ export const TEAM_API_OPERATIONS = [
   'claim-task',
   'transition-task-status',
   'release-task-claim',
+  'retry-failed-task',
   'read-config',
   'read-manifest',
   'read-worker-status',
@@ -888,6 +890,19 @@ export async function executeTeamApiOperation(
           return { ok: false, operation, error: { code: 'invalid_input', message: 'team_name, task_id, claim_token, worker are required' } };
         }
         const result = await teamReleaseTaskClaim(teamName, taskId, claimToken, worker, cwd);
+        return { ok: true, operation, data: result as unknown as Record<string, unknown> };
+      }
+      case 'retry-failed-task': {
+        const teamName = String(opArgs.team_name || '').trim();
+        const taskId = String(opArgs.task_id || '').trim();
+        const expectedVersion = opArgs.expected_version;
+        if (!teamName || !taskId || expectedVersion === undefined) {
+          return { ok: false, operation, error: { code: 'invalid_input', message: 'team_name, task_id, expected_version are required' } };
+        }
+        if (!isFiniteInteger(expectedVersion) || expectedVersion < 1) {
+          return { ok: false, operation, error: { code: 'invalid_input', message: 'expected_version must be a positive integer' } };
+        }
+        const result = await teamRetryFailedTask(teamName, taskId, expectedVersion, cwd);
         return { ok: true, operation, data: result as unknown as Record<string, unknown> };
       }
       case 'read-config': {

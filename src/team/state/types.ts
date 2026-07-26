@@ -305,6 +305,10 @@ export type ReleaseTaskClaimResult =
   | { ok: true; task: TeamTaskV2 }
   | { ok: false; error: 'claim_conflict' | 'task_not_found' | 'already_terminal' | 'lease_expired' };
 
+export type RetryFailedTaskResult =
+  | { ok: true; task: TeamTaskV2 }
+  | { ok: false; error: 'claim_conflict' | 'task_not_found' | 'invalid_transition' };
+
 export type ReclaimTaskResult =
   | { ok: true; task: TeamTaskV2; reclaimed: boolean }
   | { ok: false; error: 'claim_conflict' | 'task_not_found' | 'already_terminal' | 'lease_active' };

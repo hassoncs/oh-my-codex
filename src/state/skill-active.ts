@@ -7,6 +7,7 @@ import {
   assertWorkflowTransitionAllowed,
   isTrackedWorkflowMode,
   pickPrimaryWorkflowMode,
+  type WorkflowTransitionOptions,
 } from './workflow-transition.js';
 
 export const SKILL_ACTIVE_STATE_MODE = 'skill-active';
@@ -68,6 +69,7 @@ export interface SyncCanonicalSkillStateOptions {
   nowIso?: string;
   source?: string;
   allSessions?: boolean;
+  workflowTransitionOptions?: WorkflowTransitionOptions;
 }
 
 function safeString(value: unknown): string {
@@ -399,7 +401,12 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
     const currentWorkflowModes = visibleEntries
       .map((entry) => entry.skill)
       .filter(isTrackedWorkflowMode);
-    assertWorkflowTransitionAllowed(currentWorkflowModes, mode, 'write');
+    assertWorkflowTransitionAllowed(
+      currentWorkflowModes,
+      mode,
+      'write',
+      options.workflowTransitionOptions,
+    );
   }
 
   const applyEntriesToState = (

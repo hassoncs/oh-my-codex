@@ -385,10 +385,12 @@ describe('paneHasActiveTask', () => {
     assert.equal(paneHasActiveTask('• Running tests (3m 12s • esc to interrupt)'), true);
     assert.equal(paneHasActiveTask('· Pollinating…'), true);
     assert.equal(paneHasActiveTask('2 background terminal running'), true);
+    assert.equal(paneHasActiveTask('background terminal running'), true);
   });
 
   it('returns false for idle prompts', () => {
     assert.equal(paneHasActiveTask('› ready for input'), false);
+    assert.equal(paneHasActiveTask('0 background terminal running'), false);
   });
 });
 

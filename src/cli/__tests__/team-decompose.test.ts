@@ -97,6 +97,21 @@ describe('decomposeTaskString', () => {
     assert.match(tasks[2].description, /write benchmark/);
   });
 
+  it('keeps semicolons in prose and shell commands atomic', () => {
+    const prose = decomposeTaskString(
+      'Review the parser; preserving quoted semicolons is required for shell command safety.',
+      3,
+      'executor',
+      false,
+    );
+    const command = decomposeTaskString('npm test; npm run build', 3, 'executor', false);
+
+    assert.equal(prose.length, 1);
+    assert.match(prose[0].description, /quoted semicolons/i);
+    assert.equal(command.length, 1);
+    assert.equal(command[0].description, 'npm test; npm run build');
+  });
+
   it('keeps long analytic prose prompts in a single-worker lane by default', () => {
     const task = 'Analyze OMX team mode reliability/efficiency weaknesses, focusing on orchestration progress detection, heartbeat/task-state coupling, tmux/state-plane brittleness, and verification gaps. Produce concrete findings with root cause, user impact, evidence pointers, and actionable recommendations suitable for a GitHub issue.';
     const plan = buildTeamExecutionPlan(task, 3, 'executor', false);

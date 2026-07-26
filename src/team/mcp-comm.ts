@@ -36,10 +36,22 @@ export type TeamNotifier = (
   context: { request: TeamDispatchRequest; message_id?: string },
 ) => DispatchOutcome | Promise<DispatchOutcome>;
 
+const NOTIFIED_REMINDER_REPLAY_AFTER_MS = 60_000;
+
 function isConfirmedNotification(outcome: DispatchOutcome): boolean {
   if (!outcome.ok) return false;
   if (outcome.transport !== 'hook') return true;
   return outcome.reason !== 'queued_for_hook_dispatch';
+}
+
+function shouldReplayNotifiedReminder(
+  notifiedAt: string | undefined,
+  intent: TeamReminderIntent | undefined,
+  nowMs: number = Date.now(),
+): boolean {
+  if (!intent || !notifiedAt) return false;
+  const notifiedAtMs = Date.parse(notifiedAt);
+  return Number.isFinite(notifiedAtMs) && nowMs - notifiedAtMs >= NOTIFIED_REMINDER_REPLAY_AFTER_MS;
 }
 
 function isLeaderPaneMissingMailboxPersistedOutcome(
@@ -248,7 +260,11 @@ interface QueueDirectMessageParams {
 
 export async function queueDirectMailboxMessage(params: QueueDirectMessageParams): Promise<DispatchOutcome> {
   const message = await sendDirectMessage(params.teamName, params.fromWorker, params.toWorker, params.body, params.cwd);
-  if (message.notified_at && !message.delivered_at) {
+  if (
+    message.notified_at
+    && !message.delivered_at
+    && !shouldReplayNotifiedReminder(message.notified_at, params.intent)
+  ) {
     const outcome = {
       ok: true,
       transport: params.toWorker === 'leader-fixed' ? 'mailbox' : fallbackTransportForPreference(params.transportPreference),
