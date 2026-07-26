@@ -27,6 +27,9 @@ async function seedLane(cwd: string, options: { origin?: string } = {}): Promise
   await writeFile(join(stateDir, 'run-state.json'), JSON.stringify({ current_phase: 'team-exec', active: true }));
   await writeFile(join(stateDir, 'ultragoal-state.json'), JSON.stringify({ active: true, current_phase: 'execute' }));
   await writeFile(join(stateDir, 'sessions', 'sess-1', 'team-state.json'), JSON.stringify({ active: true, current_phase: 'team-exec' }));
+  // A long-lived tree accumulates finished sessions; the default view drops them.
+  await mkdir(join(stateDir, 'sessions', 'sess-old'), { recursive: true });
+  await writeFile(join(stateDir, 'sessions', 'sess-old', 'ralplan-state.json'), JSON.stringify({ active: false, current_phase: 'complete' }));
   await writeFile(join(stateDir, 'team-state.json'), JSON.stringify({
     active: true,
     team_name: 'execute-g006-runtime-a784b8fd',
@@ -65,7 +68,7 @@ describe('omx supervision status', () => {
   it('renders phase, run namespace, per-goal status, teams and last checkpoint from state files', async () => {
     await withTempRepo(async (cwd) => {
       await seedLane(cwd);
-      const status = await buildSupervisionStatus(cwd, new Date('2026-07-26T02:00:00.000Z'));
+      const status = await buildSupervisionStatus(cwd, { now: new Date('2026-07-26T02:00:00.000Z'), allModes: true });
 
       assert.equal(status.schema, SUPERVISION_STATUS_SCHEMA);
       assert.equal(status.worktreePath, cwd);
@@ -89,6 +92,13 @@ describe('omx supervision status', () => {
       // Session-scoped state files are visible to an outside reader too.
       assert.ok(status.modes.some((mode) => mode.mode === 'team' && mode.sessionId === 'sess-1'));
       assert.ok(status.modes.some((mode) => mode.mode === 'ultragoal' && mode.sessionId === null && mode.active));
+
+      // Default omits inactive/historical session state: a supervisor polling
+      // this surface should not pay for every session the tree ever held.
+      const lean = await buildSupervisionStatus(cwd);
+      assert.ok(lean.modes.every((mode) => mode.active));
+      assert.ok(lean.modes.length < status.modes.length);
+      assert.equal(lean.phase, 'team-exec');
     });
   });
 

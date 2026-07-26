@@ -281,10 +281,27 @@ async function collectTeams(cwd: string): Promise<SupervisionTeamStatus[]> {
   return teams;
 }
 
-export async function buildSupervisionStatus(cwd: string, now: Date = new Date()): Promise<SupervisionStatus> {
-  const modes = await collectModes(cwd);
+export interface BuildSupervisionStatusOptions {
+  /**
+   * Include every historical session's mode files. Off by default: a long-lived
+   * tree accumulates hundreds of session-scoped state files, and a supervisor
+   * polling this surface should not pay 150KB a tick to learn nothing.
+   */
+  allModes?: boolean;
+  now?: Date;
+}
+
+export async function buildSupervisionStatus(
+  cwd: string,
+  options: Date | BuildSupervisionStatusOptions = {},
+): Promise<SupervisionStatus> {
+  const resolved: BuildSupervisionStatusOptions = options instanceof Date ? { now: options } : options;
+  const now = resolved.now ?? new Date();
+  const allModes = resolved.allModes === true;
+  const collected = await collectModes(cwd);
+  const modes = allModes ? collected : collected.filter((mode) => mode.active);
   const runState = await readJson<Record<string, unknown>>(join(cwd, '.omx', 'state', 'run-state.json'));
-  const activeMode = modes.find((mode) => mode.active && mode.phase);
+  const activeMode = collected.find((mode) => mode.active && mode.phase);
   return {
     schema: SUPERVISION_STATUS_SCHEMA,
     generatedAt: now.toISOString(),

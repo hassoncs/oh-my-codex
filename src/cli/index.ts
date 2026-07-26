@@ -287,7 +287,7 @@ Usage:
                 (also used as an adaptive backend for qualifying read-only explore tasks)
   omx help      Show this help message
   omx status    Show active modes and state
-  omx status --json [--cwd <path>]
+  omx status --json [--cwd <path>] [--all-modes]
                 Machine-readable supervision surface (schema omx.supervision.status.v1):
                 phase, goal registry + run namespace, per-goal status, teams/workers,
                 last checkpoint. Readable from OUTSIDE the session by path.
@@ -2945,7 +2945,7 @@ async function showStatus(args: string[] = []): Promise<void> {
   const cwd = resolve(readStatusOption(args, "--cwd") ?? process.cwd());
   if (args.includes("--json")) {
     const { buildSupervisionStatus } = await import("../state/supervision-status.js");
-    console.log(JSON.stringify(await buildSupervisionStatus(cwd), null, 2));
+    console.log(JSON.stringify(await buildSupervisionStatus(cwd, { allModes: args.includes("--all-modes") }), null, 2));
     return;
   }
   try {

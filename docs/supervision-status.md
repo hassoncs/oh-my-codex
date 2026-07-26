@@ -13,7 +13,7 @@ and `.omx/state/*.json`.
 ## Contract
 
 ```bash
-omx status --json [--cwd <path>]
+omx status --json [--cwd <path>] [--all-modes]
 ```
 
 Emits one document, schema `omx.supervision.status.v1`. `--cwd` makes it readable
@@ -23,7 +23,7 @@ from **outside** the session, by path — no attach, no pane, no scraping.
 | --- | --- |
 | `worktreePath`, `omxPresent` | which tree was read, and whether it has `.omx/` |
 | `phase` | current run phase (`run-state.json`, falling back to the active mode) |
-| `modes[]` | every `*-state.json`, base and session-scoped: mode, active, phase, sessionId, path |
+| `modes[]` | active `*-state.json`, base and session-scoped: mode, active, phase, sessionId, path. `--all-modes` adds every historical session — a long-lived tree holds hundreds, and a polling supervisor should not pay ~150KB a tick for them |
 | `ultragoal.runId`, `.briefHash` | the active run namespace |
 | `ultragoal.origin` | creating worktree, and `inherited: true` for a registry that belongs to another tree |
 | `ultragoal.counts`, `.goals[]` | per-goal status |
