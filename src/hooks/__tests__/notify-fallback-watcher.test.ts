@@ -18,6 +18,9 @@ const INHERITED_OMX_ENV_KEYS = [
   'OMX_SOURCE_CWD',
   'OMX_STARTUP_CWD',
   'OMX_ENTRY_PATH',
+  'CODEX_SESSION_ID',
+  'CODEX_THREAD_ID',
+  'SESSION_ID',
 ] as const;
 const inheritedOmxEnv = new Map<string, string | undefined>();
 
@@ -471,7 +474,13 @@ function buildCleanNotifyEnv(
 
 describe('notify-fallback watcher', () => {
   it('uses offset-bounded rollout reads instead of re-reading whole tracked files', async () => {
-    const source = await readFile(new URL('../../scripts/notify-fallback-watcher.js', import.meta.url), 'utf-8');
+    const sourceUrl = new URL(
+      import.meta.url.endsWith('.ts')
+        ? '../../scripts/notify-fallback-watcher.ts'
+        : '../../scripts/notify-fallback-watcher.js',
+      import.meta.url,
+    );
+    const source = await readFile(sourceUrl, 'utf-8');
 
     assert.match(source, /async function readFirstLine[\s\S]*handle\.read\(/);
     assert.match(source, /if \(newline >= 0\)\s*return Buffer\.concat\(chunks\)\.toString\('utf-8'\)/);

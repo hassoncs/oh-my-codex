@@ -1990,7 +1990,9 @@ async function ensureTrackedFiles(): Promise<void> {
     const fileStat = await stat(path).catch(() => null);
     if (!fileStat) continue;
     const size = fileStat.size || 0;
-    const offset = runOnce ? 0 : size;
+    const createdAtMs = fileStat.birthtimeMs > 0 ? fileStat.birthtimeMs : fileStat.ctimeMs;
+    const createdWhileRunning = createdAtMs > startedAt;
+    const offset = runOnce || createdWhileRunning ? 0 : size;
     fileState.set(path, { ...sessionMeta, offset, size, partial: '', decoder: new StringDecoder('utf8') });
   }
 }
