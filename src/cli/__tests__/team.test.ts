@@ -33,7 +33,11 @@ import {
 import { writePersistedTeamUltragoalContext } from '../../team/ultragoal-context.js';
 import { isRealTmuxAvailable, withTempTmuxSession, type TempTmuxSessionFixture } from '../../team/__tests__/tmux-test-fixture.js';
 
-const OMX_CLI_PATH = fileURLToPath(new URL('../omx.js', import.meta.url));
+const COMPILED_OMX_CLI_PATH = fileURLToPath(new URL('../omx.js', import.meta.url));
+const OMX_CLI_PATH = existsSync(COMPILED_OMX_CLI_PATH)
+  ? COMPILED_OMX_CLI_PATH
+  : fileURLToPath(new URL('../omx.ts', import.meta.url));
+const OMX_CLI_NODE_ARGS = OMX_CLI_PATH.endsWith('.ts') ? ['--import', import.meta.resolve('tsx')] : [];
 const ORIGINAL_OMX_TEAM_WORKER = process.env.OMX_TEAM_WORKER;
 const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
 
@@ -170,7 +174,7 @@ async function runNodeCli(
   },
 ): Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }> {
   return await new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [OMX_CLI_PATH, ...args], {
+    const child = spawn(process.execPath, [...OMX_CLI_NODE_ARGS, OMX_CLI_PATH, ...args], {
       cwd: options.cwd,
       env: options.env,
       stdio: ['ignore', 'pipe', 'pipe'],
