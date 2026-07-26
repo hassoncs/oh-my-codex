@@ -2581,15 +2581,11 @@ esac
             `expected hook notification or ready-prompt fallback confirmation, got ${JSON.stringify(requests)}`,
           );
 
-          const captureCount = Number.parseInt(await readFile(join(cwd, 'capture-count'), 'utf-8'), 10);
-          assert.ok(captureCount >= 2, `expected ready wait capture after bootstrapping, got ${captureCount}`);
-
           const timingPath = join(cwd, '.omx', 'state', 'team', runtime.teamName, 'startup-timing.json');
-          if (existsSync(timingPath)) {
-            const timing = JSON.parse(await readFile(timingPath, 'utf-8')) as { events: Array<{ phase: string; ok?: boolean }> };
-            assert.ok(timing.events.some((event) => event.phase === 'ready_wait_start'));
-            assert.ok(timing.events.some((event) => event.phase === 'ready_wait_end' && event.ok === true));
-          }
+          assert.equal(existsSync(timingPath), true, 'startup timing must record the ready-prompt evidence path');
+          const timing = JSON.parse(await readFile(timingPath, 'utf-8')) as { events: Array<{ phase: string; ok?: boolean }> };
+          assert.ok(timing.events.some((event) => event.phase === 'ready_wait_start'));
+          assert.ok(timing.events.some((event) => event.phase === 'ready_wait_end' && event.ok === true));
         },
       );
     } finally {
