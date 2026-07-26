@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { preflightTeamModeStart } from '../team.js';
@@ -55,9 +55,11 @@ describe('team mode compatibility preflight', () => {
         await updateModeState('autopilot', { current_phase: 'ultragoal' }, wd);
         await writeActiveUltragoal(wd);
 
-        assert.equal(await preflightTeamModeStart(wd), true);
+        const preflight = await preflightTeamModeStart(wd);
+        assert.equal(preflight.allowNestedAutopilotTeam, true);
         await startMode('team', 'run nested story', 5, wd, {
-          allowNestedAutopilotTeam: true,
+          allowNestedAutopilotTeam: preflight.allowNestedAutopilotTeam,
+          preflightTransition: preflight.workflowTransition,
         });
 
         assert.equal((await readModeState('autopilot', wd))?.active, true);
@@ -88,6 +90,43 @@ describe('team mode compatibility preflight', () => {
           /invalid_ultragoal_team_context:missing/,
         );
         assert.equal(await readModeState('team', wd), null);
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('rejects canonical-only Autopilot before Team runtime state can mutate', async () => {
+    await withIsolatedStateEnv(async () => {
+      const wd = await mkdtemp(join(tmpdir(), 'omx-team-autopilot-canonical-only-'));
+      try {
+        const stateDir = join(wd, '.omx', 'state');
+        const canonicalPath = join(stateDir, 'skill-active-state.json');
+        await mkdir(stateDir, { recursive: true });
+        await writeFile(canonicalPath, JSON.stringify({
+          version: 1,
+          active: true,
+          skill: 'autopilot',
+          phase: 'ultragoal',
+          active_skills: [{
+            skill: 'autopilot',
+            phase: 'ultragoal',
+            active: true,
+          }],
+        }, null, 2));
+        await writeActiveUltragoal(wd);
+        const before = await readFile(canonicalPath, 'utf-8');
+
+        await assert.rejects(
+          () => preflightTeamModeStart(wd),
+          /nested_autopilot_team_requires_active_ultragoal_child/,
+        );
+
+        assert.equal(await readFile(canonicalPath, 'utf-8'), before);
+        assert.equal(await readModeState('team', wd), null);
+        assert.equal(await readFile(join(stateDir, 'autopilot-state.json'), 'utf-8').catch(() => null), null);
+        assert.equal(await readFile(join(stateDir, 'team-state.json'), 'utf-8').catch(() => null), null);
+        assert.equal(await readFile(join(stateDir, 'team', 'config.json'), 'utf-8').catch(() => null), null);
       } finally {
         await rm(wd, { recursive: true, force: true });
       }

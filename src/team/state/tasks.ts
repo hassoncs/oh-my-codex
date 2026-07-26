@@ -280,6 +280,13 @@ export async function transitionTaskStatus(
 
 interface ReleaseDeps extends ClaimTaskDeps {}
 
+interface RetryFailedTaskDeps extends ReleaseDeps {
+  beforeRetry?: (
+    previous: TeamTaskV2,
+    next: TeamTaskV2,
+  ) => Promise<(() => Promise<void>) | void>;
+}
+
 export async function releaseTaskClaim(
   taskId: string,
   claimToken: string,
@@ -317,7 +324,7 @@ export async function releaseTaskClaim(
 export async function retryFailedTask(
   taskId: string,
   expectedVersion: number,
-  deps: ReleaseDeps,
+  deps: RetryFailedTaskDeps,
 ): Promise<RetryFailedTaskResult> {
   const lock = await deps.withTaskClaimLock(deps.teamName, taskId, deps.cwd, async () => {
     const current = await deps.readTask(deps.teamName, taskId, deps.cwd);
@@ -355,7 +362,22 @@ export async function retryFailedTask(
     delete updated.completed_at;
     delete updated.delegation_compliance;
     delete updated.coordination_compliance;
-    await deps.writeAtomic(deps.taskFilePath(deps.teamName, taskId, deps.cwd), JSON.stringify(updated, null, 2));
+    const rollback = await deps.beforeRetry?.(v, updated);
+    try {
+      await deps.writeAtomic(deps.taskFilePath(deps.teamName, taskId, deps.cwd), JSON.stringify(updated, null, 2));
+    } catch (error) {
+      if (rollback) {
+        try {
+          await rollback();
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [error, rollbackError],
+            'retry_failed_task_write_and_workflow_rollback_failed',
+          );
+        }
+      }
+      throw error;
+    }
     return { ok: true as const, task: updated };
   });
 

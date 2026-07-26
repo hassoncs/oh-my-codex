@@ -61,6 +61,7 @@ export function isTeamWorkerIntegrationStatus(status: unknown): status is TeamWo
 export const TEAM_EVENT_TYPES = [
   'task_completed',
   'task_failed',
+  'task_retried',
   'worker_state_changed',
   'worker_idle',
   'worker_stopped',

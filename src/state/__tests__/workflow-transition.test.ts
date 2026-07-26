@@ -10,7 +10,10 @@ import {
   evaluateWorkflowTransition,
   readActiveWorkflowModes,
 } from '../workflow-transition.js';
-import { reconcileWorkflowTransition } from '../workflow-transition-reconcile.js';
+import {
+  preflightWorkflowTransition,
+  reconcileWorkflowTransition,
+} from '../workflow-transition-reconcile.js';
 
 const STATE_ENV_KEYS = [
   'OMX_ROOT',
@@ -386,6 +389,61 @@ describe('workflow transition rules', () => {
         const boxedMode = JSON.parse(await readFile(join(sessionDir, 'deep-interview-state.json'), 'utf-8')) as Record<string, unknown>;
         assert.equal(boxedMode.active, true);
         assert.equal(boxedMode.current_phase, 'interviewing');
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('binds dry-run transitions to action, cwd, session, and state root', async () => {
+    await withIsolatedStateEnv(async () => {
+      const root = await mkdtemp(join(tmpdir(), 'omx-workflow-preflight-binding-'));
+      try {
+        const wd = join(root, 'source');
+        const otherWd = join(root, 'other-source');
+        const baseStateDir = join(root, 'state');
+        const otherStateDir = join(root, 'other-state');
+        await mkdir(wd, { recursive: true });
+        await mkdir(otherWd, { recursive: true });
+        const preflight = await preflightWorkflowTransition(wd, 'team', {
+          action: 'start',
+          baseStateDir,
+          currentModes: [],
+        });
+
+        await assert.rejects(
+          reconcileWorkflowTransition(wd, 'team', {
+            action: 'activate',
+            baseStateDir,
+            preflight,
+          }),
+          /workflow_transition_preflight_action_mismatch/,
+        );
+        await assert.rejects(
+          reconcileWorkflowTransition(otherWd, 'team', {
+            action: 'start',
+            baseStateDir,
+            preflight,
+          }),
+          /workflow_transition_preflight_cwd_mismatch/,
+        );
+        await assert.rejects(
+          reconcileWorkflowTransition(wd, 'team', {
+            action: 'start',
+            sessionId: 'other-session',
+            baseStateDir,
+            preflight,
+          }),
+          /workflow_transition_preflight_session_mismatch/,
+        );
+        await assert.rejects(
+          reconcileWorkflowTransition(wd, 'team', {
+            action: 'start',
+            baseStateDir: otherStateDir,
+            preflight,
+          }),
+          /workflow_transition_preflight_state_root_mismatch/,
+        );
       } finally {
         await rm(root, { recursive: true, force: true });
       }

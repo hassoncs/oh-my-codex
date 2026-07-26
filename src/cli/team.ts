@@ -1,12 +1,11 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  assertModeStartAllowed,
   updateModeState,
   startMode,
   readModeState,
 } from '../modes/base.js';
-import { getStateFilePath, getStatePath, resolveStateScope, validateSessionId } from '../mcp/state-paths.js';
+import { getBaseStateDir, getStateFilePath, getStatePath, resolveStateScope, validateSessionId } from '../mcp/state-paths.js';
 import { monitorTeam, resumeTeam, shutdownTeam, startTeam, type TeamRuntime, type TeamSnapshot } from '../team/runtime.js';
 import { buildRepoAwareTeamExecutionPlan } from '../team/repo-aware-decomposition.js';
 import { DEFAULT_MAX_WORKERS } from '../team/state.js';
@@ -49,7 +48,10 @@ import {
   renderUltragoalCheckpointGuidanceText,
 } from '../team/ultragoal-context.js';
 import { resolveCodexHomeForLaunch } from './codex-home.js';
-import { readActiveWorkflowModes } from '../state/workflow-transition.js';
+import {
+  preflightWorkflowTransition,
+  type PreflightedWorkflowTransition,
+} from '../state/workflow-transition-reconcile.js';
 
 interface TeamCliOptions {
   verbose?: boolean;
@@ -76,6 +78,11 @@ interface TeamFollowupContext {
   agentType?: string;
   explicitAgentType?: boolean;
   approvedHint?: ApprovedExecutionLaunchHint;
+}
+
+export interface TeamModeStartPreflight {
+  allowNestedAutopilotTeam: boolean;
+  workflowTransition: PreflightedWorkflowTransition;
 }
 
 function persistExactTeamModeState(
@@ -1247,7 +1254,7 @@ function distributeTasksToWorkers(
 async function ensureTeamModeState(
   parsed: ParsedTeamArgs,
   tasks?: Array<{ role?: string }>,
-  allowNestedAutopilotTeam = false,
+  preflight?: TeamModeStartPreflight,
 ): Promise<void> {
   const fallbackRole = resolveImplicitTeamFallbackRole(parsed.agentType, parsed.explicitAgentType);
   const roleDistribution = tasks && tasks.length > 0
@@ -1283,7 +1290,10 @@ async function ensureTeamModeState(
     return;
   }
 
-  await startMode('team', parsed.task, 50, undefined, { allowNestedAutopilotTeam });
+  await startMode('team', parsed.task, 50, undefined, {
+    allowNestedAutopilotTeam: preflight?.allowNestedAutopilotTeam,
+    preflightTransition: preflight?.workflowTransition,
+  });
   await updateModeState('team', {
     active,
     current_phase: currentPhase,
@@ -1299,16 +1309,18 @@ async function ensureTeamModeState(
 
 }
 
-export async function preflightTeamModeStart(cwd: string = process.cwd()): Promise<boolean> {
+export async function preflightTeamModeStart(cwd: string = process.cwd()): Promise<TeamModeStartPreflight> {
   const scope = await resolveStateScope(cwd);
-  const activeModes = await readActiveWorkflowModes(cwd, scope.sessionId);
-  if (!activeModes.includes('autopilot')) {
-    await assertModeStartAllowed('team', cwd);
-    return false;
-  }
-
-  await assertModeStartAllowed('team', cwd, { allowNestedAutopilotTeam: true });
-  return true;
+  const transition = await preflightWorkflowTransition(cwd, 'team', {
+    action: 'start',
+    sessionId: scope.sessionId,
+    baseStateDir: getBaseStateDir(cwd),
+    allowNestedAutopilotTeam: true,
+  });
+  return {
+    allowNestedAutopilotTeam: transition.currentModes.includes('autopilot'),
+    workflowTransition: transition,
+  };
 }
 
 async function persistTeamShutdownModeState(
@@ -1691,7 +1703,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
   if (subcommand === 'resume') {
     const name = teamArgs[1];
     if (!name) throw new Error('Usage: omx team resume <team-name>');
-    const allowNestedAutopilotTeam = await preflightTeamModeStart(cwd);
+    const modePreflight = await preflightTeamModeStart(cwd);
     const runtime = await resumeTeam(name, cwd);
     if (!runtime) {
       console.log(`No resumable team found for ${name}`);
@@ -1706,7 +1718,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       teamName: runtime.teamName,
       displayName: runtime.config.display_name ?? runtime.teamName,
       allowRepoAwareDagHandoff: false,
-    }, undefined, allowNestedAutopilotTeam);
+    }, undefined, modePreflight);
     const availableAgentTypes = await resolveAvailableAgentTypes(cwd);
     const staffingPlan = buildFollowupStaffingPlan('team', runtime.config.task, availableAgentTypes, {
       workerCount: runtime.config.worker_count,
@@ -1772,7 +1784,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
     fallbackRole: resolveImplicitTeamFallbackRole(parsed.agentType, parsed.explicitAgentType),
     codexHomeOverride,
   });
-  const allowNestedAutopilotTeam = await preflightTeamModeStart(cwd);
+  const modePreflight = await preflightTeamModeStart(cwd);
   const runtime = await startTeam(
     parsed.teamName,
     parsed.task,
@@ -1791,7 +1803,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
   await ensureTeamModeState(
     { ...effectiveParsed, teamName: runtime.teamName, displayName: runtime.config.display_name ?? effectiveParsed.displayName },
     tasks,
-    allowNestedAutopilotTeam,
+    modePreflight,
   );
   if (executionPlan.overOrchestrationNotice) {
     console.log(`${executionPlan.overOrchestrationNotice.code}: ${executionPlan.overOrchestrationNotice.message}`);

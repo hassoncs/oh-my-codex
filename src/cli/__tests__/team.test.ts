@@ -33,10 +33,11 @@ import {
 import { writePersistedTeamUltragoalContext } from '../../team/ultragoal-context.js';
 import { isRealTmuxAvailable, withTempTmuxSession, type TempTmuxSessionFixture } from '../../team/__tests__/tmux-test-fixture.js';
 
-const COMPILED_OMX_CLI_PATH = fileURLToPath(new URL('../omx.js', import.meta.url));
-const OMX_CLI_PATH = existsSync(COMPILED_OMX_CLI_PATH)
-  ? COMPILED_OMX_CLI_PATH
-  : fileURLToPath(new URL('../omx.ts', import.meta.url));
+function resolveTeamTestCliPath(testModuleUrl: string): string {
+  return fileURLToPath(new URL(testModuleUrl.endsWith('.ts') ? '../omx.ts' : '../omx.js', testModuleUrl));
+}
+
+const OMX_CLI_PATH = resolveTeamTestCliPath(import.meta.url);
 const OMX_CLI_NODE_ARGS = OMX_CLI_PATH.endsWith('.ts') ? ['--import', import.meta.resolve('tsx')] : [];
 const ORIGINAL_OMX_TEAM_WORKER = process.env.OMX_TEAM_WORKER;
 const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
@@ -1754,6 +1755,11 @@ esac
 });
 
 describe('teamCommand api', () => {
+  it('runs source tests against TypeScript even when compiled output exists', () => {
+    const sourceTestUrl = new URL('./team.test.ts', import.meta.url).href;
+    assert.match(resolveTeamTestCliPath(sourceTestUrl), /\/src\/cli\/omx\.ts$/);
+  });
+
   it('builds leader monitoring hints that keep team status visible while ON', () => {
     const hints = buildLeaderMonitoringHints('My Team');
     assert.equal(hints[0], 'leader_check: omx team status my-team');

@@ -7,13 +7,12 @@ import { readFile, writeFile, mkdir, readdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { withModeRuntimeContext } from '../state/mode-state-context.js';
 import {
-  assertWorkflowTransitionAllowed,
   isTrackedWorkflowMode,
-  readActiveWorkflowModes,
   type WorkflowTransitionOptions,
 } from '../state/workflow-transition.js';
 import {
-  assertWorkflowTransitionContextAllowed,
+  type PreflightedWorkflowTransition,
+  preflightWorkflowTransition,
   reconcileWorkflowTransition,
 } from '../state/workflow-transition-reconcile.js';
 import { syncCanonicalSkillStateForMode } from '../state/skill-active.js';
@@ -58,7 +57,9 @@ export interface UpdateModeStateOptions {
   trustedPipelineProgress?: boolean;
 }
 
-export type StartModeOptions = WorkflowTransitionOptions;
+export interface StartModeOptions extends WorkflowTransitionOptions {
+  preflightTransition?: PreflightedWorkflowTransition;
+}
 
 const DEPRECATED_MODES: Record<DeprecatedModeName, string> = {
   ultrapilot: 'Use "team" instead. ultrapilot has been merged into team mode.',
@@ -153,13 +154,12 @@ export async function assertModeStartAllowed(
   if (!isTrackedWorkflowMode(mode)) return;
   const scope = await resolveStateScope(projectRoot);
   const cwd = projectRoot ?? process.cwd();
-  const activeModes = await readActiveWorkflowModes(cwd, scope.sessionId);
-  await assertWorkflowTransitionContextAllowed(cwd, activeModes, mode, {
+  await preflightWorkflowTransition(cwd, mode, {
+    action: 'start',
     sessionId: scope.sessionId,
     baseStateDir: getBaseStateDir(projectRoot),
     allowNestedAutopilotTeam: options.allowNestedAutopilotTeam,
   });
-  assertWorkflowTransitionAllowed(activeModes, mode, 'start', options);
 }
 
 /**
@@ -185,6 +185,7 @@ export async function startMode(
       source: 'startMode',
       baseStateDir,
       allowNestedAutopilotTeam: options.allowNestedAutopilotTeam,
+      preflight: options.preflightTransition,
     });
     transitionMessage = transition.transitionMessage;
   }

@@ -69,6 +69,16 @@ import type { TeamReminderIntent } from './reminder-intents.js';
 import type { WorktreeMode } from './worktree.js';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
 import { normalizeTeamTaskCoordinationPlanForStorage } from './coordination-protocol.js';
+import { readModeState, startMode, updateModeState } from '../modes/base.js';
+import { reconcilePhaseStateForMonitor } from './phase-controller.js';
+import {
+  getBaseStateDir,
+  getReadScopedStatePaths,
+  getStateFilePath,
+  resolveStateScope,
+} from '../mcp/state-paths.js';
+import { preflightWorkflowTransition } from '../state/workflow-transition-reconcile.js';
+import { getSkillActiveStatePathsForStateDir } from '../state/skill-active.js';
 
 export type { TeamDispatchRequestStatus, TeamWorkerIntegrationStatus } from './contracts.js';
 
@@ -1475,13 +1485,47 @@ export async function releaseTaskClaim(
   });
 }
 
+async function snapshotRetryWorkflowState(
+  teamName: string,
+  cwd: string,
+): Promise<() => Promise<void>> {
+  const scope = await resolveStateScope(cwd);
+  const baseStateDir = getBaseStateDir(cwd);
+  const modePaths = await getReadScopedStatePaths('team', cwd, scope.sessionId);
+  const skillPaths = getSkillActiveStatePathsForStateDir(baseStateDir, scope.sessionId);
+  const paths = [...new Set([
+    teamPhasePath(teamName, cwd),
+    ...modePaths,
+    getStateFilePath('run-state.json', cwd, scope.sessionId),
+    skillPaths.rootPath,
+    ...(skillPaths.sessionPath ? [skillPaths.sessionPath] : []),
+  ])];
+  const snapshots = await Promise.all(paths.map(async (path) => ({
+    path,
+    content: await readFile(path, 'utf-8').catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    }),
+  })));
+
+  return async () => {
+    for (const snapshot of snapshots) {
+      if (snapshot.content === null) {
+        await rm(snapshot.path, { force: true });
+      } else {
+        await writeAtomic(snapshot.path, snapshot.content);
+      }
+    }
+  };
+}
+
 export async function retryFailedTask(
   teamName: string,
   taskId: string,
   expectedVersion: number,
   cwd: string
 ): Promise<RetryFailedTaskResult> {
-  return await retryFailedTaskImpl(taskId, expectedVersion, {
+  const result = await retryFailedTaskImpl(taskId, expectedVersion, {
     teamName,
     cwd,
     readTask,
@@ -1491,7 +1535,75 @@ export async function retryFailedTask(
     isTerminalTaskStatus,
     taskFilePath,
     writeAtomic,
+    beforeRetry: async () => {
+      const rollback = await snapshotRetryWorkflowState(teamName, cwd);
+      try {
+        const phase = await readTeamPhase(teamName, cwd);
+        await writeTeamPhase(teamName, reconcilePhaseStateForMonitor(phase, 'team-exec'), cwd);
+
+        const modeState = await readModeState('team', cwd);
+        const stateTeamName = typeof modeState?.team_name === 'string' ? modeState.team_name.trim() : '';
+        if (stateTeamName && stateTeamName !== teamName) {
+          throw new Error(`team_retry_mode_state_mismatch:${stateTeamName}:${teamName}`);
+        }
+        if (modeState) {
+          await updateModeState('team', {
+            active: true,
+            current_phase: 'team-exec',
+            completed_at: undefined,
+            error: undefined,
+            cancel_reason: undefined,
+            lifecycle_outcome: undefined,
+            terminal_outcome: undefined,
+            terminal_reason: undefined,
+            team_name: teamName,
+          }, cwd);
+          return rollback;
+        }
+
+        const scope = await resolveStateScope(cwd);
+        const transition = await preflightWorkflowTransition(cwd, 'team', {
+          action: 'start',
+          sessionId: scope.sessionId,
+          baseStateDir: getBaseStateDir(cwd),
+          allowNestedAutopilotTeam: true,
+        });
+        const config = await readTeamConfig(teamName, cwd);
+        await startMode('team', config?.task ?? `Retry failed task ${taskId}`, 50, cwd, {
+          allowNestedAutopilotTeam: transition.currentModes.includes('autopilot'),
+          preflightTransition: transition,
+        });
+        await updateModeState('team', {
+          current_phase: 'team-exec',
+          team_name: teamName,
+        }, cwd);
+        return rollback;
+      } catch (error) {
+        try {
+          await rollback();
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [error, rollbackError],
+            'retry_failed_task_workflow_reactivation_and_rollback_failed',
+          );
+        }
+        throw error;
+      }
+    },
   });
+  if (!result.ok) return result;
+
+  await appendTeamEvent(teamName, {
+    type: 'task_retried',
+    worker: 'leader-fixed',
+    task_id: taskId,
+    reason: 'failed_task_requeued',
+    metadata: {
+      previous_version: expectedVersion,
+      retry_version: result.task.version,
+    },
+  }, cwd);
+  return result;
 }
 
 export async function reclaimExpiredTaskClaim(

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, rm, writeFile, readFile, mkdir, utimes } from 'fs/promises';
+import { chmod, mkdtemp, rename, rm, writeFile, readFile, mkdir, utimes } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync, readFileSync } from 'fs';
@@ -44,10 +44,15 @@ import {
   transitionDispatchRequest,
   readDispatchRequest,
   readMonitorSnapshot,
+  readTeamPhase,
   resolveDispatchLockTimeoutMs,
+  teamEventLogPath,
+  writeTeamPhase,
   writeTeamManifestV2,
 } from '../state.js';
 import { normalizeDispatchRequest } from '../state/dispatch.js';
+import { readModeState, startMode, updateModeState } from '../../modes/base.js';
+import { listActiveSkills, readVisibleSkillActiveState } from '../../state/skill-active.js';
 
 const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
 
@@ -1434,6 +1439,20 @@ exit 1
       );
       assert.equal(failed.ok, true);
       if (!failed.ok) return;
+      await startMode('team', 'retry lifecycle', 5, cwd);
+      await updateModeState('team', {
+        active: false,
+        current_phase: 'failed',
+        completed_at: new Date().toISOString(),
+        error: 'old failure',
+      }, cwd);
+      await writeTeamPhase('team-retry-failed', {
+        current_phase: 'failed',
+        max_fix_attempts: 3,
+        current_fix_attempt: 3,
+        transitions: [],
+        updated_at: new Date().toISOString(),
+      }, cwd);
 
       const stale = await retryFailedTask('team-retry-failed', t.id, failed.task.version - 1, cwd);
       assert.deepEqual(stale, { ok: false, error: 'claim_conflict' });
@@ -1467,6 +1486,20 @@ exit 1
         },
       );
       assert.match(retried.task.attempt_history?.[0]?.recorded_at ?? '', /^\d{4}-\d{2}-\d{2}T/);
+      assert.equal((await readTeamPhase('team-retry-failed', cwd))?.current_phase, 'team-exec');
+      const modeState = await readModeState('team', cwd);
+      assert.equal(modeState?.active, true);
+      assert.equal(modeState?.current_phase, 'team-exec');
+      assert.equal(modeState?.completed_at, undefined);
+      assert.equal(modeState?.error, undefined);
+      const canonical = await readVisibleSkillActiveState(cwd);
+      assert.equal(listActiveSkills(canonical ?? {}).some((entry) => entry.skill === 'team'), true);
+      const events = (await readFile(teamEventLogPath('team-retry-failed', cwd), 'utf-8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      assert.equal(events.at(-1)?.type, 'task_retried');
+      assert.equal(events.at(-1)?.task_id, t.id);
 
       const duplicate = await retryFailedTask('team-retry-failed', t.id, retried.task.version, cwd);
       assert.deepEqual(duplicate, { ok: false, error: 'invalid_transition' });
@@ -1498,6 +1531,121 @@ exit 1
       assert.deepEqual(retried, { ok: false, error: 'invalid_transition' });
       assert.equal((await readTask('team-retry-completed', t.id, cwd))?.status, 'completed');
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('retryFailedTask creates visible Team mode when legacy state lacks mode state', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-missing-mode-'));
+    try {
+      await initTeamState('team-retry-missing-mode', 'retry missing mode', 'executor', 1, cwd);
+      const task = await createTask('team-retry-missing-mode', {
+        subject: 'retry',
+        description: 'retry',
+        status: 'pending',
+      }, cwd);
+      const claim = await claimTask('team-retry-missing-mode', task.id, 'worker-1', task.version, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+      const failed = await transitionTaskStatus(
+        'team-retry-missing-mode',
+        task.id,
+        'in_progress',
+        'failed',
+        claim.claimToken,
+        cwd,
+        { error: 'failed once' },
+      );
+      assert.equal(failed.ok, true);
+      if (!failed.ok) return;
+      await writeTeamPhase('team-retry-missing-mode', {
+        current_phase: 'failed',
+        max_fix_attempts: 3,
+        current_fix_attempt: 3,
+        transitions: [],
+        updated_at: new Date().toISOString(),
+      }, cwd);
+      assert.equal(await readModeState('team', cwd), null);
+
+      const retried = await retryFailedTask(
+        'team-retry-missing-mode',
+        task.id,
+        failed.task.version,
+        cwd,
+      );
+      assert.equal(retried.ok, true);
+      assert.equal((await readModeState('team', cwd))?.active, true);
+      const canonical = await readVisibleSkillActiveState(cwd);
+      assert.equal(listActiveSkills(canonical ?? {}).some((entry) => entry.skill === 'team'), true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('retryFailedTask restores terminal workflow state when task rewrite fails', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-write-failure-'));
+    try {
+      const teamName = 'team-retry-write-failure';
+      await initTeamState(teamName, 'retry write failure', 'executor', 1, cwd);
+      const task = await createTask(teamName, {
+        subject: 'retry',
+        description: 'retry',
+        status: 'pending',
+      }, cwd);
+      const claim = await claimTask(teamName, task.id, 'worker-1', task.version, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+      const failed = await transitionTaskStatus(
+        teamName,
+        task.id,
+        'in_progress',
+        'failed',
+        claim.claimToken,
+        cwd,
+        { error: 'failed once' },
+      );
+      assert.equal(failed.ok, true);
+      if (!failed.ok) return;
+      await startMode('team', 'retry write failure', 5, cwd);
+      await updateModeState('team', {
+        active: false,
+        current_phase: 'failed',
+        completed_at: new Date().toISOString(),
+        error: 'failed once',
+        team_name: teamName,
+      }, cwd);
+      await writeTeamPhase(teamName, {
+        current_phase: 'failed',
+        max_fix_attempts: 3,
+        current_fix_attempt: 3,
+        transitions: [],
+        updated_at: new Date().toISOString(),
+      }, cwd);
+      const modePath = join(cwd, '.omx', 'state', 'team-state.json');
+      const phasePath = join(cwd, '.omx', 'state', 'team', teamName, 'phase.json');
+      const canonicalPath = join(cwd, '.omx', 'state', 'skill-active-state.json');
+      const beforeMode = await readFile(modePath, 'utf-8');
+      const beforePhase = await readFile(phasePath, 'utf-8');
+      const beforeCanonical = await readFile(canonicalPath, 'utf-8');
+
+      setWriteAtomicRenameForTests(async (from, to) => {
+        if (String(to).endsWith(`/tasks/task-${task.id}.json`)) {
+          throw Object.assign(new Error('simulated task write failure'), { code: 'ENOSPC' });
+        }
+        await rename(from, to);
+      });
+      await assert.rejects(
+        () => retryFailedTask(teamName, task.id, failed.task.version, cwd),
+        /simulated task write failure/,
+      );
+      resetWriteAtomicRenameForTests();
+
+      assert.equal((await readTask(teamName, task.id, cwd))?.status, 'failed');
+      assert.equal(await readFile(modePath, 'utf-8'), beforeMode);
+      assert.equal(await readFile(phasePath, 'utf-8'), beforePhase);
+      assert.equal(await readFile(canonicalPath, 'utf-8'), beforeCanonical);
+    } finally {
+      resetWriteAtomicRenameForTests();
       await rm(cwd, { recursive: true, force: true });
     }
   });

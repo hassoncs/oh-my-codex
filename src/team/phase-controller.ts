@@ -6,7 +6,7 @@ import {
   type TeamState,
   type TerminalPhase,
 } from './orchestrator.js';
-import { type TeamPhaseState } from './state.js';
+import { type TeamPhaseState } from './state/types.js';
 
 export function inferPhaseTargetFromTaskCounts(
   taskCounts: { pending: number; blocked: number; in_progress: number; failed: number },

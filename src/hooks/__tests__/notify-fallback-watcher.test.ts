@@ -11,6 +11,19 @@ import { buildTmuxSessionName, buildWindowsMsysBackgroundHelperBootstrapScript }
 import { writeSessionStart } from '../session.js';
 
 const DEFAULT_AUTO_NUDGE_RESPONSE = 'continue with the current task only if it is already authorized';
+const SOURCE_TEST_MODE = import.meta.url.endsWith('.ts');
+const WATCHER_TEST_SCRIPT = new URL(
+  SOURCE_TEST_MODE
+    ? './fixtures/run-notify-fallback-watcher.mjs'
+    : '../../../dist/scripts/notify-fallback-watcher.js',
+  import.meta.url,
+).pathname;
+const NOTIFY_HOOK_TEST_SCRIPT = new URL(
+  SOURCE_TEST_MODE
+    ? './fixtures/run-notify-hook.mjs'
+    : '../../../dist/scripts/notify-hook.js',
+  import.meta.url,
+).pathname;
 const INHERITED_OMX_ENV_KEYS = [
   'OMX_ROOT',
   'OMX_STATE_ROOT',
@@ -504,8 +517,8 @@ describe('notify-fallback watcher', () => {
     const sessionDir = todaySessionDir(tempHome);
     const foreignRolloutPath = join(sessionDir, `rollout-test-fallback-deep-idle-${sid}.jsonl`);
     const oversizedRolloutPath = join(sessionDir, `rollout-test-fallback-deep-idle-oversized-${sid}.jsonl`);
-    const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-    const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+    const watcherScript = WATCHER_TEST_SCRIPT;
+    const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
     const watcherStatePath = join(wd, '.omx', 'state', 'notify-fallback-state.json');
     let child: ReturnType<typeof spawn> | undefined;
 
@@ -583,8 +596,8 @@ describe('notify-fallback watcher', () => {
     const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-deep-idle-locked-home-'));
     const stateDir = join(wd, '.omx', 'state');
     const watcherStatePath = join(stateDir, 'notify-fallback-state.json');
-    const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-    const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+    const watcherScript = WATCHER_TEST_SCRIPT;
+    const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
     let child: ReturnType<typeof spawn> | undefined;
 
     try {
@@ -824,8 +837,8 @@ describe('notify-fallback watcher', () => {
         },
       ].map(v => JSON.stringify(v)).join('\n')}\n`);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -926,8 +939,8 @@ describe('notify-fallback watcher', () => {
         },
       ].map((value) => JSON.stringify(value)).join('\n')}\n`);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -993,8 +1006,8 @@ describe('notify-fallback watcher', () => {
         },
       ].map((value) => JSON.stringify(value)).join('\n')}\n`);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -1061,8 +1074,8 @@ describe('notify-fallback watcher', () => {
         },
       ].map((value) => JSON.stringify(value)).join('\n')}\n`);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -1136,8 +1149,8 @@ describe('notify-fallback watcher', () => {
         },
       })}\n`);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       child = spawn(
         process.execPath,
         [watcherScript, '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '75'],
@@ -1308,8 +1321,8 @@ describe('notify-fallback watcher', () => {
         },
       ].map((value) => JSON.stringify(value)).join('\n')}\n`);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -1419,8 +1432,8 @@ describe('notify-fallback watcher', () => {
         },
       ].map((value) => JSON.stringify(value)).join('\n')}\n`);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -1514,8 +1527,8 @@ describe('notify-fallback watcher', () => {
         },
       ].map((value) => JSON.stringify(value)).join('\n')}\n`);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -1570,8 +1583,8 @@ describe('notify-fallback watcher', () => {
       ];
       await writeFile(rolloutPath, `${lines.map(v => JSON.stringify(v)).join('\n')}\n`);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50', '--log-max-bytes', '1'],
@@ -1623,8 +1636,8 @@ describe('notify-fallback watcher', () => {
 `
       );
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const watcherStatePath = join(wd, '.omx', 'state', 'notify-fallback-state.json');
       const turnLog = join(wd, '.omx', 'logs', `turns-${new Date().toISOString().split('T')[0]}.jsonl`);
       const child = spawn(
@@ -1704,8 +1717,8 @@ describe('notify-fallback watcher', () => {
         })}\n`
       );
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const watcherStatePath = join(wd, '.omx', 'state', 'notify-fallback-state.json');
       const turnLog = join(wd, '.omx', 'logs', `turns-${new Date().toISOString().split('T')[0]}.jsonl`);
       const child = spawn(
@@ -1802,8 +1815,8 @@ describe('notify-fallback watcher', () => {
         }\n`
       );
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const watcherStatePath = join(wd, '.omx', 'state', 'notify-fallback-state.json');
       const turnLog = join(wd, '.omx', 'logs', `turns-${new Date().toISOString().split('T')[0]}.jsonl`);
       const child = spawn(
@@ -1865,8 +1878,8 @@ describe('notify-fallback watcher', () => {
         trigger_message: 'dispatch ping',
       }, wd);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50', '--dispatch-max-per-tick', '1'],
@@ -1899,8 +1912,8 @@ describe('notify-fallback watcher', () => {
       await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
       await mkdir(join(wd, '.omx', 'state'), { recursive: true });
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--authority-only', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -1948,8 +1961,8 @@ describe('notify-fallback watcher', () => {
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--authority-only', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -2007,8 +2020,8 @@ describe('notify-fallback watcher', () => {
         dispatch_drain: { last_tick_at: new Date().toISOString() },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--authority-only', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -2072,8 +2085,8 @@ describe('notify-fallback watcher', () => {
         dispatch_drain: { last_tick_at: new Date().toISOString() },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--authority-only', '--cwd', aliasWd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -2136,8 +2149,8 @@ describe('notify-fallback watcher', () => {
         leader_pane_id: '%42',
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook],
@@ -2207,8 +2220,8 @@ describe('notify-fallback watcher', () => {
         leader_pane_id: '%42',
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook],
@@ -2254,8 +2267,8 @@ describe('notify-fallback watcher', () => {
         leader_pane_id: '%42',
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook],
@@ -2314,8 +2327,8 @@ describe('notify-fallback watcher', () => {
       await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook],
@@ -2357,8 +2370,8 @@ describe('notify-fallback watcher', () => {
       await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook],
@@ -2417,8 +2430,8 @@ describe('notify-fallback watcher', () => {
         ],
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook],
@@ -2627,8 +2640,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook],
@@ -2682,8 +2695,8 @@ exit 0
         last_agent_output: 'Keep going and finish the cleanup from here.',
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -2742,8 +2755,8 @@ exit 0
         last_agent_output: 'Keep going and finish the cleanup from here.',
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -2789,8 +2802,8 @@ exit 0
         last_agent_output: 'Keep going and finish the cleanup from here.',
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -2843,8 +2856,8 @@ exit 0
         last_agent_output: 'Keep going and finish the cleanup from here.',
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -2902,8 +2915,8 @@ exit 0
         lastSemanticSignature: 'stall:proceed_intent',
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -2961,8 +2974,8 @@ exit 0
         lastSemanticSignature: 'stall:proceed_intent',
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -3003,8 +3016,8 @@ exit 0
         worker_index: 1,
         trigger_message: 'dispatch ping',
       }, wd);
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50', '--dispatch-max-per-tick', '1'],
@@ -3033,8 +3046,8 @@ exit 0
         worker_index: 1,
         trigger_message: 'dispatch ping',
       }, wd);
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50', '--dispatch-max-per-tick', '1'],
@@ -3083,8 +3096,8 @@ exit 0
         trigger_message: 'ping',
       }, wd);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const env = {
         ...buildCleanNotifyEnv(),
         PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
@@ -3149,8 +3162,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const env = {
         ...buildCleanNotifyEnv(),
         PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
@@ -3233,8 +3246,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const env = {
         ...buildCleanNotifyEnv(),
         PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
@@ -3283,8 +3296,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const env = {
         ...buildCleanNotifyEnv(),
         PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
@@ -3337,8 +3350,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const run = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -3420,8 +3433,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const env = {
         ...buildCleanNotifyEnv(),
         PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
@@ -3470,8 +3483,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const env = {
         ...buildCleanNotifyEnv(),
         PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
@@ -3532,8 +3545,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const env = {
         ...buildCleanNotifyEnv(),
         PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
@@ -3600,8 +3613,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const run = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -3763,8 +3776,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const run = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -3829,8 +3842,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const run = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -3900,8 +3913,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const run = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -3972,8 +3985,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const run = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -4029,8 +4042,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const env = {
         ...buildCleanNotifyEnv(),
         PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
@@ -4090,8 +4103,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const env = {
         ...buildCleanNotifyEnv(),
         PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
@@ -4150,8 +4163,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const run = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -4202,8 +4215,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const env = {
         ...buildCleanNotifyEnv(),
         PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
@@ -4279,8 +4292,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const run = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -4331,8 +4344,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const run = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -4382,8 +4395,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const env = {
         ...buildCleanNotifyEnv(),
         PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
@@ -4459,8 +4472,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const result = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50', '--dispatch-max-per-tick', '1'],
@@ -4532,8 +4545,8 @@ exit 0
         trigger_message: 'ping',
       }, wd);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const env = {
         ...buildCleanNotifyEnv(),
         PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
@@ -4567,8 +4580,8 @@ exit 0
   it('exits when the tracked parent pid is gone', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-parent-exit-'));
     const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-parent-home-'));
-    const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-    const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+    const watcherScript = WATCHER_TEST_SCRIPT;
+    const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
     const logPath = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
     let child: ReturnType<typeof spawn> | undefined;
 
@@ -4622,7 +4635,7 @@ exit 0
   it('prints notify script missing errors to stderr for authority-only ticks', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-authority-missing-script-'));
     const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-authority-missing-home-'));
-    const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+    const watcherScript = WATCHER_TEST_SCRIPT;
     const missingNotifyHook = join(wd, 'dist', 'scripts', 'missing-notify-hook.js');
     try {
       const run = spawnSync(
@@ -4657,8 +4670,8 @@ exit 0
   it('prints fatal watcher errors to stderr for authority-only ticks', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-authority-fatal-'));
     const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-authority-fatal-home-'));
-    const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-    const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+    const watcherScript = WATCHER_TEST_SCRIPT;
+    const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
     try {
       const run = spawnSync(
         process.execPath,
@@ -4723,8 +4736,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const run = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -4773,8 +4786,8 @@ exit 0
         },
       }, null, 2));
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const run = spawnSync(
         process.execPath,
         [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
@@ -4808,8 +4821,8 @@ exit 0
     const sessionId = 'sess-active-ralph';
     const sessionStateDir = join(stateDir, 'sessions', sessionId);
     const ralphStatePath = join(sessionStateDir, 'ralph-state.json');
-    const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-    const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+    const watcherScript = WATCHER_TEST_SCRIPT;
+    const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
     const logPath = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
     let child: ReturnType<typeof spawn> | undefined;
 
@@ -4924,8 +4937,8 @@ exit 0
       await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const logPath = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
 
       const shortLivedParent = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 10)'], {
@@ -5015,8 +5028,8 @@ exit 0
       await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const logPath = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
 
       const shortLivedParent = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 10)'], {
@@ -5088,8 +5101,8 @@ exit 0
       await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const logPath = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
 
       const shortLivedParent = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 10)'], {
@@ -5180,8 +5193,8 @@ exit 0
       await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const logPath = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
 
       const shortLivedParent = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 10)'], {
@@ -5264,8 +5277,8 @@ exit 0
       await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const logPath = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
 
       const shortLivedParent = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 10)'], {
@@ -5347,8 +5360,8 @@ exit 0
       await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
-      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const watcherScript = WATCHER_TEST_SCRIPT;
+      const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
       const logPath = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
 
       const shortLivedParent = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 10)'], {
@@ -5404,8 +5417,8 @@ exit 0
     const replacementTimeoutMs = 20000; // c8-instrumented Node20 full runs can delay watcher handoff well beyond 8s.
     const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-stale-pid-'));
     const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-stale-home-'));
-    const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-    const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+    const watcherScript = WATCHER_TEST_SCRIPT;
+    const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
     const pidPath = join(wd, '.omx', 'state', 'notify-fallback.pid');
     let first: ReturnType<typeof spawn> | undefined;
     let second: ReturnType<typeof spawn> | undefined;
@@ -5501,8 +5514,8 @@ exit 0
     const sid = randomUUID();
     const sessionDir = todaySessionDir(tempHome);
     const rolloutPath = join(sessionDir, `rollout-test-fallback-idle-backoff-${sid}.jsonl`);
-    const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-    const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+    const watcherScript = WATCHER_TEST_SCRIPT;
+    const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
     const watcherStatePath = join(wd, '.omx', 'state', 'notify-fallback-state.json');
     const turnLogPath = join(wd, '.omx', 'logs', `turns-${new Date().toISOString().split('T')[0]}.jsonl`);
     let child: ReturnType<typeof spawn> | undefined;
@@ -5588,8 +5601,8 @@ exit 0
   it('exits after the configured max lifetime', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-max-life-'));
     const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-max-home-'));
-    const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
-    const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+    const watcherScript = WATCHER_TEST_SCRIPT;
+    const notifyHook = NOTIFY_HOOK_TEST_SCRIPT;
     const logPath = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
     let child: ReturnType<typeof spawn> | undefined;
 

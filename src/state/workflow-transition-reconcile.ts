@@ -1,6 +1,6 @@
 import { existsSync } from 'fs';
 import { mkdir, readFile, writeFile } from 'fs/promises';
-import { dirname, join } from 'path';
+import { dirname, join, resolve } from 'path';
 import { getStatePath } from '../mcp/state-paths.js';
 import {
   buildWorkflowTransitionError,
@@ -39,6 +39,16 @@ export interface ReconciledWorkflowTransition {
   transitionMessage?: string;
   autoCompletedModes: TrackedWorkflowMode[];
   completedPaths: string[];
+}
+
+export interface PreflightedWorkflowTransition {
+  action: WorkflowTransitionAction;
+  baseStateDir?: string;
+  cwd: string;
+  decision: WorkflowTransitionDecision;
+  currentModes: TrackedWorkflowMode[];
+  requestedMode: TrackedWorkflowMode;
+  sessionId?: string;
 }
 
 function safeString(value: unknown): string {
@@ -247,24 +257,20 @@ export async function assertWorkflowTransitionContextAllowed(
   }
 }
 
-export async function reconcileWorkflowTransition(
+export async function preflightWorkflowTransition(
   cwd: string,
   requestedMode: TrackedWorkflowMode,
   options: {
     action?: WorkflowTransitionAction;
     sessionId?: string;
-    nowIso?: string;
-    source?: string;
     baseStateDir?: string;
     currentModes?: Iterable<string>;
     allowNestedAutopilotTeam?: boolean;
   } = {},
-): Promise<ReconciledWorkflowTransition> {
+): Promise<PreflightedWorkflowTransition> {
   const {
     action = 'activate',
     sessionId,
-    nowIso = new Date().toISOString(),
-    source = 'workflow-transition',
     baseStateDir,
   } = options;
   if (!options.currentModes) {
@@ -285,6 +291,64 @@ export async function reconcileWorkflowTransition(
   if (!decision.allowed) {
     throw new Error(buildWorkflowTransitionError(currentModes, requestedMode, action));
   }
+
+  return {
+    action,
+    baseStateDir: baseStateDir ? resolve(baseStateDir) : undefined,
+    cwd: resolve(cwd),
+    decision,
+    currentModes,
+    requestedMode,
+    sessionId,
+  };
+}
+
+export async function reconcileWorkflowTransition(
+  cwd: string,
+  requestedMode: TrackedWorkflowMode,
+  options: {
+    action?: WorkflowTransitionAction;
+    sessionId?: string;
+    nowIso?: string;
+    source?: string;
+    baseStateDir?: string;
+    currentModes?: Iterable<string>;
+    allowNestedAutopilotTeam?: boolean;
+    preflight?: PreflightedWorkflowTransition;
+  } = {},
+): Promise<ReconciledWorkflowTransition> {
+  const {
+    action = 'activate',
+    sessionId,
+    nowIso = new Date().toISOString(),
+    source = 'workflow-transition',
+    baseStateDir,
+  } = options;
+  if (options.preflight) {
+    const expectedBaseStateDir = baseStateDir ? resolve(baseStateDir) : undefined;
+    if (options.preflight.requestedMode !== requestedMode) {
+      throw new Error(`workflow_transition_preflight_mode_mismatch:${options.preflight.requestedMode}:${requestedMode}`);
+    }
+    if (options.preflight.action !== action) {
+      throw new Error(`workflow_transition_preflight_action_mismatch:${options.preflight.action}:${action}`);
+    }
+    if (options.preflight.cwd !== resolve(cwd)) {
+      throw new Error('workflow_transition_preflight_cwd_mismatch');
+    }
+    if (options.preflight.sessionId !== sessionId) {
+      throw new Error('workflow_transition_preflight_session_mismatch');
+    }
+    if (options.preflight.baseStateDir !== expectedBaseStateDir) {
+      throw new Error('workflow_transition_preflight_state_root_mismatch');
+    }
+  }
+  const { decision } = options.preflight ?? await preflightWorkflowTransition(cwd, requestedMode, {
+      action,
+      sessionId,
+      baseStateDir,
+      currentModes: options.currentModes,
+      allowNestedAutopilotTeam: options.allowNestedAutopilotTeam,
+    });
 
   const completedPaths: string[] = [];
   for (const sourceMode of decision.autoCompleteModes) {
