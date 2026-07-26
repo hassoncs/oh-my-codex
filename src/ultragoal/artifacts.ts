@@ -13,10 +13,34 @@ import {
   type NativeSubagentSupportEvidence,
 } from '../leader/contract.js';
 
-export const ULTRAGOAL_DIR = '.omx/ultragoal';
-export const ULTRAGOAL_BRIEF = 'brief.md';
-export const ULTRAGOAL_GOALS = 'goals.json';
-export const ULTRAGOAL_LEDGER = 'ledger.jsonl';
+import {
+  ULTRAGOAL_BRIEF,
+  ULTRAGOAL_DIR,
+  ULTRAGOAL_GOALS,
+  ULTRAGOAL_LEDGER,
+  UltragoalRegistryConflictError,
+  archiveFlatRegistry,
+  buildLegacyRunId,
+  buildUltragoalRunId,
+  computeUltragoalBriefHash,
+  describeRegistryConflict,
+  isInheritedOrigin,
+  readActiveRunPointer,
+  ultragoalDir,
+  ultragoalRunDir,
+  writeActiveRunPointer,
+  type UltragoalRunOrigin,
+} from './registry.js';
+
+export {
+  ULTRAGOAL_BRIEF,
+  ULTRAGOAL_DIR,
+  ULTRAGOAL_GOALS,
+  ULTRAGOAL_LEDGER,
+  UltragoalRegistryConflictError,
+  computeUltragoalBriefHash,
+  ultragoalDir,
+};
 const ULTRAGOAL_MUTATION_LOCK = '.mutation.lock';
 
 export type UltragoalStatus = 'pending' | 'in_progress' | 'complete' | 'failed' | 'review_blocked' | 'needs_user_decision';
@@ -170,6 +194,12 @@ export interface UltragoalPlan {
   version: 1;
   createdAt: string;
   updatedAt: string;
+  /** Namespace of this run: `.omx/ultragoal/runs/<runId>/`. Absent on pre-namespacing plans. */
+  runId?: string;
+  /** Stable hash of the brief this run was created from. */
+  briefHash?: string;
+  /** Worktree that created this run, plus any that explicitly adopted it. */
+  origin?: UltragoalRunOrigin;
   briefPath: string;
   goalsPath: string;
   ledgerPath: string;
@@ -220,7 +250,14 @@ export interface CreateUltragoalOptions {
   goals?: Array<{ title?: string; objective: string; tokenBudget?: number }>;
   codexGoalMode?: UltragoalCodexGoalMode;
   now?: Date;
+  /** Legacy escape hatch; equivalent to archiveExisting. */
   force?: boolean;
+  /** Keep the existing registry under runs/<runId>/ and start a fresh namespace. */
+  archiveExisting?: boolean;
+  /** Continue the existing registry in this worktree instead of starting a new run. */
+  adoptExisting?: boolean;
+  /** Start a fresh namespace, leaving the existing run registered but inactive. */
+  newNamespace?: boolean;
 }
 
 export interface StartNextOptions {
@@ -292,10 +329,6 @@ export class UltragoalError extends Error {}
 
 function iso(now = new Date()): string {
   return now.toISOString();
-}
-
-export function ultragoalDir(cwd: string): string {
-  return join(cwd, ULTRAGOAL_DIR);
 }
 
 export function ultragoalBriefPath(cwd: string): string {
@@ -829,8 +862,13 @@ async function withUltragoalMutationLock<T>(cwd: string, operation: () => Promis
 
 async function appendLedger(cwd: string, entry: UltragoalLedgerEntry): Promise<void> {
   await mkdir(ultragoalDir(cwd), { recursive: true });
-  const path = ultragoalLedgerPath(cwd);
-  await appendFile(path, `${JSON.stringify(entry)}\n`);
+  const line = `${JSON.stringify(entry)}\n`;
+  await appendFile(ultragoalLedgerPath(cwd), line);
+  const pointer = await readActiveRunPointer(cwd);
+  if (!pointer) return;
+  const runDir = ultragoalRunDir(cwd, pointer.runId);
+  await mkdir(runDir, { recursive: true });
+  await appendFile(join(runDir, ULTRAGOAL_LEDGER), line);
 }
 
 export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
@@ -844,6 +882,25 @@ export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
   const parsed = JSON.parse(raw) as UltragoalPlan;
   if (parsed.version !== 1 || !Array.isArray(parsed.goals)) {
     throw new UltragoalError(`Invalid ultragoal plan at ${repoRelative(cwd, path)}.`);
+  }
+  if (isInheritedOrigin(parsed.origin, cwd)) {
+    throw new UltragoalRegistryConflictError(
+      [
+        `Refusing to read an ultragoal registry created by a different worktree.`,
+        `  run:          ${parsed.runId ?? 'unknown'}`,
+        `  created in:   ${parsed.origin?.worktreePath}`,
+        `  current tree: ${cwd}`,
+        'A Grove CoW clone inherits .omx state from its source; that registry is not this run.',
+        'Run `omx ultragoal adopt-run` to take ownership here, or start a fresh run with',
+        '`omx ultragoal create-goals --new-namespace`.',
+      ].join('\n'),
+      {
+        reason: 'inherited_worktree',
+        runId: parsed.runId,
+        briefHash: parsed.briefHash,
+        originWorktreePath: parsed.origin?.worktreePath,
+      },
+    );
   }
   if (codexGoalMode(parsed) === 'aggregate' && isLegacyEnumeratedAggregateObjective(parsed.codexObjective)) {
     const previousObjective = parsed.codexObjective;
@@ -863,18 +920,86 @@ export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
   return parsed;
 }
 
+async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
+  const tmpPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`);
+  await rename(tmpPath, path);
+}
+
+/**
+ * The namespaced run directory is canonical; the flat `.omx/ultragoal/goals.json`
+ * is the active-run projection every existing reader (HUD, shutdown gates, state
+ * operations) consumes. One writer, both paths, always together.
+ */
 async function writePlan(cwd: string, plan: UltragoalPlan): Promise<void> {
   await mkdir(ultragoalDir(cwd), { recursive: true });
-  const path = ultragoalGoalsPath(cwd);
-  const tmpPath = `${path}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(tmpPath, `${JSON.stringify(plan, null, 2)}\n`);
-  await rename(tmpPath, path);
+  if (plan.runId) {
+    const runDir = ultragoalRunDir(cwd, plan.runId);
+    await mkdir(runDir, { recursive: true });
+    await writeJsonAtomic(join(runDir, ULTRAGOAL_GOALS), plan);
+  }
+  await writeJsonAtomic(ultragoalGoalsPath(cwd), plan);
+}
+
+async function readExistingPlanForConflictCheck(cwd: string): Promise<UltragoalPlan | null> {
+  if (!existsSync(ultragoalGoalsPath(cwd))) return null;
+  try {
+    return JSON.parse(await readFile(ultragoalGoalsPath(cwd), 'utf-8')) as UltragoalPlan;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Refuse to silently capture a new run with a registry that belongs to someone
+ * else: a different brief, a pre-namespacing registry, or a registry inherited
+ * from the worktree this tree was CoW-cloned from.
+ */
+async function resolveRegistryDisposition(
+  cwd: string,
+  briefHash: string,
+  options: CreateUltragoalOptions,
+): Promise<{ adopt: UltragoalPlan | null; archivedTo: string | null }> {
+  const existing = await readExistingPlanForConflictCheck(cwd);
+  if (!existing) return { adopt: null, archivedTo: null };
+
+  const pointer = await readActiveRunPointer(cwd);
+  const conflict = describeRegistryConflict({
+    cwd,
+    briefHash,
+    existingBriefHash: existing.briefHash,
+    existingRunId: existing.runId ?? pointer?.runId,
+    existingOrigin: existing.origin ?? pointer?.origin,
+    unnamespacedLegacyRegistry: !existing.runId,
+  });
+
+  const archive = options.archiveExisting || options.force;
+  if (!conflict && !options.newNamespace && !archive) {
+    // Same brief, same worktree: this is a resume of the same run.
+    return { adopt: existing, archivedTo: null };
+  }
+  if (options.adoptExisting) return { adopt: existing, archivedTo: null };
+  if (!archive && !options.newNamespace && conflict) {
+    throw new UltragoalRegistryConflictError(conflict.message, {
+      reason: conflict.reason,
+      runId: existing.runId ?? pointer?.runId,
+      briefHash: existing.briefHash,
+      originWorktreePath: (existing.origin ?? pointer?.origin)?.worktreePath,
+    });
+  }
+  const archivedTo = archive
+    ? await archiveFlatRegistry(cwd, existing.runId ?? buildLegacyRunId(existing.briefHash ?? 'unknown00'))
+    : null;
+  return { adopt: null, archivedTo };
 }
 
 export async function createUltragoalPlan(cwd: string, options: CreateUltragoalOptions): Promise<UltragoalPlan> {
   return withUltragoalMutationLock(cwd, async () => {
-  if (!options.force && existsSync(ultragoalGoalsPath(cwd))) {
-    throw new UltragoalError(`Refusing to overwrite existing ${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS}; pass --force to recreate it.`);
+  const briefHash = computeUltragoalBriefHash(options.brief);
+  const disposition = await resolveRegistryDisposition(cwd, briefHash, options);
+  if (disposition.adopt) {
+    const adopted = await adoptExistingPlanForRun(cwd, disposition.adopt, briefHash, options);
+    return adopted;
   }
   const now = iso(options.now);
   const sourceGoals: Array<{ title?: string; objective: string; tokenBudget?: number }> = options.goals?.length
@@ -892,10 +1017,14 @@ export async function createUltragoalPlan(cwd: string, options: CreateUltragoalO
       updatedAt: now,
     }));
 
+  const runId = buildUltragoalRunId(briefHash, options.now ?? new Date());
   const plan: UltragoalPlan = {
     version: 1,
     createdAt: now,
     updatedAt: now,
+    runId,
+    briefHash,
+    origin: { worktreePath: cwd, createdAt: now },
     briefPath: `${ULTRAGOAL_DIR}/${ULTRAGOAL_BRIEF}`,
     goalsPath: `${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS}`,
     ledgerPath: `${ULTRAGOAL_DIR}/${ULTRAGOAL_LEDGER}`,
@@ -906,11 +1035,97 @@ export async function createUltragoalPlan(cwd: string, options: CreateUltragoalO
 
   await mkdir(ultragoalDir(cwd), { recursive: true });
   await writeFile(ultragoalBriefPath(cwd), options.brief.endsWith('\n') ? options.brief : `${options.brief}\n`);
-  await writePlan(cwd, plan);
   await writeFile(ultragoalLedgerPath(cwd), '');
-  await appendLedger(cwd, { ts: now, event: 'plan_created', message: `${candidates.length} goal(s) created` });
+  await writeActiveRunPointer(cwd, {
+    version: 1,
+    runId,
+    briefHash,
+    updatedAt: now,
+    origin: plan.origin as UltragoalRunOrigin,
+  });
+  await writePlan(cwd, plan);
+  await writeFile(join(ultragoalRunDir(cwd, runId), ULTRAGOAL_BRIEF), options.brief.endsWith('\n') ? options.brief : `${options.brief}\n`);
+  await appendLedger(cwd, {
+    ts: now,
+    event: 'plan_created',
+    message: `${candidates.length} goal(s) created in run ${runId}`
+      + (disposition.archivedTo ? `; archived previous registry to ${disposition.archivedTo}` : ''),
+  });
   return plan;
   });
+}
+
+/**
+ * Explicitly take ownership of a registry inherited from another worktree
+ * (Grove CoW clone, moved tree). Deliberately manual: silent inheritance is the
+ * failure this guards against.
+ */
+export async function adoptUltragoalRun(cwd: string, options: { now?: Date } = {}): Promise<UltragoalPlan> {
+  return withUltragoalMutationLock(cwd, async () => {
+    const existing = await readExistingPlanForConflictCheck(cwd);
+    if (!existing) {
+      throw new UltragoalError(`No ultragoal registry found at ${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS} to adopt.`);
+    }
+    const now = iso(options.now);
+    const runId = existing.runId ?? buildLegacyRunId(existing.briefHash ?? 'unknown00');
+    const origin: UltragoalRunOrigin = existing.origin ?? { worktreePath: cwd, createdAt: existing.createdAt };
+    origin.adoptedWorktreePaths = Array.from(new Set([...(origin.adoptedWorktreePaths ?? []), cwd]));
+    const adopted: UltragoalPlan = { ...existing, runId, origin, updatedAt: now };
+    await writeActiveRunPointer(cwd, {
+      version: 1,
+      runId,
+      briefHash: adopted.briefHash ?? 'unknown',
+      updatedAt: now,
+      origin,
+    });
+    await writePlan(cwd, adopted);
+    await appendLedger(cwd, {
+      ts: now,
+      event: 'plan_created',
+      message: `run ${runId} adopted by worktree ${cwd} (origin ${origin.worktreePath})`,
+    });
+    return adopted;
+  });
+}
+
+/**
+ * Same brief, same tree: continue the existing run rather than recreating it.
+ * Backfills namespace identity onto pre-namespacing registries and records an
+ * explicit adoption when the tree differs from the run's origin.
+ */
+async function adoptExistingPlanForRun(
+  cwd: string,
+  existing: UltragoalPlan,
+  briefHash: string,
+  options: CreateUltragoalOptions,
+): Promise<UltragoalPlan> {
+  const now = iso(options.now);
+  const runId = existing.runId ?? buildLegacyRunId(existing.briefHash ?? briefHash);
+  const origin: UltragoalRunOrigin = existing.origin ?? { worktreePath: cwd, createdAt: existing.createdAt };
+  if (isInheritedOrigin(origin, cwd)) {
+    origin.adoptedWorktreePaths = Array.from(new Set([...(origin.adoptedWorktreePaths ?? []), cwd]));
+  }
+  const adopted: UltragoalPlan = {
+    ...existing,
+    runId,
+    briefHash: existing.briefHash ?? briefHash,
+    origin,
+    updatedAt: now,
+  };
+  await writeActiveRunPointer(cwd, {
+    version: 1,
+    runId,
+    briefHash: adopted.briefHash as string,
+    updatedAt: now,
+    origin,
+  });
+  await writePlan(cwd, adopted);
+  await appendLedger(cwd, {
+    ts: now,
+    event: 'plan_created',
+    message: `adopted existing ultragoal registry as run ${runId} (${adopted.goals.length} goal(s))`,
+  });
+  return adopted;
 }
 
 export function summarizeUltragoalPlan(plan: UltragoalPlan): { total: number; pending: number; inProgress: number; complete: number; failed: number; reviewBlocked: number; historicalReviewBlocked: number; needsUserDecision: number; superseded: number; steeringBlocked: number; aggregateComplete: boolean; aggregateCompletionRecorded: boolean; artifactComplete: boolean; activeGoalId?: string } {

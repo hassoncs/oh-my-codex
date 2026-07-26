@@ -8,6 +8,7 @@ import {
 } from '../goal-workflows/codex-goal-snapshot.js';
 import {
   addUltragoalGoal,
+  adoptUltragoalRun,
   buildCodexGoalInstruction,
   checkpointUltragoal,
   createUltragoalPlan,
@@ -24,12 +25,14 @@ import {
   ULTRAGOAL_STEERING_MUTATION_KINDS,
   ULTRAGOAL_STEERING_SOURCES,
   UltragoalError,
+  UltragoalRegistryConflictError,
 } from '../ultragoal/artifacts.js';
 
 export const ULTRAGOAL_HELP = `omx ultragoal - Durable repo-native multi-goal workflow over Codex goal mode
 
 Usage:
-  omx ultragoal create-goals [--brief <text> | --brief-file <path> | --from-stdin] [--goal <title::objective>] [--codex-goal-mode <aggregate|per-story>] [--force] [--json]
+  omx ultragoal create-goals [--brief <text> | --brief-file <path> | --from-stdin] [--goal <title::objective>] [--codex-goal-mode <aggregate|per-story>] [--archive-existing | --adopt-existing | --new-namespace] [--force] [--json]
+  omx ultragoal adopt-run [--json]
   omx ultragoal complete-goals [--retry-failed] [--json]
   omx ultragoal add-goal --title <title> --objective <text> [--evidence <text>] [--json]
   omx ultragoal steer --kind <mutation-kind> --evidence <text> --rationale <text> [--target-goal-id <id> | --target-goal-ids <id1,id2,...>] [--title <title>] [--objective <text>] [--json]
@@ -43,9 +46,17 @@ Aliases:
   create -> create-goals, complete|next|start-next -> complete-goals
 
 Artifacts:
-  .omx/ultragoal/brief.md
-  .omx/ultragoal/goals.json
-  .omx/ultragoal/ledger.jsonl
+  .omx/ultragoal/runs/<runId>/{brief.md,goals.json,ledger.jsonl}   canonical, namespaced per run
+  .omx/ultragoal/active-run.json                                   pointer to the active run
+  .omx/ultragoal/{brief.md,goals.json,ledger.jsonl}                active-run projection (readers)
+
+Run namespacing:
+  Each run gets a runId derived from a hash of its brief. Starting a run in a tree
+  that already holds a registry from a DIFFERENT brief, from a pre-namespacing
+  layout, or created by a DIFFERENT worktree (the Grove CoW-clone case) is refused
+  until you choose: --archive-existing, --adopt-existing, or --new-namespace.
+  A registry inherited from another worktree is never read implicitly; take
+  ownership with: omx ultragoal adopt-run
 
 Codex goal integration:
   This command cannot directly invoke the interactive /goal tool from a shell.
@@ -302,6 +313,7 @@ function printSteerResult(proposal: UltragoalSteeringProposal, result: CliSteerR
 const ULTRAGOAL_MUTATING_COMMANDS = new Set([
   'create',
   'create-goals',
+  'adopt-run',
   'add-goal',
   'steer',
   'record-review-blockers',
@@ -356,10 +368,14 @@ export async function ultragoalCommand(args: string[]): Promise<void> {
         goals,
         codexGoalMode: normalizeCodexGoalMode(readValue(rest, '--codex-goal-mode')),
         force: hasFlag(rest, '--force'),
+        archiveExisting: hasFlag(rest, '--archive-existing'),
+        adoptExisting: hasFlag(rest, '--adopt-existing'),
+        newNamespace: hasFlag(rest, '--new-namespace'),
       });
       if (json) printJson({ ok: true, plan, summary: summarizeUltragoalPlan(plan) });
       else {
         console.log(`ultragoal plan created: ${plan.goals.length} goal(s)`);
+        console.log(`run: ${plan.runId ?? 'unnamespaced'}`);
         console.log(`brief: ${plan.briefPath}`);
         console.log(`goals: ${plan.goalsPath}`);
         console.log(`ledger: ${plan.ledgerPath}`);
@@ -395,6 +411,16 @@ export async function ultragoalCommand(args: string[]): Promise<void> {
         if (codexGoalFallback) console.log(`codex goal fallback: ${codexGoalFallback.message}`);
         if (reconciliation && !reconciliation.ok) console.log(`codex goal warning: ${formatCodexGoalReconciliation(reconciliation)}`);
         else if (reconciliation?.warnings.length) console.log(`codex goal warning: ${formatCodexGoalReconciliation(reconciliation)}`);
+      }
+      return;
+    }
+
+    if (command === 'adopt-run') {
+      const plan = await adoptUltragoalRun(cwd);
+      if (json) printJson({ ok: true, runId: plan.runId, origin: plan.origin, summary: summarizeUltragoalPlan(plan) });
+      else {
+        console.log(`ultragoal run adopted: ${plan.runId ?? 'unnamespaced'} (origin ${plan.origin?.worktreePath ?? 'unknown'})`);
+        printStatus(plan);
       }
       return;
     }
@@ -507,6 +533,12 @@ export async function ultragoalCommand(args: string[]): Promise<void> {
 
     throw new UltragoalError(`Unknown ultragoal command: ${command}\n\n${ULTRAGOAL_HELP}`);
   } catch (error) {
+    if (error instanceof UltragoalRegistryConflictError) {
+      console.error(`[ultragoal] ${error.message}`);
+      if (json) printJson({ ok: false, error: 'registry_conflict', reason: error.reason, runId: error.runId, originWorktreePath: error.originWorktreePath, message: error.message });
+      process.exitCode = 1;
+      return;
+    }
     if (error instanceof UltragoalError || error instanceof CodexGoalSnapshotError) {
       console.error(`[ultragoal] ${error.message}`);
       process.exitCode = 1;
