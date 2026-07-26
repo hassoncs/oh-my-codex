@@ -1,7 +1,13 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { updateModeState, startMode, readModeState } from '../modes/base.js';
-import { getStateFilePath, getStatePath, validateSessionId } from '../mcp/state-paths.js';
+import {
+  assertModeStartAllowed,
+  updateModeState,
+  startMode,
+  readModeState,
+  readModeStateForActiveDecision,
+} from '../modes/base.js';
+import { getStateFilePath, getStatePath, resolveStateScope, validateSessionId } from '../mcp/state-paths.js';
 import { monitorTeam, resumeTeam, shutdownTeam, startTeam, type TeamRuntime, type TeamSnapshot } from '../team/runtime.js';
 import { buildRepoAwareTeamExecutionPlan } from '../team/repo-aware-decomposition.js';
 import { DEFAULT_MAX_WORKERS } from '../team/state.js';
@@ -41,9 +47,12 @@ import {
   buildUltragoalCheckpointGuidance,
   reconcilePersistedTeamUltragoalContext,
   readPersistedTeamUltragoalContext,
+  resolveLeaderOwnedUltragoalContextOutcome,
   renderUltragoalCheckpointGuidanceText,
 } from '../team/ultragoal-context.js';
 import { resolveCodexHomeForLaunch } from './codex-home.js';
+import { isAutopilotSupervisingChild } from '../autopilot/fsm.js';
+import { readActiveWorkflowModes } from '../state/workflow-transition.js';
 
 interface TeamCliOptions {
   verbose?: boolean;
@@ -333,6 +342,7 @@ const TEAM_API_OPERATION_REQUIRED_FIELDS: Record<TeamApiOperation, string[]> = {
   'claim-task': ['team_name', 'task_id', 'worker'],
   'transition-task-status': ['team_name', 'task_id', 'from', 'to', 'claim_token'],
   'release-task-claim': ['team_name', 'task_id', 'claim_token', 'worker'],
+  'retry-failed-task': ['team_name', 'task_id', 'expected_version'],
   'read-config': ['team_name'],
   'read-manifest': ['team_name'],
   'read-worker-status': ['team_name', 'worker'],
@@ -376,6 +386,7 @@ const TEAM_API_OPERATION_OPTIONAL_FIELDS: Partial<Record<TeamApiOperation, strin
 const TEAM_API_OPERATION_NOTES: Partial<Record<TeamApiOperation, string>> = {
   'update-task': 'Only non-lifecycle task metadata can be updated.',
   'release-task-claim': 'Use this only for rollback/requeue to pending (not for completion).',
+  'retry-failed-task': 'Only failed tasks can be retried. Retry clears prior ownership, claim, terminal payload, and compliance evidence.',
   'transition-task-status': 'Lifecycle flow is claim-safe and typically transitions in_progress -> completed|failed.',
   'cleanup': 'Uses the runtime shutdown contract; add confirm_issues=true when failed tasks are acknowledged and shutdown should still proceed.',
   'orphan-cleanup': 'Destructive escape hatch for known orphan recovery. Bypasses shutdown orchestration.',
@@ -1177,11 +1188,11 @@ function splitTaskString(task: string): DecompositionPlan {
     };
   }
 
-  const strongParts = task.split(/;\s+/).map(s => s.trim()).filter(s => s.length > 0);
-  if (strongParts.length >= 2) {
+  const semicolonParts = task.split(/;\s+/).map(s => s.trim()).filter(s => s.length > 0);
+  if (canSafelySplitWeakTaskList(task, semicolonParts)) {
     return {
       strategy: 'conjunction',
-      subtasks: strongParts.map((part) => ({ subject: part.slice(0, 80), description: part })),
+      subtasks: semicolonParts.map((part) => ({ subject: part.slice(0, 80), description: part })),
     };
   }
 
@@ -1239,6 +1250,7 @@ function distributeTasksToWorkers(
 async function ensureTeamModeState(
   parsed: ParsedTeamArgs,
   tasks?: Array<{ role?: string }>,
+  allowNestedAutopilotTeam = false,
 ): Promise<void> {
   const fallbackRole = resolveImplicitTeamFallbackRole(parsed.agentType, parsed.explicitAgentType);
   const roleDistribution = tasks && tasks.length > 0
@@ -1274,7 +1286,7 @@ async function ensureTeamModeState(
     return;
   }
 
-  await startMode('team', parsed.task, 50);
+  await startMode('team', parsed.task, 50, undefined, { allowNestedAutopilotTeam });
   await updateModeState('team', {
     active,
     current_phase: currentPhase,
@@ -1288,6 +1300,30 @@ async function ensureTeamModeState(
     completed_at: completionStamp,
   });
 
+}
+
+export async function preflightTeamModeStart(cwd: string = process.cwd()): Promise<boolean> {
+  const scope = await resolveStateScope(cwd);
+  const activeModes = await readActiveWorkflowModes(cwd, scope.sessionId);
+  if (!activeModes.includes('autopilot')) {
+    await assertModeStartAllowed('team', cwd);
+    return false;
+  }
+
+  const autopilotState = await readModeStateForActiveDecision('autopilot', scope.sessionId, cwd);
+  const validChild = isAutopilotSupervisingChild(autopilotState, 'ultragoal')
+    || isAutopilotSupervisingChild(autopilotState, 'team');
+  if (!validChild) {
+    throw new Error('nested_autopilot_team_requires_active_ultragoal_child');
+  }
+
+  const ultragoalOutcome = await resolveLeaderOwnedUltragoalContextOutcome(cwd);
+  if (ultragoalOutcome.status !== 'valid') {
+    throw new Error(`invalid_ultragoal_team_context:${ultragoalOutcome.warning?.message ?? ultragoalOutcome.status}`);
+  }
+
+  await assertModeStartAllowed('team', cwd, { allowNestedAutopilotTeam: true });
+  return true;
 }
 
 async function persistTeamShutdownModeState(
@@ -1670,6 +1706,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
   if (subcommand === 'resume') {
     const name = teamArgs[1];
     if (!name) throw new Error('Usage: omx team resume <team-name>');
+    const allowNestedAutopilotTeam = await preflightTeamModeStart(cwd);
     const runtime = await resumeTeam(name, cwd);
     if (!runtime) {
       console.log(`No resumable team found for ${name}`);
@@ -1684,7 +1721,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       teamName: runtime.teamName,
       displayName: runtime.config.display_name ?? runtime.teamName,
       allowRepoAwareDagHandoff: false,
-    });
+    }, undefined, allowNestedAutopilotTeam);
     const availableAgentTypes = await resolveAvailableAgentTypes(cwd);
     const staffingPlan = buildFollowupStaffingPlan('team', runtime.config.task, availableAgentTypes, {
       workerCount: runtime.config.worker_count,
@@ -1750,6 +1787,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
     fallbackRole: resolveImplicitTeamFallbackRole(parsed.agentType, parsed.explicitAgentType),
     codexHomeOverride,
   });
+  const allowNestedAutopilotTeam = await preflightTeamModeStart(cwd);
   const runtime = await startTeam(
     parsed.teamName,
     parsed.task,
@@ -1765,7 +1803,11 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
     },
   );
 
-  await ensureTeamModeState({ ...effectiveParsed, teamName: runtime.teamName, displayName: runtime.config.display_name ?? effectiveParsed.displayName }, tasks);
+  await ensureTeamModeState(
+    { ...effectiveParsed, teamName: runtime.teamName, displayName: runtime.config.display_name ?? effectiveParsed.displayName },
+    tasks,
+    allowNestedAutopilotTeam,
+  );
   if (executionPlan.overOrchestrationNotice) {
     console.log(`${executionPlan.overOrchestrationNotice.code}: ${executionPlan.overOrchestrationNotice.message}`);
   }

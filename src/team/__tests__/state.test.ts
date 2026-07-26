@@ -20,6 +20,7 @@ import {
   readTeamManifestV2,
   transitionTaskStatus,
   releaseTaskClaim,
+  retryFailedTask,
   reclaimExpiredTaskClaim,
   sendDirectMessage,
   broadcastMessage,
@@ -1392,6 +1393,93 @@ exit 1
 
       const reread = await readTask('team-release-failed', t.id, cwd);
       assert.equal(reread?.status, 'failed');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('retryFailedTask requeues only the expected failed version and clears terminal state', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-failed-'));
+    try {
+      await initTeamState('team-retry-failed', 't', 'executor', 1, cwd);
+      const t = await createTask('team-retry-failed', {
+        subject: 'a',
+        description: 'd',
+        status: 'pending',
+        delegation_compliance: {
+          status: 'spawned',
+          source: 'terminal_result',
+          detail: 'old attempt',
+          recorded_at: new Date().toISOString(),
+        },
+        coordination_compliance: {
+          status: 'checked',
+          source: 'terminal_result',
+          detail: 'old attempt',
+          recorded_at: new Date().toISOString(),
+        },
+      }, cwd);
+      const claim = await claimTask('team-retry-failed', t.id, 'worker-1', t.version, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const failed = await transitionTaskStatus(
+        'team-retry-failed',
+        t.id,
+        'in_progress',
+        'failed',
+        claim.claimToken,
+        cwd,
+        { error: 'old failure', result: 'old result' },
+      );
+      assert.equal(failed.ok, true);
+      if (!failed.ok) return;
+
+      const stale = await retryFailedTask('team-retry-failed', t.id, failed.task.version - 1, cwd);
+      assert.deepEqual(stale, { ok: false, error: 'claim_conflict' });
+
+      const retried = await retryFailedTask('team-retry-failed', t.id, failed.task.version, cwd);
+      assert.equal(retried.ok, true);
+      if (!retried.ok) return;
+      assert.equal(retried.task.status, 'pending');
+      assert.equal(retried.task.version, failed.task.version + 1);
+      assert.equal(retried.task.owner, undefined);
+      assert.equal(retried.task.claim, undefined);
+      assert.equal(retried.task.error, undefined);
+      assert.equal(retried.task.result, undefined);
+      assert.equal(retried.task.completed_at, undefined);
+      assert.equal(retried.task.delegation_compliance, undefined);
+      assert.equal(retried.task.coordination_compliance, undefined);
+
+      const duplicate = await retryFailedTask('team-retry-failed', t.id, retried.task.version, cwd);
+      assert.deepEqual(duplicate, { ok: false, error: 'invalid_transition' });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('retryFailedTask does not reopen completed tasks', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-completed-'));
+    try {
+      await initTeamState('team-retry-completed', 't', 'executor', 1, cwd);
+      const t = await createTask('team-retry-completed', { subject: 'a', description: 'd', status: 'pending' }, cwd);
+      const claim = await claimTask('team-retry-completed', t.id, 'worker-1', t.version, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+      const completed = await transitionTaskStatus(
+        'team-retry-completed',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+      );
+      assert.equal(completed.ok, true);
+      if (!completed.ok) return;
+
+      const retried = await retryFailedTask('team-retry-completed', t.id, completed.task.version, cwd);
+      assert.deepEqual(retried, { ok: false, error: 'invalid_transition' });
+      assert.equal((await readTask('team-retry-completed', t.id, cwd))?.status, 'completed');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

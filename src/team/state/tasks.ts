@@ -12,6 +12,7 @@ import type {
   ClaimTaskResult,
   TransitionTaskResult,
   ReleaseTaskClaimResult,
+  RetryFailedTaskResult,
   ReclaimTaskResult,
   TeamMonitorSnapshotState,
 } from './types.js';
@@ -305,6 +306,39 @@ export async function releaseTaskClaim(
       claim: undefined,
       version: v.version + 1,
     };
+    await deps.writeAtomic(deps.taskFilePath(deps.teamName, taskId, deps.cwd), JSON.stringify(updated, null, 2));
+    return { ok: true as const, task: updated };
+  });
+
+  if (!lock.ok) return { ok: false, error: 'claim_conflict' };
+  return lock.value;
+}
+
+export async function retryFailedTask(
+  taskId: string,
+  expectedVersion: number,
+  deps: ReleaseDeps,
+): Promise<RetryFailedTaskResult> {
+  const lock = await deps.withTaskClaimLock(deps.teamName, taskId, deps.cwd, async () => {
+    const current = await deps.readTask(deps.teamName, taskId, deps.cwd);
+    if (!current) return { ok: false as const, error: 'task_not_found' as const };
+
+    const v = deps.normalizeTask(current);
+    if (v.version !== expectedVersion) return { ok: false as const, error: 'claim_conflict' as const };
+    if (v.status !== 'failed') return { ok: false as const, error: 'invalid_transition' as const };
+
+    const updated: TeamTaskV2 = {
+      ...v,
+      status: 'pending',
+      version: v.version + 1,
+    };
+    delete updated.owner;
+    delete updated.claim;
+    delete updated.error;
+    delete updated.result;
+    delete updated.completed_at;
+    delete updated.delegation_compliance;
+    delete updated.coordination_compliance;
     await deps.writeAtomic(deps.taskFilePath(deps.teamName, taskId, deps.cwd), JSON.stringify(updated, null, 2));
     return { ok: true as const, task: updated };
   });

@@ -220,6 +220,7 @@ export async function reconcileWorkflowTransition(
     source?: string;
     baseStateDir?: string;
     currentModes?: Iterable<string>;
+    allowNestedAutopilotTeam?: boolean;
   } = {},
 ): Promise<ReconciledWorkflowTransition> {
   const {
@@ -235,7 +236,9 @@ export async function reconcileWorkflowTransition(
   const currentModes = options.currentModes
     ? [...options.currentModes].filter(isTrackedWorkflowMode)
     : await visibleTrackedModes(cwd, sessionId, baseStateDir);
-  const decision = evaluateWorkflowTransition(currentModes, requestedMode);
+  const decision = evaluateWorkflowTransition(currentModes, requestedMode, {
+    allowNestedAutopilotTeam: options.allowNestedAutopilotTeam,
+  });
 
   if (!decision.allowed) {
     throw new Error(buildWorkflowTransitionError(currentModes, requestedMode, action));

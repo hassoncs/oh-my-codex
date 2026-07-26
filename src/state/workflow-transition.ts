@@ -777,6 +777,10 @@ export type TrackedWorkflowMode = (typeof TRACKED_WORKFLOW_MODES)[number];
 export type WorkflowTransitionAction = 'activate' | 'start' | 'write';
 export type WorkflowTransitionKind = 'allow' | 'overlap' | 'auto-complete' | 'deny';
 
+export interface WorkflowTransitionOptions {
+  allowNestedAutopilotTeam?: boolean;
+}
+
 const ALLOWED_OVERLAP_PAIRS = new Set([
   'ralph|team',
 ]);
@@ -833,8 +837,13 @@ function buildPairKey(a: string, b: string): string {
   return [a, b].sort((left, right) => left.localeCompare(right)).join('|');
 }
 
-function isAllowedOverlap(a: TrackedWorkflowMode, b: TrackedWorkflowMode): boolean {
+function isAllowedOverlap(
+  a: TrackedWorkflowMode,
+  b: TrackedWorkflowMode,
+  options: WorkflowTransitionOptions,
+): boolean {
   if (a === 'ultrawork' || b === 'ultrawork') return true;
+  if (options.allowNestedAutopilotTeam && buildPairKey(a, b) === 'autopilot|team') return true;
   return ALLOWED_OVERLAP_PAIRS.has(buildPairKey(a, b));
 }
 
@@ -890,6 +899,7 @@ export function isTrackedWorkflowMode(mode: string): mode is TrackedWorkflowMode
 export function evaluateWorkflowTransition(
   currentActiveModes: Iterable<string>,
   requestedMode: TrackedWorkflowMode,
+  options: WorkflowTransitionOptions = {},
 ): WorkflowTransitionDecision {
   const currentModes = normalizeTrackedModes(currentActiveModes);
 
@@ -921,7 +931,7 @@ export function evaluateWorkflowTransition(
   ));
   const survivableModes = currentModes.filter((mode) => !autoCompleteModes.includes(mode));
 
-  if (autoCompleteModes.length > 0 && survivableModes.every((mode) => isAllowedOverlap(mode, requestedMode))) {
+  if (autoCompleteModes.length > 0 && survivableModes.every((mode) => isAllowedOverlap(mode, requestedMode, options))) {
     return {
       allowed: true,
       kind: 'auto-complete',
@@ -933,7 +943,7 @@ export function evaluateWorkflowTransition(
     };
   }
 
-  if (currentModes.every((mode) => isAllowedOverlap(mode, requestedMode))) {
+  if (currentModes.every((mode) => isAllowedOverlap(mode, requestedMode, options))) {
     return {
       allowed: true,
       kind: 'overlap',
@@ -983,8 +993,9 @@ export function assertWorkflowTransitionAllowed(
   currentActiveModes: Iterable<string>,
   requestedMode: TrackedWorkflowMode,
   action: WorkflowTransitionAction = 'activate',
+  options: WorkflowTransitionOptions = {},
 ): void {
-  const decision = evaluateWorkflowTransition(currentActiveModes, requestedMode);
+  const decision = evaluateWorkflowTransition(currentActiveModes, requestedMode, options);
   if (decision.allowed) return;
   throw new Error(buildWorkflowTransitionError(currentActiveModes, requestedMode, action));
 }

@@ -317,9 +317,9 @@ export function paneShowsCodexViewport(captured: any): boolean {
 
 export function paneHasActiveTask(captured: any): boolean {
   const tail = normalizePaneLines(captured).map((line) => line.trim()).slice(-40);
-  if (tail.some((line) => /\b\d+\s+background terminal running\b/i.test(line))) return true;
+  if (tail.some((line) => /\b[1-9]\d*\s+background terminal running\b/i.test(line))) return true;
   if (tail.some((line) => /esc to interrupt/i.test(line))) return true;
-  if (tail.some((line) => /\bbackground terminal running\b/i.test(line))) return true;
+  if (tail.some((line) => /(?<!\d\s)\bbackground terminal running\b/i.test(line))) return true;
   if (tail.some((line) => /^•\s.+\(.+•\s*esc to interrupt\)$/i.test(line))) return true;
   return tail.some((line) => /^[·✻]\s+[A-Za-z][A-Za-z0-9''-]*(?:\s+[A-Za-z][A-Za-z0-9''-]*){0,3}(?:…|\.{3})$/u.test(line));
 }

@@ -1804,6 +1804,7 @@ describe('teamCommand api', () => {
       assert.match(logs[0] ?? '', /Usage: omx team api <operation>/);
       assert.match(logs[0] ?? '', /send-message/);
       assert.match(logs[0] ?? '', /transition-task-status/);
+      assert.match(logs[0] ?? '', /retry-failed-task/);
       assert.match(logs[0] ?? '', /read-idle-state/);
       assert.match(logs[0] ?? '', /read-stall-state/);
     } finally {
@@ -1852,6 +1853,22 @@ describe('teamCommand api', () => {
       assert.equal(logs.length, 1);
       assert.match(logs[0] ?? '', /Usage: omx team api claim-task --input <json> \[--json\]/);
       assert.match(logs[0] ?? '', /expected_version/);
+    } finally {
+      console.log = originalLog;
+    }
+  });
+
+  it('documents retry-failed-task optimistic version safety', async () => {
+    const logs: string[] = [];
+    const originalLog = console.log;
+    try {
+      console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
+      await teamCommand(['api', 'retry-failed-task', '--help']);
+      assert.equal(logs.length, 1);
+      assert.match(logs[0] ?? '', /team_name/);
+      assert.match(logs[0] ?? '', /task_id/);
+      assert.match(logs[0] ?? '', /expected_version/);
+      assert.match(logs[0] ?? '', /Only failed tasks can be retried/);
     } finally {
       console.log = originalLog;
     }

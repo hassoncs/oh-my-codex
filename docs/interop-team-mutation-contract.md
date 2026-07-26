@@ -21,7 +21,8 @@ Direct writes to `.omx/state/team/...` are unsupported and may violate runtime i
    - `omx team api claim-task --json`
 3. Transition terminal state with claim token:
    - `omx team api transition-task-status --json` (`in_progress -> completed|failed`)
-4. Use `omx team api release-task-claim --json` only for rollback/requeue-to-pending flows.
+4. Use `omx team api release-task-claim --json` only for claimed-task rollback/requeue-to-pending flows.
+5. Retry a terminal failure through `omx team api retry-failed-task --json` with the current task version.
 
 ## Legacy MCP -> CLI migration table
 
@@ -94,5 +95,6 @@ When brokers inspect team events via `read-events` / `await-event`:
 - `transition-task-status` is the claim-safe terminal transition path.
   - Runtime enforces `in_progress -> completed|failed`; other transitions return `invalid_transition`.
 - `release-task-claim` intentionally resets the task to `pending`; it is not a completion operation.
+- `retry-failed-task` is the only terminal reopen path. It accepts only `failed`, requires `expected_version`, and clears prior attempt ownership, claim, terminal payload, and compliance evidence.
 - `update-task` only accepts `subject`, `description`, `blocked_by`, and `requires_code_change` as mutable fields.
 - `append-event.type` and `write-task-approval.status` enforce strict enum validation.

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile } from 'fs/promises';
+import { mkdtemp, rm, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
@@ -169,6 +169,64 @@ describe('mcp-comm', () => {
 
       const requests = await listDispatchRequests('alpha-dedupe', cwd, { kind: 'mailbox', to_worker: 'leader-fixed' });
       assert.equal(requests.length, 1);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('queueDirectMailboxMessage replays only stale intentional reminders', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-mcp-comm-'));
+    try {
+      await initTeamState('alpha-reminder', 'task', 'executor', 1, cwd);
+      let notifyCount = 0;
+      const notify = async () => {
+        notifyCount += 1;
+        return { ok: true as const, transport: 'mailbox' as const, reason: 'leader_mailbox_notified' };
+      };
+      const params = {
+        teamName: 'alpha-reminder',
+        fromWorker: 'worker-1',
+        toWorker: 'leader-fixed',
+        body: 'review pending mailbox',
+        triggerMessage: 'check mailbox',
+        intent: 'pending-mailbox-review' as const,
+        cwd,
+        transportPreference: 'transport_direct' as const,
+        fallbackAllowed: false,
+        notify,
+      };
+
+      const first = await queueDirectMailboxMessage(params);
+      assert.equal(first.ok, true);
+      assert.equal(notifyCount, 1);
+
+      const freshDuplicate = await queueDirectMailboxMessage(params);
+      assert.equal(freshDuplicate.reason, 'existing_message_already_notified');
+      assert.equal(notifyCount, 1);
+
+      const mailboxPath = join(cwd, '.omx', 'state', 'team', 'alpha-reminder', 'mailbox', 'leader-fixed.json');
+      const mailbox = JSON.parse(await readFile(mailboxPath, 'utf8')) as {
+        messages: Array<{ notified_at?: string }>;
+      };
+      mailbox.messages[0]!.notified_at = new Date(Date.now() - 61_000).toISOString();
+      await writeFile(mailboxPath, JSON.stringify(mailbox, null, 2));
+
+      const staleReminder = await queueDirectMailboxMessage(params);
+      assert.equal(staleReminder.ok, true);
+      assert.equal(staleReminder.reason, 'leader_mailbox_notified');
+      assert.equal(notifyCount, 2);
+
+      const replayDuplicate = await queueDirectMailboxMessage(params);
+      assert.equal(replayDuplicate.reason, 'existing_message_already_notified');
+      assert.equal(notifyCount, 2);
+
+      const messages = await listMailboxMessages('alpha-reminder', 'leader-fixed', cwd);
+      assert.equal(messages.length, 1);
+      const requests = await listDispatchRequests('alpha-reminder', cwd, {
+        kind: 'mailbox',
+        to_worker: 'leader-fixed',
+      });
+      assert.equal(requests.length, 2);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

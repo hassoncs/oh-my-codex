@@ -9,6 +9,7 @@ import {
   claimTask as claimTaskImpl,
   transitionTaskStatus as transitionTaskStatusImpl,
   releaseTaskClaim as releaseTaskClaimImpl,
+  retryFailedTask as retryFailedTaskImpl,
   reclaimExpiredTaskClaim as reclaimExpiredTaskClaimImpl,
   listTasks as listTasksImpl,
 } from './state/tasks.js';
@@ -397,6 +398,10 @@ export type TransitionTaskResult =
 export type ReleaseTaskClaimResult =
   | { ok: true; task: TeamTaskV2 }
   | { ok: false; error: 'claim_conflict' | 'task_not_found' | 'already_terminal' | 'lease_expired' };
+
+export type RetryFailedTaskResult =
+  | { ok: true; task: TeamTaskV2 }
+  | { ok: false; error: 'claim_conflict' | 'task_not_found' | 'invalid_transition' };
 
 export type ReclaimTaskResult =
   | { ok: true; task: TeamTaskV2; reclaimed: boolean }
@@ -1444,6 +1449,25 @@ export async function releaseTaskClaim(
   cwd: string
 ): Promise<ReleaseTaskClaimResult> {
   return await releaseTaskClaimImpl(taskId, claimToken, workerName, {
+    teamName,
+    cwd,
+    readTask,
+    readTeamConfig,
+    withTaskClaimLock,
+    normalizeTask,
+    isTerminalTaskStatus,
+    taskFilePath,
+    writeAtomic,
+  });
+}
+
+export async function retryFailedTask(
+  teamName: string,
+  taskId: string,
+  expectedVersion: number,
+  cwd: string
+): Promise<RetryFailedTaskResult> {
+  return await retryFailedTaskImpl(taskId, expectedVersion, {
     teamName,
     cwd,
     readTask,

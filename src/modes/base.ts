@@ -10,6 +10,7 @@ import {
   assertWorkflowTransitionAllowed,
   isTrackedWorkflowMode,
   readActiveWorkflowModes,
+  type WorkflowTransitionOptions,
 } from '../state/workflow-transition.js';
 import { reconcileWorkflowTransition } from '../state/workflow-transition-reconcile.js';
 import { syncCanonicalSkillStateForMode } from '../state/skill-active.js';
@@ -53,6 +54,8 @@ export type DeprecatedModeName = 'ultrapilot' | 'pipeline' | 'ecomode';
 export interface UpdateModeStateOptions {
   trustedPipelineProgress?: boolean;
 }
+
+export type StartModeOptions = WorkflowTransitionOptions;
 
 const DEPRECATED_MODES: Record<DeprecatedModeName, string> = {
   ultrapilot: 'Use "team" instead. ultrapilot has been merged into team mode.',
@@ -142,11 +145,12 @@ function stateDir(projectRoot?: string): string {
 export async function assertModeStartAllowed(
   mode: ModeName,
   projectRoot?: string,
+  options: StartModeOptions = {},
 ): Promise<void> {
   if (!isTrackedWorkflowMode(mode)) return;
   const scope = await resolveStateScope(projectRoot);
   const activeModes = await readActiveWorkflowModes(projectRoot ?? process.cwd(), scope.sessionId);
-  assertWorkflowTransitionAllowed(activeModes, mode, 'start');
+  assertWorkflowTransitionAllowed(activeModes, mode, 'start', options);
 }
 
 /**
@@ -156,7 +160,8 @@ export async function startMode(
   mode: ModeName,
   taskDescription: string,
   maxIterations: number = 50,
-  projectRoot?: string
+  projectRoot?: string,
+  options: StartModeOptions = {},
 ): Promise<ModeState> {
   const dir = stateDir(projectRoot);
   await mkdir(dir, { recursive: true });
@@ -170,6 +175,7 @@ export async function startMode(
       sessionId: scope.sessionId,
       source: 'startMode',
       baseStateDir,
+      allowNestedAutopilotTeam: options.allowNestedAutopilotTeam,
     });
     transitionMessage = transition.transitionMessage;
   }
@@ -200,6 +206,7 @@ export async function startMode(
       currentPhase: typeof state.current_phase === 'string' ? state.current_phase : undefined,
       sessionId: scope.sessionId,
       source: 'startMode',
+      workflowTransitionOptions: options,
     });
   }
   return state;

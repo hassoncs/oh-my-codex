@@ -997,6 +997,16 @@ async function integrateWorkerCommitsIntoLeader(params: {
 
       let allPicked = true;
       for (const commit of commits) {
+        if (leaderContainsCommit(repoRoot, cwd, commit)) {
+          state.last_integrated_head = commit;
+          state.last_leader_head = resolveLeaderHead(repoRoot, cwd) ?? state.last_leader_head;
+          state.status = 'integrated';
+          state.conflict_commit = undefined;
+          state.conflict_files = undefined;
+          state.updated_at = new Date().toISOString();
+          continue;
+        }
+
         await appendIntegrationEvent(teamName, 'worker_cherry_pick_detected', worker, {
           worker_name: worker.name,
           worker_head: workerHead,

@@ -175,7 +175,7 @@ describe('resolveTeamApiOperation', () => {
     assert.equal(resolveTeamApiOperation('  SEND_MESSAGE  '), 'send-message');
   });
 
-  it('resolves all 33 operations from the operation list', () => {
+  it('resolves all 34 operations from the operation list', () => {
     for (const op of TEAM_API_OPERATIONS) {
       assert.equal(resolveTeamApiOperation(op), op);
     }
@@ -217,8 +217,8 @@ describe('LEGACY_TEAM_MCP_TOOLS', () => {
 });
 
 describe('TEAM_API_OPERATIONS', () => {
-  it('contains 33 operations', () => {
-    assert.equal(TEAM_API_OPERATIONS.length, 33);
+  it('contains 34 operations', () => {
+    assert.equal(TEAM_API_OPERATIONS.length, 34);
   });
 
   it('all use kebab-case', () => {
@@ -1224,6 +1224,68 @@ describe('executeTeamApiOperation: release-task-claim', () => {
       team_name: 'x', task_id: '1',
     }, '/tmp');
     assert.equal(result.ok, false);
+  });
+});
+
+// ─── retry-failed-task ────────────────────────────────────────────────────
+
+describe('executeTeamApiOperation: retry-failed-task', () => {
+  it('requeues a failed task with optimistic version protection', async () => {
+    const { cwd, cleanup } = await setupTeam('retry-failed');
+    try {
+      const task = await createTask('retry-failed', { subject: 'Retry me', description: 'D', status: 'pending' }, cwd);
+      const claim = await executeTeamApiOperation('claim-task', {
+        team_name: 'retry-failed',
+        task_id: task.id,
+        worker: 'worker-1',
+        expected_version: task.version,
+      }, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const failed = await executeTeamApiOperation('transition-task-status', {
+        team_name: 'retry-failed',
+        task_id: task.id,
+        from: 'in_progress',
+        to: 'failed',
+        claim_token: String(claim.data.claimToken),
+        error: 'failed once',
+      }, cwd);
+      assert.equal(failed.ok, true);
+      if (!failed.ok || failed.data.ok !== true) return;
+      const failedTask = failed.data.task as { version: number };
+
+      const result = await executeTeamApiOperation('retry-failed-task', {
+        team_name: 'retry-failed',
+        task_id: task.id,
+        expected_version: failedTask.version,
+      }, cwd);
+      assert.equal(result.ok, true);
+      if (!result.ok) return;
+      assert.equal(result.data.ok, true);
+      const retried = result.data.task as Record<string, unknown>;
+      assert.equal(retried.status, 'pending');
+      assert.equal(retried.error, undefined);
+      assert.equal(retried.owner, undefined);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('requires a positive expected_version', async () => {
+    const missing = await executeTeamApiOperation('retry-failed-task', {
+      team_name: 'x',
+      task_id: '1',
+    }, '/tmp');
+    assert.equal(missing.ok, false);
+
+    const invalid = await executeTeamApiOperation('retry-failed-task', {
+      team_name: 'x',
+      task_id: '1',
+      expected_version: 0,
+    }, '/tmp');
+    assert.equal(invalid.ok, false);
+    if (!invalid.ok) assert.match(invalid.error.message, /positive integer/);
   });
 });
 

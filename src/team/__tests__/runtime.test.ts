@@ -5370,6 +5370,90 @@ exec "${realGit}" "$@"
     }
   });
 
+  it('monitorTeam skips leader-contained commits before cherry-picking newer diverged worker commits', async () => {
+    const repo = await initRepo();
+    let workerPath = '';
+    try {
+      const baseline = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf-8' }).trim();
+      workerPath = await addWorktree(repo, 'wk1-partial-div-branch', 'omx-runtime-wk1-partial-diverged-');
+
+      await writeFile(join(workerPath, 'landed.txt'), 'already landed\n', 'utf-8');
+      execFileSync('git', ['add', 'landed.txt'], { cwd: workerPath, stdio: 'ignore' });
+      execFileSync('git', ['commit', '-m', 'worker landed change'], { cwd: workerPath, stdio: 'ignore' });
+      const landedCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workerPath, encoding: 'utf-8' }).trim();
+
+      execFileSync('git', ['merge', '--ff-only', 'wk1-partial-div-branch'], { cwd: repo, stdio: 'ignore' });
+      await writeFile(join(repo, 'leader-only.txt'), 'leader divergence\n', 'utf-8');
+      execFileSync('git', ['add', 'leader-only.txt'], { cwd: repo, stdio: 'ignore' });
+      execFileSync('git', ['commit', '-m', 'leader diverged change'], { cwd: repo, stdio: 'ignore' });
+
+      await writeFile(join(workerPath, 'new-worker.txt'), 'new worker change\n', 'utf-8');
+      execFileSync('git', ['add', 'new-worker.txt'], { cwd: workerPath, stdio: 'ignore' });
+      execFileSync('git', ['commit', '-m', 'worker new change'], { cwd: workerPath, stdio: 'ignore' });
+      const newCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workerPath, encoding: 'utf-8' }).trim();
+
+      await initTeamState('team-partial-diverged', 'partial diverged test', 'executor', 1, repo);
+      const cfg = await readTeamConfig('team-partial-diverged', repo);
+      assert.ok(cfg);
+      if (!cfg) throw new Error('missing config');
+      cfg.leader_pane_id = '';
+      cfg.workers[0] = {
+        ...cfg.workers[0],
+        assigned_tasks: ['1'],
+        worktree_repo_root: repo,
+        worktree_path: workerPath,
+        worktree_branch: 'wk1-partial-div-branch',
+        worktree_detached: false,
+        worktree_created: false,
+      };
+      await saveTeamConfig(cfg, repo);
+      await writeAtomic(
+        join(repo, '.omx', 'state', 'team', 'team-partial-diverged', 'monitor-snapshot.json'),
+        JSON.stringify({
+          taskStatusById: {},
+          workerAliveByName: {},
+          workerStateByName: {},
+          workerTurnCountByName: {},
+          workerTaskIdByName: {},
+          mailboxNotifiedByMessageId: {},
+          completedEventTaskIds: {},
+          integrationByWorker: {
+            'worker-1': {
+              last_integrated_head: baseline,
+            },
+          },
+        }, null, 2),
+      );
+
+      const leaderCommitCountBefore = Number(
+        execFileSync('git', ['rev-list', '--count', 'HEAD'], { cwd: repo, encoding: 'utf-8' }).trim(),
+      );
+      await monitorTeam('team-partial-diverged', repo);
+      const leaderCommitCountAfter = Number(
+        execFileSync('git', ['rev-list', '--count', 'HEAD'], { cwd: repo, encoding: 'utf-8' }).trim(),
+      );
+
+      assert.equal(leaderCommitCountAfter, leaderCommitCountBefore + 1, 'only the unseen worker commit should be cherry-picked');
+      assert.equal(await readFile(join(repo, 'landed.txt'), 'utf-8'), 'already landed\n');
+      assert.equal(await readFile(join(repo, 'new-worker.txt'), 'utf-8'), 'new worker change\n');
+
+      const events = await readTeamEvents('team-partial-diverged', repo, { wakeableOnly: false });
+      const detectedCommits = events
+        .filter((event) => event.type === 'worker_cherry_pick_detected')
+        .map((event) => event.metadata?.commit);
+      assert.deepEqual(detectedCommits, [newCommit]);
+      assert.equal(detectedCommits.includes(landedCommit), false);
+
+      const snapshot = await readMonitorSnapshot('team-partial-diverged', repo);
+      assert.equal(snapshot?.integrationByWorker?.['worker-1']?.last_integrated_head, newCommit);
+    } finally {
+      if (workerPath) {
+        await rm(workerPath, { recursive: true, force: true });
+      }
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
   it('monitorTeam rebases idle workers after integration lands on leader (cross-worker rebase)', async () => {
     const repo = await initRepo();
     let worker1Path = '';
