@@ -32,8 +32,14 @@ import {
   resolveStateScope,
 } from '../mcp/state-paths.js';
 import { completeRalplanSession, validateRalplanTerminalConsensus } from '../state/operations.js';
-import { withWorkflowStateLock } from '../state/workflow-state-lock.js';
-import { withWorkflowStateTransaction } from '../state/workflow-state-transaction.js';
+import {
+  withWorkflowStateLock,
+  type WorkflowStateLockLease,
+} from '../state/workflow-state-lock.js';
+import {
+  withWorkflowStateTransaction,
+  type WorkflowStateTransactionLease,
+} from '../state/workflow-state-transaction.js';
 
 export interface ModeState {
   active: boolean;
@@ -57,12 +63,14 @@ export type DeprecatedModeName = 'ultrapilot' | 'pipeline' | 'ecomode';
 
 export interface UpdateModeStateOptions extends WorkflowTransitionOptions {
   trustedPipelineProgress?: boolean;
-  workflowLockHeld?: boolean;
+  workflowLockLease?: WorkflowStateLockLease;
+  workflowTransactionLease?: WorkflowStateTransactionLease;
 }
 
 export interface StartModeOptions extends WorkflowTransitionOptions {
   preflightTransition?: PreflightedWorkflowTransition;
-  workflowLockHeld?: boolean;
+  workflowLockLease?: WorkflowStateLockLease;
+  workflowTransactionLease?: WorkflowStateTransactionLease;
 }
 
 const DEPRECATED_MODES: Record<DeprecatedModeName, string> = {
@@ -174,12 +182,12 @@ export async function startMode(
 ): Promise<ModeState> {
   const scope = await resolveStateScope(projectRoot);
   const baseStateDir = getBaseStateDir(projectRoot);
-  if (isTrackedWorkflowMode(mode) && !options.workflowLockHeld) {
+  if (isTrackedWorkflowMode(mode) && !options.workflowLockLease) {
     return withWorkflowStateLock(
       baseStateDir,
-      () => startMode(mode, taskDescription, maxIterations, projectRoot, {
+      (workflowLockLease) => startMode(mode, taskDescription, maxIterations, projectRoot, {
         ...options,
-        workflowLockHeld: true,
+        workflowLockLease,
       }),
     );
   }
@@ -194,7 +202,7 @@ export async function startMode(
         baseStateDir,
         allowNestedAutopilotTeam: options.allowNestedAutopilotTeam,
         preflight: options.preflightTransition,
-        workflowLockHeld: true,
+        workflowLockLease: options.workflowLockLease,
       });
       transitionMessage = transition.transitionMessage;
     }
@@ -236,6 +244,11 @@ export async function startMode(
       projectRoot ?? process.cwd(),
       scope.sessionId,
       run,
+      [],
+      {
+        lockLease: options.workflowLockLease,
+        transactionLease: options.workflowTransactionLease,
+      },
     )
     : run();
 }
@@ -317,12 +330,12 @@ export async function updateModeState(
 ): Promise<ModeState> {
   const scope = await resolveStateScope(projectRoot, explicitSessionId);
   const baseStateDir = getBaseStateDir(projectRoot);
-  if (isTrackedWorkflowMode(mode) && !options.workflowLockHeld) {
+  if (isTrackedWorkflowMode(mode) && !options.workflowLockLease) {
     return withWorkflowStateLock(
       baseStateDir,
-      () => updateModeState(mode, updates, projectRoot, explicitSessionId, {
+      (workflowLockLease) => updateModeState(mode, updates, projectRoot, explicitSessionId, {
         ...options,
-        workflowLockHeld: true,
+        workflowLockLease,
       }),
     );
   }
@@ -440,6 +453,11 @@ export async function updateModeState(
       projectRoot ?? process.cwd(),
       scope.sessionId,
       run,
+      [],
+      {
+        lockLease: options.workflowLockLease,
+        transactionLease: options.workflowTransactionLease,
+      },
     )
     : run();
 }

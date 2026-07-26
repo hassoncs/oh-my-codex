@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { chmod, mkdtemp, rename, rm, writeFile, readFile, mkdir, utimes } from 'fs/promises';
 import { dirname, join } from 'path';
 import { tmpdir } from 'os';
@@ -55,14 +56,20 @@ import {
 import { normalizeDispatchRequest } from '../state/dispatch.js';
 import { readModeState, startMode, updateModeState } from '../../modes/base.js';
 import { listActiveSkills, readVisibleSkillActiveState } from '../../state/skill-active.js';
+import {
+  setWorkflowStateLockTestConfig,
+  withWorkflowStateLock,
+} from '../../state/workflow-state-lock.js';
 
 const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
+const CHILD_NODE_ARGS = import.meta.url.endsWith('.ts') ? ['--import', import.meta.resolve('tsx')] : [];
 
 beforeEach(() => {
   delete process.env.OMX_TEAM_STATE_ROOT;
 });
 
 afterEach(() => {
+  setWorkflowStateLockTestConfig();
   resetWriteAtomicRenameForTests();
   if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
   else delete process.env.OMX_TEAM_STATE_ROOT;
@@ -1794,7 +1801,7 @@ exit 1
     }
   });
 
-  it('recovers a committed retry intent after workflow reactivation interruption', async () => {
+  it('rolls back retry task, workflow, phase, intent, and event after reactivation interruption', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-recovery-'));
     try {
       const teamName = 'retry-recovery';
@@ -1846,24 +1853,130 @@ exit 1
       resetWriteAtomicRenameForTests();
 
       const intentPath = join(cwd, '.omx', 'state', 'team', teamName, 'retry-intents', `task-${task.id}.json`);
-      assert.equal((await readTask(teamName, task.id, cwd))?.status, 'pending');
-      assert.equal(existsSync(intentPath), true);
-
-      await reconcileFailedTaskRetryIntents(teamName, cwd);
-
+      assert.equal((await readTask(teamName, task.id, cwd))?.status, 'failed');
       assert.equal(existsSync(intentPath), false);
-      assert.equal((await readTeamPhase(teamName, cwd))?.current_phase, 'team-exec');
-      assert.equal((await readModeState('team', cwd))?.active, true);
-      const events = (await readFile(teamEventLogPath(teamName, cwd), 'utf-8'))
+      assert.equal((await readTeamPhase(teamName, cwd))?.current_phase, 'failed');
+      assert.equal((await readModeState('team', cwd))?.active, false);
+      const events = (await readFile(teamEventLogPath(teamName, cwd), 'utf-8').catch(() => ''))
         .trim()
         .split('\n')
+        .filter(Boolean)
         .map((line) => JSON.parse(line) as Record<string, unknown>);
       assert.equal(
         events.filter((event) => event.type === 'task_retried' && event.task_id === task.id).length,
-        1,
+        0,
       );
     } finally {
       resetWriteAtomicRenameForTests();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers exact retry task, workflow, phase, intent, and event bytes after SIGKILL', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-sigkill-'));
+    try {
+      const teamName = 'retry-sigkill';
+      await initTeamState(teamName, 'retry sigkill recovery', 'executor', 1, cwd);
+      const task = await createTask(teamName, {
+        subject: 'retry',
+        description: 'retry',
+        status: 'pending',
+      }, cwd);
+      const claim = await claimTask(teamName, task.id, 'worker-1', task.version, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+      const failed = await transitionTaskStatus(
+        teamName,
+        task.id,
+        'in_progress',
+        'failed',
+        claim.claimToken,
+        cwd,
+        { error: 'failed once' },
+      );
+      assert.equal(failed.ok, true);
+      if (!failed.ok) return;
+      await startMode('team', 'retry sigkill recovery', 5, cwd);
+      await updateModeState('team', {
+        active: false,
+        current_phase: 'failed',
+        completed_at: new Date().toISOString(),
+        team_name: teamName,
+      }, cwd);
+      await writeTeamPhase(teamName, {
+        current_phase: 'failed',
+        max_fix_attempts: 3,
+        current_fix_attempt: 3,
+        transitions: [],
+        updated_at: new Date().toISOString(),
+      }, cwd);
+
+      const stateDir = join(cwd, '.omx', 'state');
+      const taskPath = join(stateDir, 'team', teamName, 'tasks', `task-${task.id}.json`);
+      const intentPath = join(stateDir, 'team', teamName, 'retry-intents', `task-${task.id}.json`);
+      const paths = [
+        taskPath,
+        join(stateDir, 'team-state.json'),
+        join(stateDir, 'skill-active-state.json'),
+        join(stateDir, 'run-state.json'),
+        join(stateDir, 'team', teamName, 'phase.json'),
+        teamEventLogPath(teamName, cwd),
+      ];
+      const before = new Map(await Promise.all(paths.map(async (path) => [
+        path,
+        await readFile(path, 'utf-8'),
+      ] as const)));
+      const markerPath = join(cwd, 'retry-mutated');
+      const stateUrl = new URL('../state.js', import.meta.url).href;
+      const transactionUrl = new URL('../../state/workflow-state-transaction.js', import.meta.url).href;
+      const script = `
+        const { readFile, writeFile } = await import('node:fs/promises');
+        const { retryFailedTask } = await import(${JSON.stringify(stateUrl)});
+        const { setWorkflowStateTransactionTestConfig } = await import(${JSON.stringify(transactionUrl)});
+        setWorkflowStateTransactionTestConfig({
+          hook: async (stage, path) => {
+            if (stage !== 'before-file-sync' || path !== ${JSON.stringify(taskPath)}) return;
+            const task = JSON.parse(await readFile(path, 'utf-8'));
+            if (task.status !== 'pending') return;
+            await writeFile(${JSON.stringify(markerPath)}, 'ready');
+            process.kill(process.pid, 'SIGKILL');
+          },
+        });
+        await retryFailedTask(
+          ${JSON.stringify(teamName)},
+          ${JSON.stringify(task.id)},
+          ${failed.task.version},
+          ${JSON.stringify(cwd)},
+        );
+      `;
+      const child = spawn(
+        process.execPath,
+        [...CHILD_NODE_ARGS, '--input-type=module', '--eval', script],
+        { stdio: 'ignore' },
+      );
+      await new Promise<void>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', () => resolve());
+      });
+      assert.equal(existsSync(markerPath), true);
+      assert.equal(existsSync(join(stateDir, '.workflow-state-transaction.json')), true);
+
+      const lockDir = join(stateDir, '.workflow-state.lock');
+      await utimes(lockDir, new Date(0), new Date(0));
+      setWorkflowStateLockTestConfig({
+        staleMs: 0,
+        timeoutMs: 1_000,
+        retryMs: 1,
+        processIsAlive: () => false,
+      });
+      await withWorkflowStateLock(stateDir, async () => {});
+
+      for (const [path, content] of before) {
+        assert.equal(await readFile(path, 'utf-8'), content);
+      }
+      assert.equal(existsSync(intentPath), false);
+      assert.equal(existsSync(join(stateDir, '.workflow-state-transaction.json')), false);
+    } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });

@@ -73,6 +73,7 @@ import {
 } from "../mcp/state-paths.js";
 import { evaluateRalphCompletionAuditEvidence, isRalphCompletePhase } from "../ralph/completion-audit.js";
 import { normalizeTerminalWorkflowState } from "../state/terminal-normalization.js";
+import { syncRunStateFromModeState } from "../runtime/run-state.js";
 import {
   readPersistedSetupPreferences,
   resolveCodexConfigPathForLaunch,
@@ -113,6 +114,8 @@ import {
   type SkillActiveStateLike,
 } from "../state/skill-active.js";
 import { isTrackedWorkflowMode } from "../state/workflow-transition.js";
+import { withWorkflowStateLock } from "../state/workflow-state-lock.js";
+import { withWorkflowStateTransaction } from "../state/workflow-state-transaction.js";
 import { maybeCheckAndPromptUpdate, runImmediateUpdate, type UpdateChannel } from "./update.js";
 import { maybePromptGithubStar } from "./star-prompt.js";
 import {
@@ -4821,7 +4824,7 @@ function markRalphCompletionAuditBlockedForPostLaunch(
   return true;
 }
 
-export async function cleanupPostLaunchModeStateFiles(
+async function cleanupPostLaunchModeStateFilesLocked(
   cwd: string,
   sessionId: string,
   dependencies: PostLaunchModeCleanupDependencies = {},
@@ -4842,6 +4845,9 @@ export async function cleanupPostLaunchModeStateFiles(
   let preserveSkillActiveForReviewPendingAutopilot = false;
 
   for (const stateDir of scopedDirs) {
+    const targetSessionId = stateDir === getStateDir(cwd, sessionId)
+      ? sessionId
+      : undefined;
     const files = await readdir(stateDir).catch(() => [] as string[]);
     const autopilotPath = join(stateDir, "autopilot-state.json");
     const autopilotPrecheck = files.includes("autopilot-state.json")
@@ -4870,6 +4876,13 @@ export async function cleanupPostLaunchModeStateFiles(
                 2,
               ),
             );
+            if (mode !== SKILL_ACTIVE_STATE_MODE) {
+              await syncRunStateFromModeState(
+                buildRecoveredPostLaunchModeState(mode, completedAt),
+                cwd,
+                targetSessionId,
+              );
+            }
             if (isTrackedWorkflowMode(mode)) {
               await syncCanonicalSkillStateForMode({
                 cwd,
@@ -4877,7 +4890,7 @@ export async function cleanupPostLaunchModeStateFiles(
                 mode,
                 active: false,
                 currentPhase: "cancelled",
-                sessionId: stateDir === getStateDir(cwd, sessionId) ? sessionId : undefined,
+                sessionId: targetSessionId,
                 nowIso: completedAt,
                 source: "postLaunchCleanup",
               });
@@ -4886,6 +4899,7 @@ export async function cleanupPostLaunchModeStateFiles(
             writeWarn(
               `[omx] postLaunch: failed to recover mode state ${path}: ${err instanceof Error ? err.message : err}`,
             );
+            throw err;
           }
         } else if (result.kind === "malformed") {
           writeWarn(
@@ -4916,11 +4930,14 @@ export async function cleanupPostLaunchModeStateFiles(
               mode,
               active: false,
               currentPhase: "cancelled",
-              sessionId: stateDir === getStateDir(cwd, sessionId) ? sessionId : undefined,
+              sessionId: targetSessionId,
               nowIso: completedAt,
               source: "postLaunchCleanup",
             });
           }
+        }
+        if (mode !== SKILL_ACTIVE_STATE_MODE) {
+          await syncRunStateFromModeState(result.state, cwd, targetSessionId);
         }
         continue;
       }
@@ -4950,6 +4967,7 @@ export async function cleanupPostLaunchModeStateFiles(
           result.state.stop_reason = cleanPostLaunchString(result.state.stop_reason) || "session_exit";
         }
         await writeFile(path, JSON.stringify(result.state, null, 2));
+        await syncRunStateFromModeState(result.state, cwd, targetSessionId);
         if (isTrackedWorkflowMode(mode)) {
           await syncCanonicalSkillStateForMode({
             cwd,
@@ -4957,7 +4975,7 @@ export async function cleanupPostLaunchModeStateFiles(
             mode,
             active: false,
             currentPhase: "cancelled",
-            sessionId: stateDir === getStateDir(cwd, sessionId) ? sessionId : undefined,
+            sessionId: targetSessionId,
             nowIso: completedAt,
             source: "postLaunchCleanup",
           });
@@ -4966,6 +4984,7 @@ export async function cleanupPostLaunchModeStateFiles(
         writeWarn(
           `[omx] postLaunch: failed to update mode state ${path}: ${err instanceof Error ? err.message : err}`,
         );
+        throw err;
       }
     }
   }
@@ -4985,8 +5004,27 @@ export async function cleanupPostLaunchModeStateFiles(
       writeWarn(
         `[omx] postLaunch: failed to reconcile root skill-active state: ${err instanceof Error ? err.message : err}`,
       );
+      throw err;
     }
   }
+}
+
+export async function cleanupPostLaunchModeStateFiles(
+  cwd: string,
+  sessionId: string,
+  dependencies: PostLaunchModeCleanupDependencies = {},
+): Promise<void> {
+  const baseStateDir = getBaseStateDir(cwd);
+  await withWorkflowStateLock(baseStateDir, (lockLease) =>
+    withWorkflowStateTransaction(
+      baseStateDir,
+      cwd,
+      sessionId || undefined,
+      () => cleanupPostLaunchModeStateFilesLocked(cwd, sessionId, dependencies),
+      [],
+      { lockLease },
+    ),
+  );
 }
 
 export async function reapPostLaunchOrphanedMcpProcesses(

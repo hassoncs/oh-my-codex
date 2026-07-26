@@ -3776,7 +3776,7 @@ process.on('SIGTERM', () => process.exit(0));
               [{ subject: 's', description: 'd', owner: 'worker-1' }],
               cwd,
               {
-                commitModeState: async (runtime) => {
+                commitModeState: async (runtime, authority) => {
                   runtimeTeamName = runtime.teamName;
                   workerPid = runtime.config.workers[0]?.pid ?? 0;
                   assert.ok(workerPid > 0, 'prompt worker must exist before mode-state commit');
@@ -3784,7 +3784,10 @@ process.on('SIGTERM', () => process.exit(0));
                     existsSync(join(cwd, '.omx', 'state', 'team', runtime.teamName)),
                     true,
                   );
-                  await startMode('team', 'partial mode-state commit', 5, cwd);
+                  await startMode('team', 'partial mode-state commit', 5, cwd, {
+                    workflowLockLease: authority.lockLease,
+                    workflowTransactionLease: authority.transactionLease,
+                  });
                   throw new Error('simulated_mode_state_commit_failure');
                 },
               },
@@ -3842,9 +3845,12 @@ process.on('SIGTERM', () => process.exit(0));
               [{ subject: 's', description: 'd', owner: 'worker-1' }],
               cwd,
               {
-                commitModeState: async (runtime) => {
+                commitModeState: async (runtime, authority) => {
                   workerPid = runtime.config.workers[0]?.pid ?? 0;
-                  await startMode('team', 'partial mode-state commit', 5, cwd);
+                  await startMode('team', 'partial mode-state commit', 5, cwd, {
+                    workflowLockLease: authority.lockLease,
+                    workflowTransactionLease: authority.transactionLease,
+                  });
                   concurrent.write = runContendedWorkflowWrite(cwd, contendedPath);
                   await waitForFileText(contendedPath, (content) => content === 'contended', 10_000);
                   throw new Error('simulated_concurrent_mode_state_commit_failure');
@@ -5147,10 +5153,28 @@ process.on('SIGTERM', () => process.exit(0));
         cwd,
       );
       const rootStatePath = join(cwd, '.omx', 'state', 'team-state.json');
+      const canonicalPath = join(cwd, '.omx', 'state', 'skill-active-state.json');
+      const runStatePath = join(cwd, '.omx', 'state', 'run-state.json');
       await writeFile(rootStatePath, JSON.stringify({
         active: true,
+        mode: 'team',
         current_phase: 'team-exec',
         team_name: 'team-root-sync',
+      }, null, 2));
+      await writeFile(canonicalPath, JSON.stringify({
+        version: 1,
+        active: true,
+        skill: 'team',
+        phase: 'team-exec',
+        active_skills: [{ skill: 'team', phase: 'team-exec', active: true }],
+      }, null, 2));
+      await writeFile(runStatePath, JSON.stringify({
+        version: 1,
+        mode: 'team',
+        active: true,
+        outcome: 'continue',
+        current_phase: 'team-exec',
+        updated_at: new Date().toISOString(),
       }, null, 2));
 
       const snapshot = await monitorTeam('team-root-sync', cwd);
@@ -5161,6 +5185,17 @@ process.on('SIGTERM', () => process.exit(0));
       assert.equal(rootState.active, false);
       assert.equal(rootState.current_phase, 'complete');
       assert.ok(typeof rootState.completed_at === 'string' && rootState.completed_at.length > 0);
+      const canonical = JSON.parse(await readFile(canonicalPath, 'utf-8')) as {
+        active_skills?: Array<{ skill?: string; active?: boolean }>;
+      };
+      assert.equal(
+        canonical.active_skills?.some((entry) => entry.skill === 'team' && entry.active !== false),
+        false,
+      );
+      const runState = JSON.parse(await readFile(runStatePath, 'utf-8')) as Record<string, unknown>;
+      assert.equal(runState.active, false);
+      assert.equal(runState.current_phase, 'complete');
+      assert.equal(runState.outcome, 'finish');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

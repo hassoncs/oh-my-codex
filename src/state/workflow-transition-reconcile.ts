@@ -27,7 +27,10 @@ import {
 } from '../autopilot/deep-interview-gate.js';
 import { isAutopilotSupervisingChild } from '../autopilot/fsm.js';
 import { resolveLeaderOwnedUltragoalContextOutcome } from '../team/ultragoal-context.js';
-import { withWorkflowStateLock } from './workflow-state-lock.js';
+import {
+  withWorkflowStateLock,
+  type WorkflowStateLockLease,
+} from './workflow-state-lock.js';
 
 interface TransitionStateLike {
   active?: unknown;
@@ -306,7 +309,7 @@ export async function preflightWorkflowTransition(
     baseStateDir?: string;
     currentModes?: Iterable<string>;
     allowNestedAutopilotTeam?: boolean;
-    workflowLockHeld?: boolean;
+    workflowLockLease?: WorkflowStateLockLease;
   } = {},
 ): Promise<PreflightedWorkflowTransition> {
   const {
@@ -314,12 +317,12 @@ export async function preflightWorkflowTransition(
     sessionId,
     baseStateDir,
   } = options;
-  if (!options.workflowLockHeld) {
+  if (!options.workflowLockLease) {
     return withWorkflowStateLock(
       baseStateDir ? resolve(baseStateDir) : getBaseStateDir(cwd),
-      () => preflightWorkflowTransition(cwd, requestedMode, {
+      (workflowLockLease) => preflightWorkflowTransition(cwd, requestedMode, {
         ...options,
-        workflowLockHeld: true,
+        workflowLockLease,
       }),
     );
   }
@@ -368,7 +371,7 @@ export async function reconcileWorkflowTransition(
     currentModes?: Iterable<string>;
     allowNestedAutopilotTeam?: boolean;
     preflight?: PreflightedWorkflowTransition;
-    workflowLockHeld?: boolean;
+    workflowLockLease?: WorkflowStateLockLease;
   } = {},
 ): Promise<ReconciledWorkflowTransition> {
   const {
@@ -378,12 +381,12 @@ export async function reconcileWorkflowTransition(
     source = 'workflow-transition',
     baseStateDir,
   } = options;
-  if (!options.workflowLockHeld) {
+  if (!options.workflowLockLease) {
     return withWorkflowStateLock(
       baseStateDir ? resolve(baseStateDir) : getBaseStateDir(cwd),
-      () => reconcileWorkflowTransition(cwd, requestedMode, {
+      (workflowLockLease) => reconcileWorkflowTransition(cwd, requestedMode, {
         ...options,
-        workflowLockHeld: true,
+        workflowLockLease,
       }),
     );
   }
@@ -434,7 +437,7 @@ export async function reconcileWorkflowTransition(
       baseStateDir,
       currentModes: options.currentModes,
       allowNestedAutopilotTeam: options.allowNestedAutopilotTeam,
-      workflowLockHeld: true,
+      workflowLockLease: options.workflowLockLease,
     })).decision;
   }
 

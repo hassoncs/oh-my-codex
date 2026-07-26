@@ -54,7 +54,11 @@ import {
 } from '../state/workflow-transition-reconcile.js';
 import { withWorkflowStateLock } from '../state/workflow-state-lock.js';
 import { syncCanonicalSkillStateForMode } from '../state/skill-active.js';
-import { withWorkflowStateTransaction } from '../state/workflow-state-transaction.js';
+import {
+  withWorkflowStateTransaction,
+  type WorkflowStateMutationAuthority,
+} from '../state/workflow-state-transaction.js';
+import { syncRunStateFromModeState } from '../runtime/run-state.js';
 
 interface TeamCliOptions {
   verbose?: boolean;
@@ -88,16 +92,18 @@ export interface TeamModeStartPreflight {
   workflowTransition: PreflightedWorkflowTransition;
 }
 
-function persistExactTeamModeState(
+async function persistExactTeamModeState(
   cwd: string,
   updates: Record<string, unknown>,
   sessionId?: string,
-): boolean {
+): Promise<boolean> {
   const statePath = getStatePath('team', cwd, sessionId);
   if (!existsSync(statePath)) return false;
 
   const current = JSON.parse(readFileSync(statePath, 'utf-8')) as Record<string, unknown>;
-  writeFileSync(statePath, JSON.stringify({ ...current, ...updates }, null, 2));
+  const next = { ...current, ...updates };
+  writeFileSync(statePath, JSON.stringify(next, null, 2));
+  await syncRunStateFromModeState(next, cwd, sessionId);
   return true;
 }
 
@@ -1254,6 +1260,7 @@ async function ensureTeamModeState(
   parsed: ParsedTeamArgs,
   tasks?: Array<{ role?: string }>,
   preflight?: TeamModeStartPreflight,
+  authority?: WorkflowStateMutationAuthority,
 ): Promise<void> {
   const fallbackRole = resolveImplicitTeamFallbackRole(parsed.agentType, parsed.explicitAgentType);
   const roleDistribution = tasks && tasks.length > 0
@@ -1274,14 +1281,14 @@ async function ensureTeamModeState(
   const cwd = process.cwd();
   const scope = await resolveStateScope(cwd);
   const baseStateDir = getBaseStateDir(cwd);
-  await withWorkflowStateLock(baseStateDir, () =>
-    withWorkflowStateTransaction(baseStateDir, cwd, scope.sessionId, async () => {
+  const mutate = async (mutationAuthority: WorkflowStateMutationAuthority): Promise<void> => {
       const existing = await readModeState('team', cwd);
       if (!existing?.active) {
         await startMode('team', parsed.task, 50, cwd, {
           allowNestedAutopilotTeam: preflight?.allowNestedAutopilotTeam,
           preflightTransition: preflight?.workflowTransition,
-          workflowLockHeld: true,
+          workflowLockLease: mutationAuthority.lockLease,
+          workflowTransactionLease: mutationAuthority.transactionLease,
         });
       }
       await updateModeState('team', {
@@ -1298,9 +1305,23 @@ async function ensureTeamModeState(
         completed_at: completionStamp,
       }, cwd, scope.sessionId, {
         allowNestedAutopilotTeam: preflight?.allowNestedAutopilotTeam,
-        workflowLockHeld: true,
+        workflowLockLease: mutationAuthority.lockLease,
+        workflowTransactionLease: mutationAuthority.transactionLease,
       });
-    }),
+  };
+  if (authority) {
+    await mutate(authority);
+    return;
+  }
+  await withWorkflowStateLock(baseStateDir, (lockLease) =>
+    withWorkflowStateTransaction(
+      baseStateDir,
+      cwd,
+      scope.sessionId,
+      (transactionLease) => mutate({ lockLease, transactionLease }),
+      [],
+      { lockLease },
+    ),
   );
 
 }
@@ -1353,20 +1374,21 @@ async function persistTeamShutdownModeState(
       : {}),
   };
 
-  const rootStatePath = getStatePath('team', cwd);
-  const hasRootState = existsSync(rootStatePath);
-  const hasScopedState = scopedSessionId
-    ? existsSync(getStatePath('team', cwd, scopedSessionId))
-    : false;
   const baseStateDir = getBaseStateDir(cwd);
-  await withWorkflowStateLock(baseStateDir, () =>
-    withWorkflowStateTransaction(baseStateDir, cwd, scopedSessionId, async () => {
+  await withWorkflowStateLock(baseStateDir, (lockLease) =>
+    withWorkflowStateTransaction(baseStateDir, cwd, scopedSessionId, async (transactionLease) => {
+      const authority = { lockLease, transactionLease };
+      const rootStatePath = getStatePath('team', cwd);
+      const hasRootState = existsSync(rootStatePath);
+      const hasScopedState = scopedSessionId
+        ? existsSync(getStatePath('team', cwd, scopedSessionId))
+        : false;
       if (hasRootState || hasScopedState) {
         if (hasRootState) {
-          persistExactTeamModeState(cwd, shutdownState);
+          await persistExactTeamModeState(cwd, shutdownState);
         }
         if (scopedSessionId && hasScopedState) {
-          persistExactTeamModeState(cwd, shutdownState, scopedSessionId);
+          await persistExactTeamModeState(cwd, shutdownState, scopedSessionId);
           await syncCanonicalSkillStateForMode({
             cwd,
             baseStateDir,
@@ -1399,16 +1421,20 @@ async function persistTeamShutdownModeState(
             explicitWorkerCount: false,
             teamName,
             allowRepoAwareDagHandoff: false,
-          });
+          }, undefined, undefined, authority);
         } else {
-          await startMode('team', `shutdown team ${teamName}`, 50, cwd);
+          await startMode('team', `shutdown team ${teamName}`, 50, cwd, {
+            workflowLockLease: lockLease,
+            workflowTransactionLease: transactionLease,
+          });
         }
       }
 
       await updateModeState('team', shutdownState, cwd, scopedSessionId, {
-        workflowLockHeld: true,
+        workflowLockLease: lockLease,
+        workflowTransactionLease: transactionLease,
       });
-    }),
+    }, [], { lockLease }),
   );
 }
 
@@ -1816,7 +1842,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       worktreeMode,
       decompositionMetadata: executionPlan.metadata,
       approvedExecution: parsed.approvedExecution ?? null,
-      commitModeState: async (startedRuntime) => {
+      commitModeState: async (startedRuntime, authority) => {
         await ensureTeamModeState(
           {
             ...effectiveParsed,
@@ -1825,6 +1851,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
           },
           tasks,
           modePreflight,
+          authority,
         );
       },
     },

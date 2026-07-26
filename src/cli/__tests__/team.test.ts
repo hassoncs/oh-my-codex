@@ -1493,6 +1493,12 @@ describe('teamCommand shutdown --force parsing', () => {
       assert.equal(scopedState.current_phase, 'cancelled');
       assert.equal(scopedState.team_name, teamName);
       assert.ok(typeof scopedState.completed_at === 'string' && scopedState.completed_at.length > 0);
+      const scopedRunState = JSON.parse(
+        await readFile(join(scopedStateDir, 'run-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(scopedRunState.active, false);
+      assert.equal(scopedRunState.current_phase, 'cancelled');
+      assert.equal(scopedRunState.outcome, 'cancelled');
       for (const path of [
         join(stateDir, 'skill-active-state.json'),
         join(scopedStateDir, 'skill-active-state.json'),

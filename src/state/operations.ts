@@ -792,7 +792,7 @@ export async function executeStateOperation(
         let transitionMessage: string | undefined;
         let ensureRalphArtifacts = false;
 
-        await withWorkflowStateLock(baseStateDir, async () => {
+        await withWorkflowStateLock(baseStateDir, async (lockLease) => {
           try {
             await withWorkflowStateTransaction(baseStateDir, cwd, effectiveSessionId, async () => {
               await withStateWriteLock(path, async () => {
@@ -1000,7 +1000,7 @@ export async function executeStateOperation(
                 sessionId: effectiveSessionId,
                 source: 'state-operations',
                 baseStateDir,
-                workflowLockHeld: true,
+                workflowLockLease: lockLease,
                 ...(transitionCurrentModes ? { currentModes: transitionCurrentModes } : {}),
               });
               transitionMessage ??= transition.transitionMessage;
@@ -1048,7 +1048,7 @@ export async function executeStateOperation(
                   });
                 }
               }
-            });
+            }, [], { lockLease });
           } catch (error) {
             if (!validationError) throw error;
           }
@@ -1079,24 +1079,26 @@ export async function executeStateOperation(
 
         const mode = validateStateModeSegment(rawArgs.mode);
         const allSessions = rawArgs.all_sessions === true;
-        const paths = allSessions
-          ? await getAllScopedStatePaths(mode, cwd)
-          : [getStatePath(mode, cwd, effectiveSessionId)];
-        const transactionPaths = [...paths];
-        if (effectiveSessionId) {
-          transactionPaths.push(
-            join(baseStateDir, 'native-stop-state.json'),
-            join(baseStateDir, 'sessions', effectiveSessionId, 'native-stop-state.json'),
-          );
-        }
-        if (allSessions) {
-          transactionPaths.push(
-            ...(await getAllScopedStateDirs(cwd)).map((dir) => join(dir, 'skill-active-state.json')),
-          );
-        }
+        return await withWorkflowStateLock(baseStateDir, async (lockLease) => {
+          const paths = allSessions
+            ? await getAllScopedStatePaths(mode, cwd)
+            : [getStatePath(mode, cwd, effectiveSessionId)];
+          const scopedDirs = allSessions ? await getAllScopedStateDirs(cwd) : [];
+          const transactionPaths = [
+            ...paths,
+            ...scopedDirs.flatMap((dir) => [
+              join(dir, 'skill-active-state.json'),
+              join(dir, 'native-stop-state.json'),
+            ]),
+          ];
+          if (!allSessions && effectiveSessionId) {
+            transactionPaths.push(
+              join(baseStateDir, 'native-stop-state.json'),
+              join(baseStateDir, 'sessions', effectiveSessionId, 'native-stop-state.json'),
+            );
+          }
 
-        return await withWorkflowStateLock(baseStateDir, () =>
-          withWorkflowStateTransaction(baseStateDir, cwd, effectiveSessionId, async () => {
+          return withWorkflowStateTransaction(baseStateDir, cwd, effectiveSessionId, async () => {
             if (!allSessions) {
               const [path] = paths;
               if (
@@ -1160,8 +1162,8 @@ export async function executeStateOperation(
                 warning: 'all_sessions clears global and session-scoped state files',
               },
             };
-          }, transactionPaths),
-        );
+          }, transactionPaths, { lockLease });
+        });
       }
 
       case 'state_list_active': {

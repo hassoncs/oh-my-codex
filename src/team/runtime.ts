@@ -140,8 +140,11 @@ import { buildRebalanceDecisions } from './rebalance-policy.js';
 import { getBaseStateDir, getStatePath, resolveStateScope } from '../mcp/state-paths.js';
 import { syncCanonicalSkillStateForMode } from '../state/skill-active.js';
 import { withWorkflowStateLock } from '../state/workflow-state-lock.js';
-import { withWorkflowStateTransaction } from '../state/workflow-state-transaction.js';
-import { readModeState, updateModeState } from '../modes/base.js';
+import {
+  withWorkflowStateTransaction,
+  type WorkflowStateMutationAuthority,
+} from '../state/workflow-state-transaction.js';
+import { syncRunStateFromModeState } from '../runtime/run-state.js';
 import { resolveWorktreeToolContext, worktreeToolContextEnv } from '../utils/worktree-tool-context.js';
 
 export { resolveTeamWorkerCliForResolvedLaunchArgs };
@@ -228,43 +231,60 @@ async function syncRootTeamModeStateOnTerminalPhase(
   teamName: string,
   phase: TeamPhase | TerminalPhase,
   cwd: string,
+  leaderSessionId?: string,
 ): Promise<void> {
   if (phase !== 'complete' && phase !== 'failed' && phase !== 'cancelled') return;
 
-  try {
-    const localStatePath = join(resolve(cwd), '.omx', 'state', 'team-state.json');
-    const localTeamState = existsSync(localStatePath)
-      ? JSON.parse(await readFile(localStatePath, 'utf-8')) as Record<string, unknown>
-      : null;
-    const teamState = localTeamState ?? await readModeState('team', cwd);
-    if (!teamState) return;
-
-    const stateTeamName = typeof teamState.team_name === 'string' ? teamState.team_name.trim() : '';
-    if (stateTeamName && stateTeamName !== teamName) return;
-
-    const alreadySynced = teamState.active === false
-      && teamState.current_phase === phase
-      && typeof teamState.completed_at === 'string'
-      && teamState.completed_at.length > 0;
-    if (alreadySynced) return;
-
-    const updates: Record<string, unknown> = {
-      active: false,
-      current_phase: phase,
-      team_name: teamName,
-    };
-    if (typeof teamState.completed_at !== 'string' || !teamState.completed_at) {
-      updates.completed_at = new Date().toISOString();
-    }
-
-    if (localTeamState) {
-      await writeFile(localStatePath, JSON.stringify({ ...localTeamState, ...updates }, null, 2), 'utf-8');
-    } else {
-      await updateModeState('team', updates, cwd);
-    }
-  } catch {
-    // Best-effort compatibility sync only.
-  }
+  const normalizedSessionId = leaderSessionId?.trim() || undefined;
+  const baseStateDir = getBaseStateDir(cwd);
+  await withWorkflowStateLock(baseStateDir, (lockLease) =>
+    withWorkflowStateTransaction(baseStateDir, cwd, normalizedSessionId, async () => {
+      const completedAt = new Date().toISOString();
+      let matched = false;
+      for (const sessionId of [undefined, normalizedSessionId]) {
+        if (sessionId === undefined && normalizedSessionId === undefined && matched) continue;
+        const path = getStatePath('team', cwd, sessionId);
+        if (!existsSync(path)) continue;
+        const state = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
+        if (!matchesTeamModeStateForShutdown(state, teamName)) continue;
+        const next = {
+          ...state,
+          active: false,
+          current_phase: phase,
+          completed_at:
+            typeof state.completed_at === 'string' && state.completed_at.trim()
+              ? state.completed_at
+              : completedAt,
+          team_name: teamName,
+        };
+        await writeFile(path, JSON.stringify(next, null, 2), 'utf-8');
+        await syncRunStateFromModeState(next, cwd, sessionId);
+        matched = true;
+      }
+      if (!matched) return;
+      if (normalizedSessionId) {
+        await syncCanonicalSkillStateForMode({
+          cwd,
+          baseStateDir,
+          mode: 'team',
+          active: false,
+          currentPhase: phase,
+          sessionId: normalizedSessionId,
+          nowIso: completedAt,
+          source: 'team-monitor-terminal',
+        });
+      }
+      await syncCanonicalSkillStateForMode({
+        cwd,
+        baseStateDir,
+        mode: 'team',
+        active: false,
+        currentPhase: phase,
+        nowIso: completedAt,
+        source: 'team-monitor-terminal',
+      });
+    }, [], { lockLease }),
+  );
 }
 
 function matchesTeamModeStateForShutdown(
@@ -297,6 +317,7 @@ async function syncExactTeamModeStateOnShutdown(
     team_name: teamName,
   };
   await writeFile(path, JSON.stringify(next, null, 2));
+  await syncRunStateFromModeState(next, cwd, sessionId);
   return true;
 }
 
@@ -307,7 +328,7 @@ async function syncTeamModeStateOnShutdown(
 ): Promise<void> {
   const normalizedLeaderSessionId = typeof leaderSessionId === 'string' ? leaderSessionId.trim() : '';
   const baseStateDir = getBaseStateDir(cwd);
-  await withWorkflowStateLock(baseStateDir, () =>
+  await withWorkflowStateLock(baseStateDir, (lockLease) =>
     withWorkflowStateTransaction(baseStateDir, cwd, normalizedLeaderSessionId || undefined, async () => {
       const rootPath = getStatePath('team', cwd);
       const sessionPath = normalizedLeaderSessionId
@@ -339,7 +360,7 @@ async function syncTeamModeStateOnShutdown(
         currentPhase: 'cancelled',
         source: 'team-shutdown',
       });
-    }),
+    }, [], { lockLease }),
   );
 }
 
@@ -1401,7 +1422,10 @@ export interface TeamStartOptions {
   cleanupLaunchOrphanedMcpProcesses?: () => Promise<CleanupResult>;
   writeCleanupWarning?: (message: string) => void;
   approvedExecution?: ApprovedTeamExecutionBinding | null;
-  commitModeState?: (runtime: TeamRuntime) => Promise<void>;
+  commitModeState?: (
+    runtime: TeamRuntime,
+    authority: WorkflowStateMutationAuthority,
+  ) => Promise<void>;
 }
 
 interface ShutdownGateCounts {
@@ -3224,12 +3248,17 @@ export async function startTeam(
     if (options.commitModeState) {
       const scope = await resolveStateScope(leaderCwd);
       const baseStateDir = getBaseStateDir(leaderCwd);
-      await withWorkflowStateLock(baseStateDir, () =>
+      await withWorkflowStateLock(baseStateDir, (lockLease) =>
         withWorkflowStateTransaction(
           baseStateDir,
           leaderCwd,
           scope.sessionId,
-          () => options.commitModeState!(runtime),
+          (transactionLease) => options.commitModeState!(runtime, {
+            lockLease,
+            transactionLease,
+          }),
+          [],
+          { lockLease },
         ),
       );
     }
@@ -3522,7 +3551,12 @@ export async function monitorTeam(teamName: string, cwd: string): Promise<TeamSn
   const phaseState: TeamPhaseState = reconcilePhaseStateForMonitor(persistedPhase, targetPhase);
   await writeTeamPhaseState(sanitized, phaseState, cwd);
   const phase: TeamPhase | TerminalPhase = phaseState.current_phase;
-  await syncRootTeamModeStateOnTerminalPhase(sanitized, phase, cwd);
+  await syncRootTeamModeStateOnTerminalPhase(
+    sanitized,
+    phase,
+    cwd,
+    manifest?.leader?.session_id,
+  );
 
   if (deadWorkerStall) {
     recommendations.push('All workers are dead while work remains; mark the team failed or restart with fresh workers.');

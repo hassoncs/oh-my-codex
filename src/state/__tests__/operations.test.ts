@@ -96,6 +96,7 @@ async function runStateWriteInChild(
     detailReadyPath?: string;
     detailReleasePath?: string;
     contendedPath?: string;
+    sessionId?: string;
   } = {},
 ): Promise<{ payload: unknown; isError?: boolean }> {
   const script = `
@@ -124,6 +125,7 @@ async function runStateWriteInChild(
     }
     const response = await executeStateOperation('state_write', {
       workingDirectory: ${JSON.stringify(workingDirectory)},
+      session_id: ${JSON.stringify(barriers.sessionId ?? undefined)},
       mode: ${JSON.stringify(mode)},
       active: true,
       current_phase: 'running',
@@ -161,6 +163,7 @@ async function runStateClearInChild(
     detailReadyPath?: string;
     detailReleasePath?: string;
     contendedPath?: string;
+    allSessions?: boolean;
   } = {},
 ): Promise<{ payload: unknown; isError?: boolean }> {
   const script = `
@@ -190,6 +193,7 @@ async function runStateClearInChild(
     const response = await executeStateOperation('state_clear', {
       workingDirectory: ${JSON.stringify(workingDirectory)},
       mode: ${JSON.stringify(mode)},
+      all_sessions: ${JSON.stringify(barriers.allSessions === true)},
     });
     process.stdout.write(JSON.stringify(response));
   `;
@@ -1172,6 +1176,69 @@ describe('state operations directory initialization', () => {
       );
     } finally {
       setWorkflowStateLockTestConfig();
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('inventories all_sessions under lock before a late session writer', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-clear-all-late-session-'));
+    try {
+      const firstSessionId = 'sess-clear-all-existing';
+      const lateSessionId = 'sess-clear-all-late';
+      const initial = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        session_id: firstSessionId,
+        mode: 'team',
+        active: true,
+        current_phase: 'running',
+      });
+      assert.equal(initial.isError, undefined);
+
+      const operationsUrl = new URL('../operations.js', import.meta.url).href;
+      const workflowLockUrl = new URL('../workflow-state-lock.js', import.meta.url).href;
+      const detailReadyPath = join(wd, 'clear-all-ready');
+      const detailReleasePath = join(wd, 'clear-all-release');
+      const contendedPath = join(wd, 'late-session-contended');
+      const clear = runStateClearInChild(
+        operationsUrl,
+        workflowLockUrl,
+        wd,
+        'team',
+        {
+          detailReadyPath,
+          detailReleasePath,
+          allSessions: true,
+        },
+      );
+      await waitForFile(detailReadyPath);
+      const write = runStateWriteInChild(
+        operationsUrl,
+        workflowLockUrl,
+        wd,
+        'team',
+        { late_session: true },
+        {
+          sessionId: lateSessionId,
+          contendedPath,
+        },
+      );
+      await waitForFile(contendedPath);
+      await writeFile(detailReleasePath, 'release');
+      const [cleared, written] = await Promise.all([clear, write]);
+
+      assert.equal(cleared.isError, undefined);
+      assert.equal(written.isError, undefined);
+      assert.equal(
+        existsSync(join(wd, '.omx', 'state', 'sessions', firstSessionId, 'team-state.json')),
+        false,
+      );
+      const lateState = JSON.parse(await readFile(
+        join(wd, '.omx', 'state', 'sessions', lateSessionId, 'team-state.json'),
+        'utf-8',
+      )) as Record<string, unknown>;
+      assert.equal(lateState.active, true);
+      assert.equal(lateState.late_session, true);
+    } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });

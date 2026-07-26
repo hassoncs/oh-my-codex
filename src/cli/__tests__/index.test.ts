@@ -1033,6 +1033,64 @@ describe("cleanupPostLaunchModeStateFiles", () => {
     assert.deepEqual(warnings, []);
   });
 
+  it("rolls back detail, canonical, and run-state when cleanup persistence fails", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-postlaunch-rollback-"));
+    const sessionId = "sess-postlaunch-rollback";
+    const stateDir = join(wd, ".omx", "state");
+    const sessionStateDir = join(stateDir, "sessions", sessionId);
+    const detailPath = join(sessionStateDir, "team-state.json");
+    const canonicalPath = join(sessionStateDir, "skill-active-state.json");
+    const runStatePath = join(sessionStateDir, "run-state.json");
+    const detailBefore = JSON.stringify({
+      active: true,
+      mode: "team",
+      current_phase: "team-exec",
+      team_name: "postlaunch-rollback",
+    }, null, 2);
+    const canonicalBefore = JSON.stringify({
+      version: 1,
+      active: true,
+      skill: "team",
+      phase: "team-exec",
+      session_id: sessionId,
+      active_skills: [
+        { skill: "team", phase: "team-exec", active: true, session_id: sessionId },
+      ],
+    }, null, 2);
+    const runStateBefore = JSON.stringify({
+      version: 1,
+      mode: "team",
+      active: true,
+      outcome: "continue",
+      updated_at: "2026-07-26T00:00:00.000Z",
+      current_phase: "team-exec",
+    }, null, 2);
+
+    try {
+      await mkdir(sessionStateDir, { recursive: true });
+      await writeFile(detailPath, detailBefore);
+      await writeFile(canonicalPath, canonicalBefore);
+      await writeFile(runStatePath, runStateBefore);
+
+      await assert.rejects(
+        () => cleanupPostLaunchModeStateFiles(wd, sessionId, {
+          writeFile: (async (path: unknown, content: unknown, options?: unknown) => {
+            await writeFile(String(path), content as string, options as BufferEncoding);
+            if (String(path) === detailPath) throw new Error("cleanup_write_failed");
+          }) as typeof writeFile,
+        }),
+        /cleanup_write_failed/,
+      );
+
+      assert.equal(await readFile(detailPath, "utf-8"), detailBefore);
+      assert.equal(await readFile(canonicalPath, "utf-8"), canonicalBefore);
+      assert.equal(await readFile(runStatePath, "utf-8"), runStateBefore);
+      assert.equal(existsSync(join(stateDir, ".workflow-state-transaction.json")), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it("normalizes stale terminal deep-interview locks during postLaunch cleanup", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-postlaunch-di-terminal-locks-"));
     const sessionId = "sess-postlaunch-di-terminal-locks";

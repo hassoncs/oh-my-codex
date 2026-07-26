@@ -1,4 +1,3 @@
-import { AsyncLocalStorage } from 'node:async_hooks';
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
@@ -15,17 +14,29 @@ interface LockOwner {
   heartbeat_at: string;
 }
 
+type LockOwnerReadResult =
+  | { kind: 'ok'; owner: LockOwner }
+  | { kind: 'missing' | 'invalid' };
+
 interface WorkflowStateLockTestConfig {
   staleMs?: number;
   timeoutMs?: number;
   retryMs?: number;
   heartbeatMs?: number;
   processIsAlive?: (pid: number) => boolean;
-  hook?: (stage: 'contended' | 'before-stale-rename') => void | Promise<void>;
+  hook?: (
+    stage: 'contended' | 'before-stale-rename' | 'before-owner-write',
+  ) => void | Promise<void>;
 }
 
 let testConfig: WorkflowStateLockTestConfig = {};
-const lockContext = new AsyncLocalStorage<Map<string, { active: boolean }>>();
+const activeLeases = new WeakSet<object>();
+
+export interface WorkflowStateLockLease {
+  readonly baseStateDir: string;
+  readonly token: string;
+  assertOwned(): Promise<void>;
+}
 
 export function setWorkflowStateLockTestConfig(config: WorkflowStateLockTestConfig = {}): void {
   testConfig = config;
@@ -35,7 +46,7 @@ function ownerToken(): string {
   return `${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
 }
 
-async function readOwner(path: string): Promise<LockOwner | null> {
+async function readOwner(path: string): Promise<LockOwnerReadResult> {
   try {
     const parsed = JSON.parse(await readFile(path, 'utf-8')) as Partial<LockOwner>;
     if (
@@ -43,11 +54,12 @@ async function readOwner(path: string): Promise<LockOwner | null> {
       || !Number.isInteger(parsed.pid)
       || typeof parsed.heartbeat_at !== 'string'
     ) {
-      return null;
+      return { kind: 'invalid' };
     }
-    return parsed as LockOwner;
-  } catch {
-    return null;
+    return { kind: 'ok', owner: parsed as LockOwner };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'missing' };
+    return { kind: 'invalid' };
   }
 }
 
@@ -63,6 +75,7 @@ function processIsAlive(pid: number): boolean {
 
 async function writeOwner(path: string, owner: LockOwner): Promise<void> {
   const tempPath = `${path}.${owner.token}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+  await testConfig.hook?.('before-owner-write');
   await writeFile(tempPath, JSON.stringify(owner), 'utf-8');
   await rename(tempPath, path);
 }
@@ -72,10 +85,12 @@ async function recoverStaleLock(lockDir: string, ownerPath: string, contenderTok
   const staleMs = testConfig.staleMs ?? DEFAULT_LOCK_STALE_MS;
   if (!observedStat || Date.now() - observedStat.mtimeMs <= staleMs) return false;
 
-  const observedOwner = await readOwner(ownerPath);
-  const heartbeatAt = observedOwner ? Date.parse(observedOwner.heartbeat_at) : Number.NaN;
+  const observedOwnerResult = await readOwner(ownerPath);
+  if (observedOwnerResult.kind !== 'ok') return false;
+  const observedOwner = observedOwnerResult.owner;
+  const heartbeatAt = Date.parse(observedOwner.heartbeat_at);
   if (Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt <= staleMs) return false;
-  if (observedOwner && processIsAlive(observedOwner.pid)) return false;
+  if (processIsAlive(observedOwner.pid)) return false;
 
   const confirmedStat = await stat(lockDir).catch(() => null);
   if (
@@ -97,13 +112,24 @@ async function recoverStaleLock(lockDir: string, ownerPath: string, contenderTok
   }
 
   const movedStat = await stat(quarantineDir).catch(() => null);
-  const movedOwner = await readOwner(join(quarantineDir, 'owner'));
-  const sameOwner = !observedOwner || movedOwner?.token === observedOwner.token;
+  const movedOwnerResult = await readOwner(join(quarantineDir, 'owner'));
+  const movedOwner = movedOwnerResult.kind === 'ok' ? movedOwnerResult.owner : null;
+  const sameOwner = Boolean(
+    movedOwner
+    && movedOwner.token === observedOwner.token
+    && movedOwner.pid === observedOwner.pid
+    && movedOwner.heartbeat_at === observedOwner.heartbeat_at
+  );
+  const movedHeartbeatAt = movedOwner ? Date.parse(movedOwner.heartbeat_at) : Number.NaN;
+  const movedOwnerIsFresh = Number.isFinite(movedHeartbeatAt) && Date.now() - movedHeartbeatAt <= staleMs;
   if (
     !movedStat
     || movedStat.dev !== observedStat.dev
     || movedStat.ino !== observedStat.ino
+    || movedStat.mtimeMs !== observedStat.mtimeMs
     || !sameOwner
+    || movedOwnerIsFresh
+    || Boolean(movedOwner && processIsAlive(movedOwner.pid))
   ) {
     await rename(quarantineDir, lockDir).catch(() => {});
     throw new Error(`workflow_state_lock_takeover_race:${lockDir}`);
@@ -115,10 +141,16 @@ async function recoverStaleLock(lockDir: string, ownerPath: string, contenderTok
 
 export async function withWorkflowStateLock<T>(
   baseStateDir: string,
-  fn: () => Promise<T>,
+  fn: (lease: WorkflowStateLockLease) => Promise<T>,
+  lease?: WorkflowStateLockLease,
 ): Promise<T> {
   const normalizedBaseStateDir = resolve(baseStateDir);
-  if (lockContext.getStore()?.get(normalizedBaseStateDir)?.active) return fn();
+  if (lease) {
+    if (!activeLeases.has(lease) || lease.baseStateDir !== normalizedBaseStateDir) {
+      throw new Error(`workflow_state_lock_invalid_lease:${baseStateDir}`);
+    }
+    return fn(lease);
+  }
 
   const lockDir = join(normalizedBaseStateDir, '.workflow-state.lock');
   const ownerPath = join(lockDir, 'owner');
@@ -153,32 +185,72 @@ export async function withWorkflowStateLock<T>(
     }
   }
 
-  const heartbeat = setInterval(() => {
-    void writeOwner(ownerPath, {
+  let heartbeatError: unknown;
+  let heartbeatWrite: Promise<void> | null = null;
+  const refreshHeartbeat = (): void => {
+    if (heartbeatWrite || heartbeatError) return;
+    heartbeatWrite = writeOwner(ownerPath, {
       token,
       pid: process.pid,
       heartbeat_at: new Date().toISOString(),
-    }).catch(() => {});
+    }).catch((error) => {
+      heartbeatError = error;
+    }).finally(() => {
+      heartbeatWrite = null;
+    });
+  };
+  const heartbeat = setInterval(() => {
+    refreshHeartbeat();
   }, heartbeatMs);
   heartbeat.unref();
 
-  try {
-    const marker = { active: true };
-    const active = new Map(lockContext.getStore() ?? []);
-    active.set(normalizedBaseStateDir, marker);
-    return await lockContext.run(active, async () => {
-      try {
-        await recoverWorkflowStateTransaction(normalizedBaseStateDir);
-        return await fn();
-      } finally {
-        marker.active = false;
+  const acquiredLease: WorkflowStateLockLease = Object.freeze({
+    baseStateDir: normalizedBaseStateDir,
+    token,
+    assertOwned: async () => {
+      if (!activeLeases.has(acquiredLease)) {
+        throw new Error(`workflow_state_lock_inactive_lease:${baseStateDir}`);
       }
-    });
+      if (heartbeatError) {
+        throw new Error(`workflow_state_lock_heartbeat_failed:${String(heartbeatError)}`);
+      }
+      if (heartbeatWrite) await heartbeatWrite;
+      if (heartbeatError) {
+        throw new Error(`workflow_state_lock_heartbeat_failed:${String(heartbeatError)}`);
+      }
+      const currentOwner = await readOwner(ownerPath);
+      if (currentOwner.kind !== 'ok' || currentOwner.owner.token !== token) {
+        throw new Error(`workflow_state_lock_ownership_lost:${baseStateDir}`);
+      }
+    },
+  });
+  activeLeases.add(acquiredLease);
+  let operationError: unknown;
+  try {
+    await recoverWorkflowStateTransaction(normalizedBaseStateDir);
+    const result = await fn(acquiredLease);
+    await acquiredLease.assertOwned();
+    return result;
+  } catch (error) {
+    operationError = error;
+    throw error;
   } finally {
+    activeLeases.delete(acquiredLease);
     clearInterval(heartbeat);
+    if (heartbeatWrite) await heartbeatWrite;
     const currentOwner = await readOwner(ownerPath);
-    if (currentOwner?.token === token) {
+    if (currentOwner.kind === 'ok' && currentOwner.owner.token === token) {
       await rm(lockDir, { recursive: true, force: true });
+    }
+    if (heartbeatError) {
+      const failure = new Error(`workflow_state_lock_heartbeat_failed:${String(heartbeatError)}`);
+      if (operationError) {
+        throw new AggregateError(
+          [operationError, failure],
+          `workflow_state_lock_operation_and_heartbeat_failed:${String(operationError)}`,
+        );
+      }
+      throw failure;
     }
   }
 }
