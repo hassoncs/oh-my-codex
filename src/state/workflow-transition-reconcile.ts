@@ -24,6 +24,8 @@ import {
   buildAutopilotDeepInterviewRalplanGateError,
   canAdvanceAutopilotDeepInterviewToRalplan,
 } from '../autopilot/deep-interview-gate.js';
+import { isAutopilotSupervisingChild } from '../autopilot/fsm.js';
+import { resolveLeaderOwnedUltragoalContextOutcome } from '../team/ultragoal-context.js';
 
 interface TransitionStateLike {
   active?: unknown;
@@ -210,6 +212,41 @@ export async function completeWorkflowModeState(
   );
 }
 
+export async function assertWorkflowTransitionContextAllowed(
+  cwd: string,
+  currentModes: Iterable<string>,
+  requestedMode: TrackedWorkflowMode,
+  options: {
+    sessionId?: string;
+    baseStateDir?: string;
+    allowNestedAutopilotTeam?: boolean;
+  } = {},
+): Promise<void> {
+  const modes = [...currentModes];
+  if (
+    !options.allowNestedAutopilotTeam
+    || requestedMode !== 'team'
+    || !modes.includes('autopilot')
+  ) {
+    return;
+  }
+
+  const autopilotState = await readJsonIfExists(
+    modeStatePathForRoot('autopilot', cwd, options.sessionId, options.baseStateDir),
+    { mode: 'autopilot', throwOnParseError: true },
+  );
+  const validChild = isAutopilotSupervisingChild(autopilotState, 'ultragoal')
+    || isAutopilotSupervisingChild(autopilotState, 'team');
+  if (!validChild) {
+    throw new Error('nested_autopilot_team_requires_active_ultragoal_child');
+  }
+
+  const ultragoalOutcome = await resolveLeaderOwnedUltragoalContextOutcome(cwd);
+  if (ultragoalOutcome.status !== 'valid') {
+    throw new Error(`invalid_ultragoal_team_context:${ultragoalOutcome.warning?.message ?? ultragoalOutcome.status}`);
+  }
+}
+
 export async function reconcileWorkflowTransition(
   cwd: string,
   requestedMode: TrackedWorkflowMode,
@@ -236,6 +273,11 @@ export async function reconcileWorkflowTransition(
   const currentModes = options.currentModes
     ? [...options.currentModes].filter(isTrackedWorkflowMode)
     : await visibleTrackedModes(cwd, sessionId, baseStateDir);
+  await assertWorkflowTransitionContextAllowed(cwd, currentModes, requestedMode, {
+    sessionId,
+    baseStateDir,
+    allowNestedAutopilotTeam: options.allowNestedAutopilotTeam,
+  });
   const decision = evaluateWorkflowTransition(currentModes, requestedMode, {
     allowNestedAutopilotTeam: options.allowNestedAutopilotTeam,
   });

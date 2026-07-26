@@ -49,4 +49,25 @@ describe('modes/base multi-state compatibility', () => {
       await rm(wd, { recursive: true, force: true });
     }
   });
+
+  it('rejects the public nested-team option without active Autopilot child context', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-mode-autopilot-team-context-'));
+    try {
+      await startMode('autopilot', 'run reviewed automation', 5, wd);
+      const autopilotPath = join(wd, '.omx', 'state', 'autopilot-state.json');
+      const autopilotState = JSON.parse(await readFile(autopilotPath, 'utf-8')) as Record<string, unknown>;
+      await writeFile(
+        autopilotPath,
+        JSON.stringify({ ...autopilotState, current_phase: 'code-review' }, null, 2),
+      );
+
+      await assert.rejects(
+        () => startMode('team', 'bypass nested context', 5, wd, { allowNestedAutopilotTeam: true }),
+        /nested_autopilot_team_requires_active_ultragoal_child/,
+      );
+      assert.equal(existsSync(join(wd, '.omx', 'state', 'team-state.json')), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
 });

@@ -5,7 +5,6 @@ import {
   updateModeState,
   startMode,
   readModeState,
-  readModeStateForActiveDecision,
 } from '../modes/base.js';
 import { getStateFilePath, getStatePath, resolveStateScope, validateSessionId } from '../mcp/state-paths.js';
 import { monitorTeam, resumeTeam, shutdownTeam, startTeam, type TeamRuntime, type TeamSnapshot } from '../team/runtime.js';
@@ -47,11 +46,9 @@ import {
   buildUltragoalCheckpointGuidance,
   reconcilePersistedTeamUltragoalContext,
   readPersistedTeamUltragoalContext,
-  resolveLeaderOwnedUltragoalContextOutcome,
   renderUltragoalCheckpointGuidanceText,
 } from '../team/ultragoal-context.js';
 import { resolveCodexHomeForLaunch } from './codex-home.js';
-import { isAutopilotSupervisingChild } from '../autopilot/fsm.js';
 import { readActiveWorkflowModes } from '../state/workflow-transition.js';
 
 interface TeamCliOptions {
@@ -1308,18 +1305,6 @@ export async function preflightTeamModeStart(cwd: string = process.cwd()): Promi
   if (!activeModes.includes('autopilot')) {
     await assertModeStartAllowed('team', cwd);
     return false;
-  }
-
-  const autopilotState = await readModeStateForActiveDecision('autopilot', scope.sessionId, cwd);
-  const validChild = isAutopilotSupervisingChild(autopilotState, 'ultragoal')
-    || isAutopilotSupervisingChild(autopilotState, 'team');
-  if (!validChild) {
-    throw new Error('nested_autopilot_team_requires_active_ultragoal_child');
-  }
-
-  const ultragoalOutcome = await resolveLeaderOwnedUltragoalContextOutcome(cwd);
-  if (ultragoalOutcome.status !== 'valid') {
-    throw new Error(`invalid_ultragoal_team_context:${ultragoalOutcome.warning?.message ?? ultragoalOutcome.status}`);
   }
 
   await assertModeStartAllowed('team', cwd, { allowNestedAutopilotTeam: true });

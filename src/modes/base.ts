@@ -12,7 +12,10 @@ import {
   readActiveWorkflowModes,
   type WorkflowTransitionOptions,
 } from '../state/workflow-transition.js';
-import { reconcileWorkflowTransition } from '../state/workflow-transition-reconcile.js';
+import {
+  assertWorkflowTransitionContextAllowed,
+  reconcileWorkflowTransition,
+} from '../state/workflow-transition-reconcile.js';
 import { syncCanonicalSkillStateForMode } from '../state/skill-active.js';
 import { validateAndNormalizeRalphState } from '../ralph/contract.js';
 import { applyRunOutcomeContract } from '../runtime/run-outcome.js';
@@ -149,7 +152,13 @@ export async function assertModeStartAllowed(
 ): Promise<void> {
   if (!isTrackedWorkflowMode(mode)) return;
   const scope = await resolveStateScope(projectRoot);
-  const activeModes = await readActiveWorkflowModes(projectRoot ?? process.cwd(), scope.sessionId);
+  const cwd = projectRoot ?? process.cwd();
+  const activeModes = await readActiveWorkflowModes(cwd, scope.sessionId);
+  await assertWorkflowTransitionContextAllowed(cwd, activeModes, mode, {
+    sessionId: scope.sessionId,
+    baseStateDir: getBaseStateDir(projectRoot),
+    allowNestedAutopilotTeam: options.allowNestedAutopilotTeam,
+  });
   assertWorkflowTransitionAllowed(activeModes, mode, 'start', options);
 }
 

@@ -327,10 +327,26 @@ export async function retryFailedTask(
     if (v.version !== expectedVersion) return { ok: false as const, error: 'claim_conflict' as const };
     if (v.status !== 'failed') return { ok: false as const, error: 'invalid_transition' as const };
 
+    const attemptHistory = Array.isArray(v.attempt_history) ? v.attempt_history : [];
     const updated: TeamTaskV2 = {
       ...v,
       status: 'pending',
       version: v.version + 1,
+      attempt_history: [
+        ...attemptHistory,
+        {
+          status: 'failed',
+          version: v.version,
+          owner: v.owner,
+          result: v.result,
+          error: v.error,
+          created_at: v.created_at,
+          completed_at: v.completed_at,
+          delegation_compliance: v.delegation_compliance,
+          coordination_compliance: v.coordination_compliance,
+          recorded_at: new Date().toISOString(),
+        },
+      ],
     };
     delete updated.owner;
     delete updated.claim;

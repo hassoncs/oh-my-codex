@@ -1450,6 +1450,23 @@ exit 1
       assert.equal(retried.task.completed_at, undefined);
       assert.equal(retried.task.delegation_compliance, undefined);
       assert.equal(retried.task.coordination_compliance, undefined);
+      assert.equal(retried.task.attempt_history?.length, 1);
+      assert.deepEqual(
+        retried.task.attempt_history?.[0],
+        {
+          status: 'failed',
+          version: failed.task.version,
+          owner: 'worker-1',
+          result: undefined,
+          error: 'old failure',
+          created_at: failed.task.created_at,
+          completed_at: failed.task.completed_at,
+          delegation_compliance: failed.task.delegation_compliance,
+          coordination_compliance: failed.task.coordination_compliance,
+          recorded_at: retried.task.attempt_history?.[0]?.recorded_at,
+        },
+      );
+      assert.match(retried.task.attempt_history?.[0]?.recorded_at ?? '', /^\d{4}-\d{2}-\d{2}T/);
 
       const duplicate = await retryFailedTask('team-retry-failed', t.id, retried.task.version, cwd);
       assert.deepEqual(duplicate, { ok: false, error: 'invalid_transition' });

@@ -182,6 +182,19 @@ export interface TeamTaskDelegationPlan {
   skip_allowed_reason_required?: boolean;
 }
 
+export interface TeamTaskAttempt {
+  status: 'failed';
+  version: number;
+  owner?: string;
+  result?: string;
+  error?: string;
+  created_at: string;
+  completed_at?: string;
+  delegation_compliance?: TeamTaskDelegationComplianceEvidence;
+  coordination_compliance?: TeamTaskCoordinationComplianceEvidence;
+  recorded_at: string;
+}
+
 export interface TeamTask {
   id: string;
   subject: string;
@@ -206,6 +219,7 @@ export interface TeamTask {
   delegation_compliance?: TeamTaskDelegationComplianceEvidence;
   coordination?: TeamTaskCoordinationPlan;
   coordination_compliance?: TeamTaskCoordinationComplianceEvidence;
+  attempt_history?: TeamTaskAttempt[];
 }
 
 export interface TeamTaskClaim {
