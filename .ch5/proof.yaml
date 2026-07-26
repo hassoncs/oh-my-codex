@@ -1,0 +1,22 @@
+version: 2
+commands:
+  fullSuite: npm test
+proofs:
+  - id: full-suite
+    kind: integration
+    stages: [dev, staging, production]
+    run:
+      command: fullSuite
+    evidence:
+      path: .ch5/artifacts/proof/full-suite
+      maxAgeHours: 24
+    triggers:
+      - paths:
+          - src/**
+          - skills/**
+          - plugins/**
+          - docs/**
+          - package.json
+          - package-lock.json
+          - tsconfig*.json
+          - .ch5/proof.yaml

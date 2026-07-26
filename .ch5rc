@@ -1,0 +1,3 @@
+id = "oh-my-codex"
+kind = "library"
+manifest = ".ch5/project.yaml"
