@@ -1,23 +1,112 @@
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-const LOCK_STALE_MS = 120_000;
-const LOCK_TIMEOUT_MS = 10_000;
-const LOCK_RETRY_MS = 25;
+const DEFAULT_LOCK_STALE_MS = 120_000;
+const DEFAULT_LOCK_TIMEOUT_MS = 10_000;
+const DEFAULT_LOCK_RETRY_MS = 25;
+const DEFAULT_LOCK_HEARTBEAT_MS = 1_000;
+
+interface LockOwner {
+  token: string;
+  pid: number;
+  heartbeat_at: string;
+}
+
+interface WorkflowStateLockTestConfig {
+  staleMs?: number;
+  timeoutMs?: number;
+  retryMs?: number;
+  heartbeatMs?: number;
+  processIsAlive?: (pid: number) => boolean;
+  hook?: (stage: 'contended' | 'before-stale-rename') => void | Promise<void>;
+}
+
+let testConfig: WorkflowStateLockTestConfig = {};
+
+export function setWorkflowStateLockTestConfig(config: WorkflowStateLockTestConfig = {}): void {
+  testConfig = config;
+}
 
 function ownerToken(): string {
   return `${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
 }
 
-async function recoverStaleLock(path: string): Promise<boolean> {
+async function readOwner(path: string): Promise<LockOwner | null> {
   try {
-    const info = await stat(path);
-    if (Date.now() - info.mtimeMs <= LOCK_STALE_MS) return false;
-    await rm(path, { recursive: true, force: true });
-    return true;
+    const parsed = JSON.parse(await readFile(path, 'utf-8')) as Partial<LockOwner>;
+    if (
+      typeof parsed.token !== 'string'
+      || !Number.isInteger(parsed.pid)
+      || typeof parsed.heartbeat_at !== 'string'
+    ) {
+      return null;
+    }
+    return parsed as LockOwner;
   } catch {
+    return null;
+  }
+}
+
+function processIsAlive(pid: number): boolean {
+  if (testConfig.processIsAlive) return testConfig.processIsAlive(pid);
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+async function writeOwner(path: string, owner: LockOwner): Promise<void> {
+  const tempPath = `${path}.${owner.token}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+  await writeFile(tempPath, JSON.stringify(owner), 'utf-8');
+  await rename(tempPath, path);
+}
+
+async function recoverStaleLock(lockDir: string, ownerPath: string, contenderToken: string): Promise<boolean> {
+  const observedStat = await stat(lockDir).catch(() => null);
+  const staleMs = testConfig.staleMs ?? DEFAULT_LOCK_STALE_MS;
+  if (!observedStat || Date.now() - observedStat.mtimeMs <= staleMs) return false;
+
+  const observedOwner = await readOwner(ownerPath);
+  const heartbeatAt = observedOwner ? Date.parse(observedOwner.heartbeat_at) : Number.NaN;
+  if (Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt <= staleMs) return false;
+  if (observedOwner && processIsAlive(observedOwner.pid)) return false;
+
+  const confirmedStat = await stat(lockDir).catch(() => null);
+  if (
+    !confirmedStat
+    || confirmedStat.dev !== observedStat.dev
+    || confirmedStat.ino !== observedStat.ino
+    || confirmedStat.mtimeMs !== observedStat.mtimeMs
+  ) {
     return false;
   }
+
+  await testConfig.hook?.('before-stale-rename');
+  const quarantineDir = `${lockDir}.stale.${contenderToken}`;
+  try {
+    await rename(lockDir, quarantineDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+
+  const movedStat = await stat(quarantineDir).catch(() => null);
+  const movedOwner = await readOwner(join(quarantineDir, 'owner'));
+  const sameOwner = !observedOwner || movedOwner?.token === observedOwner.token;
+  if (
+    !movedStat
+    || movedStat.dev !== observedStat.dev
+    || movedStat.ino !== observedStat.ino
+    || !sameOwner
+  ) {
+    await rename(quarantineDir, lockDir).catch(() => {});
+    throw new Error(`workflow_state_lock_takeover_race:${lockDir}`);
+  }
+
+  await rm(quarantineDir, { recursive: true, force: true });
+  return true;
 }
 
 export async function withWorkflowStateLock<T>(
@@ -27,13 +116,20 @@ export async function withWorkflowStateLock<T>(
   const lockDir = join(baseStateDir, '.workflow-state.lock');
   const ownerPath = join(lockDir, 'owner');
   const token = ownerToken();
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  const timeoutMs = testConfig.timeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
+  const retryMs = testConfig.retryMs ?? DEFAULT_LOCK_RETRY_MS;
+  const heartbeatMs = testConfig.heartbeatMs ?? DEFAULT_LOCK_HEARTBEAT_MS;
+  const deadline = Date.now() + timeoutMs;
   await mkdir(baseStateDir, { recursive: true });
 
   while (true) {
     try {
       await mkdir(lockDir);
-      await writeFile(ownerPath, token, 'utf-8');
+      await writeOwner(ownerPath, {
+        token,
+        pid: process.pid,
+        heartbeat_at: new Date().toISOString(),
+      });
       break;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
@@ -41,19 +137,30 @@ export async function withWorkflowStateLock<T>(
         await rm(lockDir, { recursive: true, force: true }).catch(() => {});
         throw error;
       }
-      if (await recoverStaleLock(lockDir)) continue;
+      await testConfig.hook?.('contended');
+      if (await recoverStaleLock(lockDir, ownerPath, token)) continue;
       if (Date.now() >= deadline) {
         throw new Error(`workflow_state_lock_timeout:${baseStateDir}`);
       }
-      await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
+      await new Promise((resolve) => setTimeout(resolve, retryMs));
     }
   }
+
+  const heartbeat = setInterval(() => {
+    void writeOwner(ownerPath, {
+      token,
+      pid: process.pid,
+      heartbeat_at: new Date().toISOString(),
+    }).catch(() => {});
+  }, heartbeatMs);
+  heartbeat.unref();
 
   try {
     return await fn();
   } finally {
-    const currentOwner = await readFile(ownerPath, 'utf-8').catch(() => '');
-    if (currentOwner.trim() === token) {
+    clearInterval(heartbeat);
+    const currentOwner = await readOwner(ownerPath);
+    if (currentOwner?.token === token) {
       await rm(lockDir, { recursive: true, force: true });
     }
   }

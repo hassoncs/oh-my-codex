@@ -72,6 +72,14 @@ export interface SyncCanonicalSkillStateOptions {
   workflowTransitionOptions?: WorkflowTransitionOptions;
 }
 
+let skillActiveWriteHookForTests: ((path: string) => void | Promise<void>) | null = null;
+
+export function setSkillActiveWriteHookForTests(
+  hook?: (path: string) => void | Promise<void>,
+): void {
+  skillActiveWriteHookForTests = hook ?? null;
+}
+
 function safeString(value: unknown): string {
   return typeof value === 'string' ? value : '';
 }
@@ -318,12 +326,14 @@ async function writeSkillActiveStateCopiesToPaths(
   if (normalizedRoot !== null) {
     const rootPayload = JSON.stringify(normalizedRoot, null, 2);
     await mkdir(dirname(rootPath), { recursive: true });
+    await skillActiveWriteHookForTests?.(rootPath);
     await writeFile(rootPath, rootPayload);
   }
 
   if (sessionPath) {
     const sessionPayload = JSON.stringify(normalized, null, 2);
     await mkdir(dirname(sessionPath), { recursive: true });
+    await skillActiveWriteHookForTests?.(sessionPath);
     await writeFile(sessionPath, sessionPayload);
   }
 }

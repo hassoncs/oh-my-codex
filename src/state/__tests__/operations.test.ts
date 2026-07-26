@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -77,6 +78,80 @@ function responsePayload<T extends Record<string, unknown>>(response: { payload:
   assert.equal(response.isError, undefined);
   assert.ok(response.payload && typeof response.payload === 'object' && !Array.isArray(response.payload));
   return response.payload as T;
+}
+
+async function runStateWriteInChild(
+  operationsUrl: string,
+  workflowLockUrl: string,
+  workingDirectory: string,
+  mode: 'team' | 'autopilot',
+  state: Record<string, unknown>,
+  barriers: {
+    detailReadyPath?: string;
+    detailReleasePath?: string;
+    contendedPath?: string;
+  } = {},
+): Promise<{ payload: unknown; isError?: boolean }> {
+  const script = `
+    const { existsSync } = await import('node:fs');
+    const { writeFile } = await import('node:fs/promises');
+    const { executeStateOperation, setStateWriteCommitHookForTests } = await import(${JSON.stringify(operationsUrl)});
+    const { setWorkflowStateLockTestConfig } = await import(${JSON.stringify(workflowLockUrl)});
+    const detailReadyPath = ${JSON.stringify(barriers.detailReadyPath ?? '')};
+    const detailReleasePath = ${JSON.stringify(barriers.detailReleasePath ?? '')};
+    const contendedPath = ${JSON.stringify(barriers.contendedPath ?? '')};
+    if (detailReadyPath) {
+      setStateWriteCommitHookForTests(async (stage) => {
+        if (stage !== 'detail-written') return;
+        await writeFile(detailReadyPath, 'ready');
+        while (!existsSync(detailReleasePath)) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+      });
+    }
+    if (contendedPath) {
+      setWorkflowStateLockTestConfig({
+        hook: async (stage) => {
+          if (stage === 'contended') await writeFile(contendedPath, 'contended');
+        },
+      });
+    }
+    const response = await executeStateOperation('state_write', {
+      workingDirectory: ${JSON.stringify(workingDirectory)},
+      mode: ${JSON.stringify(mode)},
+      active: true,
+      current_phase: 'running',
+      state: ${JSON.stringify(state)},
+    });
+    process.stdout.write(JSON.stringify(response));
+  `;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [...process.execArgv, '--input-type=module', '--eval', script], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf-8');
+    child.stderr.setEncoding('utf-8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`state_write_child_failed:${code}:${stderr}`));
+        return;
+      }
+      resolve(JSON.parse(stdout) as { payload: unknown; isError?: boolean });
+    });
+  });
+}
+
+async function waitForFile(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 2_000; attempt++) {
+    if (existsSync(path)) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`barrier_timeout:${path}`);
 }
 
 function validExecutionContract(stride: 'task' | 'deliverable' | 'milestone'): Record<string, unknown> {
@@ -855,6 +930,49 @@ describe('state operations directory initialization', () => {
       for (let i = 0; i < 16; i++) {
         assert.equal(state[`k${i}`], i);
       }
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('holds the workflow lock across detail and canonical writes in separate processes', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-cross-process-'));
+    try {
+      const operationsUrl = new URL('../operations.js', import.meta.url).href;
+      const workflowLockUrl = new URL('../workflow-state-lock.js', import.meta.url).href;
+      const detailReadyPath = join(wd, 'detail-ready');
+      const detailReleasePath = join(wd, 'detail-release');
+      const contendedPath = join(wd, 'contended');
+      const first = runStateWriteInChild(operationsUrl, workflowLockUrl, wd, 'team', {
+        first_field: 'first',
+      }, {
+        detailReadyPath,
+        detailReleasePath,
+      });
+      await waitForFile(detailReadyPath);
+      const second = runStateWriteInChild(operationsUrl, workflowLockUrl, wd, 'team', {
+        second_field: 'second',
+      }, {
+        contendedPath,
+      });
+      await waitForFile(contendedPath);
+      await writeFile(detailReleasePath, 'release');
+      const responses = await Promise.all([first, second]);
+
+      assert.equal(responses.filter((response) => response.isError !== true).length, 2);
+
+      const activeResponse = await executeStateOperation('state_list_active', {
+        workingDirectory: wd,
+      });
+      const activeModes = responsePayload<{ active_modes: string[] }>(activeResponse).active_modes;
+      assert.deepEqual(activeModes, ['team']);
+
+      const teamState = JSON.parse(
+        await readFile(join(wd, '.omx', 'state', 'team-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(teamState.active, true);
+      assert.equal(teamState.first_field, 'first');
+      assert.equal(teamState.second_field, 'second');
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

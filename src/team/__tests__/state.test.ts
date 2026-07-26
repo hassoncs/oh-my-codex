@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, rename, rm, writeFile, readFile, mkdir, utimes } from 'fs/promises';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync, readFileSync } from 'fs';
 import {
@@ -1864,6 +1864,201 @@ exit 1
       );
     } finally {
       resetWriteAtomicRenameForTests();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('replays a pre-commit retry intent before a task claim', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-precommit-recovery-'));
+    try {
+      const teamName = 'retry-precommit';
+      await initTeamState(teamName, 'retry precommit recovery', 'executor', 1, cwd);
+      const task = await createTask(teamName, {
+        subject: 'retry',
+        description: 'retry',
+        status: 'pending',
+      }, cwd);
+      const claim = await claimTask(teamName, task.id, 'worker-1', task.version, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+      const failed = await transitionTaskStatus(
+        teamName,
+        task.id,
+        'in_progress',
+        'failed',
+        claim.claimToken,
+        cwd,
+        { error: 'failed once' },
+      );
+      assert.equal(failed.ok, true);
+      if (!failed.ok) return;
+
+      const retryTask = {
+        ...failed.task,
+        status: 'pending' as const,
+        version: failed.task.version + 1,
+        attempt_history: [
+          ...(failed.task.attempt_history ?? []),
+          {
+            status: 'failed' as const,
+            version: failed.task.version,
+            owner: failed.task.owner,
+            result: failed.task.result,
+            error: failed.task.error,
+            created_at: failed.task.created_at,
+            completed_at: failed.task.completed_at,
+            delegation_compliance: failed.task.delegation_compliance,
+            coordination_compliance: failed.task.coordination_compliance,
+            recorded_at: new Date().toISOString(),
+          },
+        ],
+      };
+      delete retryTask.owner;
+      delete retryTask.claim;
+      delete retryTask.error;
+      delete retryTask.result;
+      delete retryTask.completed_at;
+      delete retryTask.delegation_compliance;
+      delete retryTask.coordination_compliance;
+
+      const intentPath = join(cwd, '.omx', 'state', 'team', teamName, 'retry-intents', `task-${task.id}.json`);
+      await mkdir(dirname(intentPath), { recursive: true });
+      await writeFile(intentPath, JSON.stringify({
+        version: 1,
+        task_id: task.id,
+        expected_version: failed.task.version,
+        retry_version: retryTask.version,
+        retry_task: retryTask,
+        created_at: new Date().toISOString(),
+      }, null, 2));
+
+      const retriedClaim = await claimTask(teamName, task.id, 'worker-1', retryTask.version, cwd);
+
+      assert.equal(retriedClaim.ok, true);
+      assert.equal(existsSync(intentPath), false);
+      assert.equal((await readModeState('team', cwd))?.active, true);
+      assert.equal((await readTeamPhase(teamName, cwd))?.current_phase, 'team-exec');
+      const events = (await readFile(teamEventLogPath(teamName, cwd), 'utf-8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      assert.equal(
+        events.filter((event) => event.type === 'task_retried' && event.task_id === task.id).length,
+        1,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves active matching Team metadata while reconciling retry intent', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-active-metadata-'));
+    try {
+      const teamName = 'retry-active';
+      await initTeamState(teamName, 'retry active metadata', 'executor', 1, cwd);
+      const task = await createTask(teamName, {
+        subject: 'retry',
+        description: 'retry',
+        status: 'pending',
+      }, cwd);
+      await startMode('team', 'existing team task', 23, cwd);
+      await updateModeState('team', {
+        current_phase: 'team-exec',
+        team_name: teamName,
+        display_name: 'Preserved Team',
+        agent_count: 4,
+        staffing_summary: 'preserve staffing',
+        opaque_metadata: { source: 'existing' },
+      }, cwd);
+
+      const retryTask = { ...task, version: task.version + 1 };
+      await writeFile(
+        join(cwd, '.omx', 'state', 'team', teamName, 'tasks', `task-${task.id}.json`),
+        JSON.stringify(retryTask, null, 2),
+      );
+      const intentPath = join(cwd, '.omx', 'state', 'team', teamName, 'retry-intents', `task-${task.id}.json`);
+      await mkdir(dirname(intentPath), { recursive: true });
+      await writeFile(intentPath, JSON.stringify({
+        version: 1,
+        task_id: task.id,
+        expected_version: task.version,
+        retry_version: retryTask.version,
+        retry_task: retryTask,
+        created_at: new Date().toISOString(),
+      }, null, 2));
+
+      await reconcileFailedTaskRetryIntents(teamName, cwd);
+
+      const modeState = await readModeState('team', cwd);
+      assert.equal(modeState?.active, true);
+      assert.equal(modeState?.current_phase, 'team-exec');
+      assert.equal(modeState?.task_description, 'existing team task');
+      assert.equal(modeState?.max_iterations, 23);
+      assert.equal(modeState?.display_name, 'Preserved Team');
+      assert.equal(modeState?.agent_count, 4);
+      assert.equal(modeState?.staffing_summary, 'preserve staffing');
+      assert.deepEqual(modeState?.opaque_metadata, { source: 'existing' });
+      assert.equal(existsSync(intentPath), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a progressed retry claim while reactivating Team once', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-progressed-claim-'));
+    try {
+      const teamName = 'retry-progressed';
+      await initTeamState(teamName, 'retry progressed claim', 'executor', 1, cwd);
+      const task = await createTask(teamName, {
+        subject: 'retry',
+        description: 'retry',
+        status: 'pending',
+      }, cwd);
+      const retryTask = { ...task, version: task.version + 1 };
+      const progressedTask = {
+        ...retryTask,
+        status: 'in_progress' as const,
+        version: retryTask.version + 1,
+        owner: 'worker-1',
+        claim: {
+          owner: 'worker-1',
+          token: 'preserved-claim-token',
+          leased_until: new Date(Date.now() + 60_000).toISOString(),
+        },
+      };
+      await writeFile(
+        join(cwd, '.omx', 'state', 'team', teamName, 'tasks', `task-${task.id}.json`),
+        JSON.stringify(progressedTask, null, 2),
+      );
+      const intentPath = join(cwd, '.omx', 'state', 'team', teamName, 'retry-intents', `task-${task.id}.json`);
+      await mkdir(dirname(intentPath), { recursive: true });
+      await writeFile(intentPath, JSON.stringify({
+        version: 1,
+        task_id: task.id,
+        expected_version: task.version,
+        retry_version: retryTask.version,
+        retry_task: retryTask,
+        created_at: new Date().toISOString(),
+      }, null, 2));
+
+      await reconcileFailedTaskRetryIntents(teamName, cwd);
+      await reconcileFailedTaskRetryIntents(teamName, cwd);
+
+      const current = await readTask(teamName, task.id, cwd);
+      assert.equal(current?.version, progressedTask.version);
+      assert.equal(current?.status, 'in_progress');
+      assert.equal(current?.owner, 'worker-1');
+      assert.deepEqual(current?.claim, progressedTask.claim);
+      assert.equal((await readModeState('team', cwd))?.active, true);
+      const events = (await readFile(teamEventLogPath(teamName, cwd), 'utf-8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      assert.equal(
+        events.filter((event) => event.type === 'task_retried' && event.task_id === task.id).length,
+        1,
+      );
+    } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });

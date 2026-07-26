@@ -33,6 +33,10 @@ import {
 } from '../mcp/state-paths.js';
 import { completeRalplanSession, validateRalplanTerminalConsensus } from '../state/operations.js';
 import { withWorkflowStateLock } from '../state/workflow-state-lock.js';
+import {
+  captureWorkflowStateSnapshot,
+  restoreWorkflowStateSnapshot,
+} from '../state/workflow-state-transaction.js';
 
 export interface ModeState {
   active: boolean;
@@ -183,50 +187,58 @@ export async function startMode(
     );
   }
   await mkdir(baseStateDir, { recursive: true });
-  let transitionMessage: string | undefined;
-  if (isTrackedWorkflowMode(mode)) {
-    const transition = await reconcileWorkflowTransition(projectRoot ?? process.cwd(), mode, {
-      action: 'start',
-      sessionId: scope.sessionId,
-      source: 'startMode',
-      baseStateDir,
-      allowNestedAutopilotTeam: options.allowNestedAutopilotTeam,
-      preflight: options.preflightTransition,
-      workflowLockHeld: true,
-    });
-    transitionMessage = transition.transitionMessage;
-  }
-  await mkdir(scope.stateDir, { recursive: true });
+  const snapshots = isTrackedWorkflowMode(mode)
+    ? await captureWorkflowStateSnapshot(projectRoot ?? process.cwd(), scope.sessionId)
+    : null;
+  try {
+    let transitionMessage: string | undefined;
+    if (isTrackedWorkflowMode(mode)) {
+      const transition = await reconcileWorkflowTransition(projectRoot ?? process.cwd(), mode, {
+        action: 'start',
+        sessionId: scope.sessionId,
+        source: 'startMode',
+        baseStateDir,
+        allowNestedAutopilotTeam: options.allowNestedAutopilotTeam,
+        preflight: options.preflightTransition,
+        workflowLockHeld: true,
+      });
+      transitionMessage = transition.transitionMessage;
+    }
+    await mkdir(scope.stateDir, { recursive: true });
 
-  const stateBase: ModeState = {
-    active: true,
-    mode,
-    iteration: 0,
-    max_iterations: maxIterations,
-    current_phase: 'starting',
-    task_description: taskDescription,
-    started_at: new Date().toISOString(),
-    ...(transitionMessage ? { transition_message: transitionMessage } : {}),
-    ...(mode === 'ralph' && scope.sessionId ? { owner_omx_session_id: scope.sessionId } : {}),
-  };
-
-  const withContext = withModeRuntimeContext({}, stateBase) as ModeState;
-  const state = normalizeModeStateOrThrow(mode, withContext);
-  await writeFile(getStatePath(mode, projectRoot, scope.sessionId), JSON.stringify(state, null, 2));
-  await syncRunStateFromModeState(state, projectRoot, scope.sessionId);
-  if (isTrackedWorkflowMode(mode)) {
-    await syncCanonicalSkillStateForMode({
-      cwd: projectRoot ?? process.cwd(),
-      baseStateDir,
-      mode,
+    const stateBase: ModeState = {
       active: true,
-      currentPhase: typeof state.current_phase === 'string' ? state.current_phase : undefined,
-      sessionId: scope.sessionId,
-      source: 'startMode',
-      workflowTransitionOptions: options,
-    });
+      mode,
+      iteration: 0,
+      max_iterations: maxIterations,
+      current_phase: 'starting',
+      task_description: taskDescription,
+      started_at: new Date().toISOString(),
+      ...(transitionMessage ? { transition_message: transitionMessage } : {}),
+      ...(mode === 'ralph' && scope.sessionId ? { owner_omx_session_id: scope.sessionId } : {}),
+    };
+
+    const withContext = withModeRuntimeContext({}, stateBase) as ModeState;
+    const state = normalizeModeStateOrThrow(mode, withContext);
+    await writeFile(getStatePath(mode, projectRoot, scope.sessionId), JSON.stringify(state, null, 2));
+    await syncRunStateFromModeState(state, projectRoot, scope.sessionId);
+    if (isTrackedWorkflowMode(mode)) {
+      await syncCanonicalSkillStateForMode({
+        cwd: projectRoot ?? process.cwd(),
+        baseStateDir,
+        mode,
+        active: true,
+        currentPhase: typeof state.current_phase === 'string' ? state.current_phase : undefined,
+        sessionId: scope.sessionId,
+        source: 'startMode',
+        workflowTransitionOptions: options,
+      });
+    }
+    return state;
+  } catch (error) {
+    if (snapshots) await restoreWorkflowStateSnapshot(snapshots);
+    throw error;
   }
-  return state;
 }
 
 /**

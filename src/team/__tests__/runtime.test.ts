@@ -3705,6 +3705,16 @@ setInterval(() => {}, 1000);
 process.on('SIGTERM', () => process.exit(0));
 `,
     );
+    const stateDir = join(cwd, '.omx', 'state');
+    await mkdir(stateDir, { recursive: true });
+    const priorFiles = new Map<string, string>([
+      [join(stateDir, 'team-state.json'), '{"active":false,"mode":"team","current_phase":"prior"}'],
+      [join(stateDir, 'run-state.json'), '{"version":1,"mode":"prior","active":false,"outcome":"finish","updated_at":"prior"}'],
+      [join(stateDir, 'skill-active-state.json'), '{"version":1,"active":false,"skill":"prior","active_skills":[]}'],
+    ]);
+    for (const [path, content] of priorFiles) {
+      await writeFile(path, content);
+    }
 
     let runtimeTeamName = '';
     let workerPid = 0;
@@ -3728,6 +3738,7 @@ process.on('SIGTERM', () => process.exit(0));
                     existsSync(join(cwd, '.omx', 'state', 'team', runtime.teamName)),
                     true,
                   );
+                  await startMode('team', 'partial mode-state commit', 5, cwd);
                   throw new Error('simulated_mode_state_commit_failure');
                 },
               },
@@ -3740,6 +3751,9 @@ process.on('SIGTERM', () => process.exit(0));
         existsSync(join(cwd, '.omx', 'state', 'team', runtimeTeamName)),
         false,
       );
+      for (const [path, content] of priorFiles) {
+        assert.equal(await readFile(path, 'utf-8'), content);
+      }
       assert.throws(() => process.kill(workerPid, 0));
     } finally {
       if (workerPid > 0) {

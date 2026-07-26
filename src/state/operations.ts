@@ -50,6 +50,7 @@ import {
   type TrackedWorkflowMode,
 } from './workflow-transition.js';
 import { reconcileWorkflowTransition } from './workflow-transition-reconcile.js';
+import { withWorkflowStateLock } from './workflow-state-lock.js';
 import {
   buildAutopilotDeepInterviewRalplanGateError,
   canAdvanceAutopilotDeepInterviewToRalplan,
@@ -126,6 +127,14 @@ export type StateOperationName =
 export interface StateOperationResponse {
   payload: unknown;
   isError?: boolean;
+}
+
+let stateWriteCommitHookForTests: ((stage: 'detail-written', mode: string) => void | Promise<void>) | null = null;
+
+export function setStateWriteCommitHookForTests(
+  hook?: (stage: 'detail-written', mode: string) => void | Promise<void>,
+): void {
+  stateWriteCommitHookForTests = hook ?? null;
 }
 
 const stateWriteQueues = new Map<string, Promise<void>>();
@@ -779,7 +788,8 @@ export async function executeStateOperation(
         let transitionMessage: string | undefined;
         let ensureRalphArtifacts = false;
 
-        await withStateWriteLock(path, async () => {
+        await withWorkflowStateLock(baseStateDir, async () => {
+          await withStateWriteLock(path, async () => {
           let existing: Record<string, unknown> = {};
           if (existsSync(path)) {
             try {
@@ -984,6 +994,7 @@ export async function executeStateOperation(
                 sessionId: effectiveSessionId,
                 source: 'state-operations',
                 baseStateDir,
+                workflowLockHeld: true,
                 ...(transitionCurrentModes ? { currentModes: transitionCurrentModes } : {}),
               });
               transitionMessage ??= transition.transitionMessage;
@@ -995,6 +1006,42 @@ export async function executeStateOperation(
 
           const merged = withModeRuntimeContext(existing, mergedRaw);
           await writeAtomicFile(path, JSON.stringify(merged, null, 2));
+          await stateWriteCommitHookForTests?.('detail-written', mode);
+          });
+
+          if (validationError) return;
+
+          if (mode === SKILL_ACTIVE_STATE_MODE) {
+            const state = await readSkillActiveState(path);
+            if (state) {
+              await writeSkillActiveStateCopiesForStateDir(baseStateDir, state, effectiveSessionId);
+            }
+          } else {
+            if (mode === 'ralph' && ensureRalphArtifacts) {
+              await ensureCanonicalRalphArtifacts(cwd, effectiveSessionId);
+            }
+            const data = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
+            const ralplanCompletionHandled = mode === 'ralplan'
+              && !isApprovedUnsupportedNativeNonCleanRecoveryState(data, { cwd, sessionId: effectiveSessionId })
+              && await completeRalplanSession({
+                cwd,
+                baseStateDir,
+                state: data,
+                explicitSessionId: effectiveSessionId,
+                requireNativeSubagents: true,
+              });
+            if (!ralplanCompletionHandled) {
+              await syncCanonicalSkillStateForMode({
+                cwd,
+                baseStateDir,
+                mode,
+                active: data.active === true,
+                currentPhase: typeof data.current_phase === 'string' ? data.current_phase : undefined,
+                sessionId: effectiveSessionId,
+                source: 'state-operations',
+              });
+            }
+          }
         });
 
         if (validationError) {
@@ -1002,38 +1049,6 @@ export async function executeStateOperation(
             payload: { error: validationError },
             isError: true,
           };
-        }
-
-        if (mode === SKILL_ACTIVE_STATE_MODE) {
-          const state = await readSkillActiveState(path);
-          if (state) {
-            await writeSkillActiveStateCopiesForStateDir(baseStateDir, state, effectiveSessionId);
-          }
-        } else {
-          if (mode === 'ralph' && ensureRalphArtifacts) {
-            await ensureCanonicalRalphArtifacts(cwd, effectiveSessionId);
-          }
-          const data = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
-          const ralplanCompletionHandled = mode === 'ralplan'
-            && !isApprovedUnsupportedNativeNonCleanRecoveryState(data, { cwd, sessionId: effectiveSessionId })
-            && await completeRalplanSession({
-              cwd,
-              baseStateDir,
-              state: data,
-              explicitSessionId: effectiveSessionId,
-              requireNativeSubagents: true,
-            });
-          if (!ralplanCompletionHandled) {
-            await syncCanonicalSkillStateForMode({
-              cwd,
-              baseStateDir,
-              mode,
-              active: data.active === true,
-              currentPhase: typeof data.current_phase === 'string' ? data.current_phase : undefined,
-              sessionId: effectiveSessionId,
-              source: 'state-operations',
-            });
-          }
         }
 
         return {

@@ -16,6 +16,7 @@ import {
 } from '../workflow-transition-reconcile.js';
 import { readModeState, startMode } from '../../modes/base.js';
 import { getBaseStateDir } from '../../mcp/state-paths.js';
+import { setSkillActiveWriteHookForTests } from '../skill-active.js';
 
 const STATE_ENV_KEYS = [
   'OMX_ROOT',
@@ -480,6 +481,46 @@ describe('workflow transition rules', () => {
         assert.equal(await readFile(canonicalPath, 'utf-8'), canonicalBefore);
         assert.equal(await readFile(runStatePath, 'utf-8'), runStateBefore);
       } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('restores exact mode, canonical, and run-state bytes when startMode canonical sync fails', async () => {
+    await withIsolatedStateEnv(async () => {
+      const wd = await mkdtemp(join(tmpdir(), 'omx-workflow-start-rollback-'));
+      try {
+        const stateDir = join(wd, '.omx', 'state');
+        const sessionId = 'sess-start-rollback';
+        const sessionDir = join(stateDir, 'sessions', sessionId);
+        await mkdir(sessionDir, { recursive: true });
+        await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
+        const priorFiles = new Map<string, string>([
+          [join(sessionDir, 'team-state.json'), '{"active":false,"mode":"team","current_phase":"old"}'],
+          [join(sessionDir, 'run-state.json'), '{"version":1,"mode":"old","active":false,"outcome":"finish","updated_at":"old"}'],
+          [join(stateDir, 'skill-active-state.json'), '{"version":1,"active":false,"skill":"old","active_skills":[]}'],
+          [join(sessionDir, 'skill-active-state.json'), '{"version":1,"active":false,"skill":"old-session","active_skills":[]}'],
+        ]);
+        for (const [path, content] of priorFiles) {
+          await writeFile(path, content);
+        }
+        const sessionCanonicalPath = join(sessionDir, 'skill-active-state.json');
+        setSkillActiveWriteHookForTests((path) => {
+          if (path === sessionCanonicalPath) {
+            throw Object.assign(new Error('simulated canonical EIO'), { code: 'EIO' });
+          }
+        });
+
+        await assert.rejects(
+          () => startMode('team', 'must roll back', 5, wd),
+          /simulated canonical EIO/,
+        );
+
+        for (const [path, content] of priorFiles) {
+          assert.equal(await readFile(path, 'utf-8'), content);
+        }
+      } finally {
+        setSkillActiveWriteHookForTests();
         await rm(wd, { recursive: true, force: true });
       }
     });

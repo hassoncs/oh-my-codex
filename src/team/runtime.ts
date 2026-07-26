@@ -137,7 +137,11 @@ import { inferPhaseTargetFromTaskCounts, reconcilePhaseStateForMonitor } from '.
 import { getTeamTmuxSessions } from '../notifications/tmux.js';
 import { hasStructuredVerificationEvidence } from '../verification/verifier.js';
 import { buildRebalanceDecisions } from './rebalance-policy.js';
-import { getStatePath } from '../mcp/state-paths.js';
+import { getStatePath, resolveStateScope } from '../mcp/state-paths.js';
+import {
+  captureWorkflowStateSnapshot,
+  restoreWorkflowStateSnapshot,
+} from '../state/workflow-state-transaction.js';
 import { readModeState, updateModeState } from '../modes/base.js';
 import { resolveWorktreeToolContext, worktreeToolContextEnv } from '../utils/worktree-tool-context.js';
 
@@ -3190,7 +3194,16 @@ export async function startTeam(
       config,
       cwd: leaderCwd,
     };
-    await options.commitModeState?.(runtime);
+    if (options.commitModeState) {
+      const scope = await resolveStateScope(leaderCwd);
+      const workflowSnapshot = await captureWorkflowStateSnapshot(leaderCwd, scope.sessionId);
+      try {
+        await options.commitModeState(runtime);
+      } catch (error) {
+        await restoreWorkflowStateSnapshot(workflowSnapshot);
+        throw error;
+      }
+    }
     await startupTiming.flush();
 
     return runtime;

@@ -1295,6 +1295,17 @@ async function withTeamLock<T>(teamName: string, cwd: string, fn: () => Promise<
   return await withTeamLockImpl(teamName, cwd, LOCK_STALE_MS, { teamDir, taskClaimLockDir, mailboxLockDir }, fn);
 }
 
+async function withReconciledTaskMutation<T>(
+  teamName: string,
+  cwd: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return withTeamLock(teamName, cwd, async () => {
+    await reconcileFailedTaskRetryIntentsUnlocked(teamName, cwd);
+    return fn();
+  });
+}
+
 async function withTaskClaimLock<T>(
   teamName: string,
   taskId: string,
@@ -1319,7 +1330,7 @@ export async function createTask(
   task: Omit<TeamTask, 'id' | 'created_at'>,
   cwd: string
 ): Promise<TeamTaskV2> {
-  return withTeamLock(teamName, cwd, async () => {
+  return withReconciledTaskMutation(teamName, cwd, async () => {
     const cfg = await readTeamConfig(teamName, cwd);
     if (!cfg) throw new Error(`Team ${teamName} not found`);
 
@@ -1371,33 +1382,35 @@ export async function updateTask(
   updates: Partial<TeamTask>,
   cwd: string
 ): Promise<TeamTask | null> {
-  const lock = await withTaskClaimLock(teamName, taskId, cwd, async () => {
-    const existing = await readTask(teamName, taskId, cwd);
-    if (!existing) return null;
+  return withReconciledTaskMutation(teamName, cwd, async () => {
+    const lock = await withTaskClaimLock(teamName, taskId, cwd, async () => {
+      const existing = await readTask(teamName, taskId, cwd);
+      if (!existing) return null;
 
-    if (updates.status !== undefined && !['pending', 'blocked', 'in_progress', 'completed', 'failed'].includes(updates.status)) {
-      throw new Error(`Invalid task status: ${updates.status}`);
-    }
+      if (updates.status !== undefined && !['pending', 'blocked', 'in_progress', 'completed', 'failed'].includes(updates.status)) {
+        throw new Error(`Invalid task status: ${updates.status}`);
+      }
 
-    const rawDeps = updates.depends_on ?? updates.blocked_by ?? existing.depends_on ?? existing.blocked_by ?? [];
-    const normalizedDeps = Array.isArray(rawDeps) ? rawDeps : [];
+      const rawDeps = updates.depends_on ?? updates.blocked_by ?? existing.depends_on ?? existing.blocked_by ?? [];
+      const normalizedDeps = Array.isArray(rawDeps) ? rawDeps : [];
 
-    const merged = normalizeTask({
-      ...normalizeTask(existing),
-      ...updates,
-      id: existing.id,
-      created_at: existing.created_at,
-      depends_on: normalizedDeps,
-      version: Math.max(1, existing.version ?? 1) + 1,
+      const merged = normalizeTask({
+        ...normalizeTask(existing),
+        ...updates,
+        id: existing.id,
+        created_at: existing.created_at,
+        depends_on: normalizedDeps,
+        version: Math.max(1, existing.version ?? 1) + 1,
+      });
+
+      await writeAtomic(taskFilePath(teamName, taskId, cwd), JSON.stringify(merged, null, 2));
+      return merged;
     });
-
-    await writeAtomic(taskFilePath(teamName, taskId, cwd), JSON.stringify(merged, null, 2));
-    return merged;
+    if (!lock.ok) {
+      throw new Error(`Timed out acquiring task claim lock for ${teamName}/${taskId}`);
+    }
+    return lock.value;
   });
-  if (!lock.ok) {
-    throw new Error(`Timed out acquiring task claim lock for ${teamName}/${taskId}`);
-  }
-  return lock.value;
 }
 
 // List all tasks sorted by numeric ID
@@ -1420,16 +1433,18 @@ export async function claimTask(
   expectedVersion: number | null,
   cwd: string
 ): Promise<ClaimTaskResult> {
-  return await claimTaskImpl(taskId, workerName, expectedVersion, {
-    teamName,
-    cwd,
-    readTask,
-    readTeamConfig,
-    withTaskClaimLock,
-    normalizeTask,
-    isTerminalTaskStatus,
-    taskFilePath,
-    writeAtomic,
+  return withReconciledTaskMutation(teamName, cwd, async () => {
+    return claimTaskImpl(taskId, workerName, expectedVersion, {
+      teamName,
+      cwd,
+      readTask,
+      readTeamConfig,
+      withTaskClaimLock,
+      normalizeTask,
+      isTerminalTaskStatus,
+      taskFilePath,
+      writeAtomic,
+    });
   });
 }
 
@@ -1442,20 +1457,22 @@ export async function transitionTaskStatus(
   cwd: string,
   terminalData?: { result?: string; error?: string },
 ): Promise<TransitionTaskResult> {
-  return await transitionTaskStatusImpl(taskId, from, to, claimToken, terminalData, {
-    teamName,
-    cwd,
-    readTask,
-    readTeamConfig,
-    withTaskClaimLock,
-    normalizeTask,
-    isTerminalTaskStatus,
-    canTransitionTaskStatus,
-    taskFilePath,
-    writeAtomic,
-    appendTeamEvent,
-    readMonitorSnapshot,
-    writeMonitorSnapshot,
+  return withReconciledTaskMutation(teamName, cwd, async () => {
+    return transitionTaskStatusImpl(taskId, from, to, claimToken, terminalData, {
+      teamName,
+      cwd,
+      readTask,
+      readTeamConfig,
+      withTaskClaimLock,
+      normalizeTask,
+      isTerminalTaskStatus,
+      canTransitionTaskStatus,
+      taskFilePath,
+      writeAtomic,
+      appendTeamEvent,
+      readMonitorSnapshot,
+      writeMonitorSnapshot,
+    });
   });
 }
 
@@ -1466,16 +1483,18 @@ export async function releaseTaskClaim(
   workerName: string,
   cwd: string
 ): Promise<ReleaseTaskClaimResult> {
-  return await releaseTaskClaimImpl(taskId, claimToken, workerName, {
-    teamName,
-    cwd,
-    readTask,
-    readTeamConfig,
-    withTaskClaimLock,
-    normalizeTask,
-    isTerminalTaskStatus,
-    taskFilePath,
-    writeAtomic,
+  return withReconciledTaskMutation(teamName, cwd, async () => {
+    return releaseTaskClaimImpl(taskId, claimToken, workerName, {
+      teamName,
+      cwd,
+      readTask,
+      readTeamConfig,
+      withTaskClaimLock,
+      normalizeTask,
+      isTerminalTaskStatus,
+      taskFilePath,
+      writeAtomic,
+    });
   });
 }
 
@@ -1484,6 +1503,7 @@ interface FailedTaskRetryIntent {
   task_id: string;
   expected_version: number;
   retry_version: number;
+  retry_task: TeamTaskV2;
   created_at: string;
 }
 
@@ -1504,6 +1524,7 @@ async function writeRetryIntent(
     task_id: previous.id,
     expected_version: previous.version,
     retry_version: next.version,
+    retry_task: next,
     created_at: new Date().toISOString(),
   };
   await writeAtomic(path, JSON.stringify(intent, null, 2));
@@ -1521,18 +1542,20 @@ async function reactivateTeamWorkflowForRetry(
     throw new Error(`team_retry_mode_state_mismatch:${stateTeamName}:${teamName}`);
   }
 
-  const scope = await resolveStateScope(cwd);
-  const transition = await preflightWorkflowTransition(cwd, 'team', {
-    action: 'start',
-    sessionId: scope.sessionId,
-    baseStateDir: getBaseStateDir(cwd),
-    allowNestedAutopilotTeam: true,
-  });
-  const config = await readTeamConfig(teamName, cwd);
-  await startMode('team', config?.task ?? `Retry failed task ${taskId}`, 50, cwd, {
-    allowNestedAutopilotTeam: true,
-    preflightTransition: transition,
-  });
+  if (modeState?.active !== true) {
+    const scope = await resolveStateScope(cwd);
+    const transition = await preflightWorkflowTransition(cwd, 'team', {
+      action: 'start',
+      sessionId: scope.sessionId,
+      baseStateDir: getBaseStateDir(cwd),
+      allowNestedAutopilotTeam: true,
+    });
+    const config = await readTeamConfig(teamName, cwd);
+    await startMode('team', config?.task ?? `Retry failed task ${taskId}`, 50, cwd, {
+      allowNestedAutopilotTeam: true,
+      preflightTransition: transition,
+    });
+  }
   await updateModeState('team', {
     current_phase: 'team-exec',
     team_name: teamName,
@@ -1586,13 +1609,24 @@ function parseRetryIntent(raw: string): FailedTaskRetryIntent | null {
     if (
       intent.version !== 1
       || typeof intent.task_id !== 'string'
+      || typeof intent.expected_version !== 'number'
       || !Number.isInteger(intent.expected_version)
+      || typeof intent.retry_version !== 'number'
       || !Number.isInteger(intent.retry_version)
+      || intent.expected_version < 1
+      || intent.retry_version !== intent.expected_version + 1
+      || !isTeamTask(intent.retry_task)
+      || intent.retry_task.id !== intent.task_id
+      || intent.retry_task.version !== intent.retry_version
+      || intent.retry_task.status !== 'pending'
       || typeof intent.created_at !== 'string'
     ) {
       return null;
     }
-    return intent as FailedTaskRetryIntent;
+    return {
+      ...intent,
+      retry_task: normalizeTask(intent.retry_task),
+    } as FailedTaskRetryIntent;
   } catch {
     return null;
   }
@@ -1614,13 +1648,30 @@ async function reconcileFailedTaskRetryIntentsUnlocked(
     const task = await readTask(teamName, intent.task_id, cwd);
     if (!task) throw new Error(`retry_intent_task_missing:${teamName}:${intent.task_id}`);
     const current = normalizeTask(task);
-    if (current.version < intent.retry_version) {
-      await rm(path, { force: true });
-      continue;
-    }
-    if (
+    if (current.version === intent.expected_version && current.status === 'failed') {
+      await writeAtomic(
+        taskFilePath(teamName, intent.task_id, cwd),
+        JSON.stringify(intent.retry_task, null, 2),
+      );
+    } else if (current.version < intent.retry_version) {
+      throw new Error(
+        `retry_intent_task_version_mismatch:${teamName}:${intent.task_id}:${current.version}:${intent.retry_version}`,
+      );
+    } else if (
       current.version === intent.retry_version
-      && (current.status === 'pending' || current.status === 'blocked' || current.status === 'in_progress')
+      && !['pending', 'blocked', 'in_progress'].includes(current.status)
+    ) {
+      throw new Error(
+        `retry_intent_task_status_mismatch:${teamName}:${intent.task_id}:${current.status}`,
+      );
+    }
+
+    const reconciledTask = current.version === intent.expected_version
+      ? intent.retry_task
+      : current;
+    if (
+      reconciledTask.version >= intent.retry_version
+      && ['pending', 'blocked', 'in_progress'].includes(reconciledTask.status)
     ) {
       await reactivateTeamWorkflowForRetry(teamName, intent.task_id, cwd);
     }
@@ -1642,8 +1693,7 @@ export async function retryFailedTask(
   expectedVersion: number,
   cwd: string
 ): Promise<RetryFailedTaskResult> {
-  return withTeamLock(teamName, cwd, async () => {
-    await reconcileFailedTaskRetryIntentsUnlocked(teamName, cwd);
+  return withReconciledTaskMutation(teamName, cwd, async () => {
     let retryIntent!: Awaited<ReturnType<typeof writeRetryIntent>>;
     return retryFailedTaskImpl(taskId, expectedVersion, {
       teamName,
@@ -1673,16 +1723,18 @@ export async function reclaimExpiredTaskClaim(
   taskId: string,
   cwd: string
 ): Promise<ReclaimTaskResult> {
-  return await reclaimExpiredTaskClaimImpl(taskId, {
-    teamName,
-    cwd,
-    readTask,
-    readTeamConfig,
-    withTaskClaimLock,
-    normalizeTask,
-    isTerminalTaskStatus,
-    taskFilePath,
-    writeAtomic,
+  return withReconciledTaskMutation(teamName, cwd, async () => {
+    return reclaimExpiredTaskClaimImpl(taskId, {
+      teamName,
+      cwd,
+      readTask,
+      readTeamConfig,
+      withTaskClaimLock,
+      normalizeTask,
+      isTerminalTaskStatus,
+      taskFilePath,
+      writeAtomic,
+    });
   });
 }
 

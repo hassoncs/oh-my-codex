@@ -52,6 +52,11 @@ import {
   preflightWorkflowTransition,
   type PreflightedWorkflowTransition,
 } from '../state/workflow-transition-reconcile.js';
+import { withWorkflowStateLock } from '../state/workflow-state-lock.js';
+import {
+  captureWorkflowStateSnapshot,
+  restoreWorkflowStateSnapshot,
+} from '../state/workflow-state-transaction.js';
 
 interface TeamCliOptions {
   verbose?: boolean;
@@ -1272,39 +1277,40 @@ async function ensureTeamModeState(
   const active = !isTerminalModePhase(currentPhase);
   const completionStamp = active ? undefined : new Date().toISOString();
 
-  const existing = await readModeState('team');
-  if (existing?.active) {
-    await updateModeState('team', {
-      active,
-      task_description: parsed.task,
-      current_phase: currentPhase,
-      team_name: parsed.teamName,
-      display_name: parsed.displayName ?? parsed.teamName,
-      agent_count: parsed.workerCount,
-      agent_types: roleDistribution,
-      available_agent_types: availableAgentTypes,
-      staffing_summary: staffingPlan.staffingSummary,
-      staffing_allocations: staffingPlan.allocations,
-      completed_at: completionStamp,
-    });
-    return;
-  }
-
-  await startMode('team', parsed.task, 50, undefined, {
-    allowNestedAutopilotTeam: preflight?.allowNestedAutopilotTeam,
-    preflightTransition: preflight?.workflowTransition,
-  });
-  await updateModeState('team', {
-    active,
-    current_phase: currentPhase,
-    team_name: parsed.teamName,
-    display_name: parsed.displayName ?? parsed.teamName,
-    agent_count: parsed.workerCount,
-    agent_types: roleDistribution,
-    available_agent_types: availableAgentTypes,
-    staffing_summary: staffingPlan.staffingSummary,
-    staffing_allocations: staffingPlan.allocations,
-    completed_at: completionStamp,
+  const cwd = process.cwd();
+  const scope = await resolveStateScope(cwd);
+  const baseStateDir = getBaseStateDir(cwd);
+  await withWorkflowStateLock(baseStateDir, async () => {
+    const snapshot = await captureWorkflowStateSnapshot(cwd, scope.sessionId);
+    try {
+      const existing = await readModeState('team', cwd);
+      if (!existing?.active) {
+        await startMode('team', parsed.task, 50, cwd, {
+          allowNestedAutopilotTeam: preflight?.allowNestedAutopilotTeam,
+          preflightTransition: preflight?.workflowTransition,
+          workflowLockHeld: true,
+        });
+      }
+      await updateModeState('team', {
+        active,
+        task_description: parsed.task,
+        current_phase: currentPhase,
+        team_name: parsed.teamName,
+        display_name: parsed.displayName ?? parsed.teamName,
+        agent_count: parsed.workerCount,
+        agent_types: roleDistribution,
+        available_agent_types: availableAgentTypes,
+        staffing_summary: staffingPlan.staffingSummary,
+        staffing_allocations: staffingPlan.allocations,
+        completed_at: completionStamp,
+      }, cwd, scope.sessionId, {
+        allowNestedAutopilotTeam: preflight?.allowNestedAutopilotTeam,
+        workflowLockHeld: true,
+      });
+    } catch (error) {
+      await restoreWorkflowStateSnapshot(snapshot);
+      throw error;
+    }
   });
 
 }
