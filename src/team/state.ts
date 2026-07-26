@@ -1433,8 +1433,10 @@ export async function claimTask(
   expectedVersion: number | null,
   cwd: string
 ): Promise<ClaimTaskResult> {
-  return withReconciledTaskMutation(teamName, cwd, async () => {
-    return claimTaskImpl(taskId, workerName, expectedVersion, {
+  return withReconciledTaskMutation(
+    teamName,
+    cwd,
+    () => claimTaskImpl(taskId, workerName, expectedVersion, {
       teamName,
       cwd,
       readTask,
@@ -1444,8 +1446,8 @@ export async function claimTask(
       isTerminalTaskStatus,
       taskFilePath,
       writeAtomic,
-    });
-  });
+    }),
+  );
 }
 
 export async function transitionTaskStatus(
@@ -1457,8 +1459,10 @@ export async function transitionTaskStatus(
   cwd: string,
   terminalData?: { result?: string; error?: string },
 ): Promise<TransitionTaskResult> {
-  return withReconciledTaskMutation(teamName, cwd, async () => {
-    return transitionTaskStatusImpl(taskId, from, to, claimToken, terminalData, {
+  return withReconciledTaskMutation(
+    teamName,
+    cwd,
+    () => transitionTaskStatusImpl(taskId, from, to, claimToken, terminalData, {
       teamName,
       cwd,
       readTask,
@@ -1472,8 +1476,8 @@ export async function transitionTaskStatus(
       appendTeamEvent,
       readMonitorSnapshot,
       writeMonitorSnapshot,
-    });
-  });
+    }),
+  );
 }
 
 export async function releaseTaskClaim(
@@ -1483,8 +1487,10 @@ export async function releaseTaskClaim(
   workerName: string,
   cwd: string
 ): Promise<ReleaseTaskClaimResult> {
-  return withReconciledTaskMutation(teamName, cwd, async () => {
-    return releaseTaskClaimImpl(taskId, claimToken, workerName, {
+  return withReconciledTaskMutation(
+    teamName,
+    cwd,
+    () => releaseTaskClaimImpl(taskId, claimToken, workerName, {
       teamName,
       cwd,
       readTask,
@@ -1494,8 +1500,8 @@ export async function releaseTaskClaim(
       isTerminalTaskStatus,
       taskFilePath,
       writeAtomic,
-    });
-  });
+    }),
+  );
 }
 
 interface FailedTaskRetryIntent {
@@ -1693,7 +1699,7 @@ export async function retryFailedTask(
   expectedVersion: number,
   cwd: string
 ): Promise<RetryFailedTaskResult> {
-  return withReconciledTaskMutation(teamName, cwd, async () => {
+  return withReconciledTaskMutation(teamName, cwd, () => {
     let retryIntent!: Awaited<ReturnType<typeof writeRetryIntent>>;
     return retryFailedTaskImpl(taskId, expectedVersion, {
       teamName,
@@ -1723,8 +1729,10 @@ export async function reclaimExpiredTaskClaim(
   taskId: string,
   cwd: string
 ): Promise<ReclaimTaskResult> {
-  return withReconciledTaskMutation(teamName, cwd, async () => {
-    return reclaimExpiredTaskClaimImpl(taskId, {
+  return withReconciledTaskMutation(
+    teamName,
+    cwd,
+    () => reclaimExpiredTaskClaimImpl(taskId, {
       teamName,
       cwd,
       readTask,
@@ -1734,8 +1742,8 @@ export async function reclaimExpiredTaskClaim(
       isTerminalTaskStatus,
       taskFilePath,
       writeAtomic,
-    });
-  });
+    }),
+  );
 }
 
 export async function appendTeamEvent(teamName: string, event: Omit<TeamEvent, 'event_id' | 'created_at' | 'team'>, cwd: string): Promise<TeamEvent> {
