@@ -1756,7 +1756,7 @@ esac
 
 describe('teamCommand api', () => {
   it('runs source tests against TypeScript even when compiled output exists', () => {
-    const sourceTestUrl = new URL('./team.test.ts', import.meta.url).href;
+    const sourceTestUrl = new URL('../../../src/cli/__tests__/team.test.ts', import.meta.url).href;
     assert.match(resolveTeamTestCliPath(sourceTestUrl), /\/src\/cli\/omx\.ts$/);
   });
 

@@ -199,9 +199,11 @@ function isPidAlive(pid: number | undefined): boolean {
 }
 
 async function waitForExit(child: ReturnType<typeof spawn>, timeoutMs: number = 4000): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
+  const terminal = child.exitCode !== null || child.signalCode !== null;
+  const outputClosed = [child.stdout, child.stderr].every((stream) => !stream || stream.closed);
+  if (terminal && outputClosed) return;
   await Promise.race([
-    once(child, 'exit'),
+    once(child, 'close'),
     sleep(timeoutMs).then(() => {
       throw new Error(`process ${child.pid ?? 'unknown'} did not exit within ${timeoutMs}ms`);
     }),
@@ -486,6 +488,22 @@ function buildCleanNotifyEnv(
 }
 
 describe('notify-fallback watcher', () => {
+  it('waits for child stdio closure before treating process cleanup as complete', async () => {
+    const child = spawn(
+      process.execPath,
+      [
+        '-e',
+        "const { spawn } = require('node:child_process'); spawn(process.execPath, ['-e', 'setTimeout(() => {}, 150)'], { stdio: ['ignore', 1, 2] });",
+      ],
+      { stdio: 'pipe' },
+    );
+    const startedAt = Date.now();
+
+    await waitForExit(child, 2000);
+
+    assert.ok(Date.now() - startedAt >= 100, 'waitForExit must wait for inherited output pipes to close');
+  });
+
   it('uses offset-bounded rollout reads instead of re-reading whole tracked files', async () => {
     const sourceUrl = new URL(
       import.meta.url.endsWith('.ts')
