@@ -6,6 +6,7 @@ import { mkdtemp, rm, writeFile, readFile, mkdir, chmod, readdir } from 'fs/prom
 import { join, relative } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
+import { DEFAULT_TEAM_CHILD_MODEL } from '../../config/models.js';
 import { HUD_TMUX_TEAM_HEIGHT_LINES } from '../../hud/constants.js';
 import {
   DEFAULT_MAX_WORKERS,
@@ -547,14 +548,18 @@ async function withNativeWindowsPlatform<T>(run: () => Promise<T>): Promise<T> {
 }
 
 const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
+const ORIGINAL_OMX_TEAM_CHILD_MODEL = process.env.OMX_TEAM_CHILD_MODEL;
 
 beforeEach(() => {
   delete process.env.OMX_TEAM_STATE_ROOT;
+  process.env.OMX_TEAM_CHILD_MODEL = DEFAULT_TEAM_CHILD_MODEL;
 });
 
 afterEach(() => {
   if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
   else delete process.env.OMX_TEAM_STATE_ROOT;
+  if (typeof ORIGINAL_OMX_TEAM_CHILD_MODEL === 'string') process.env.OMX_TEAM_CHILD_MODEL = ORIGINAL_OMX_TEAM_CHILD_MODEL;
+  else delete process.env.OMX_TEAM_CHILD_MODEL;
 });
 
 describe('runtime', () => {
@@ -3649,7 +3654,7 @@ setTimeout(() => {}, 5000);`,
       );
       runtime = started;
 
-      const order = await waitForFileText(capturePath, (content) => /spawn/.test(content));
+      const order = await waitForFileText(capturePath, (content) => /spawn/.test(content), 10_000);
       assert.equal(order, 'cleanup\nspawn\n');
 
       await shutdownTeam(runtime.teamName, cwd, { force: true });

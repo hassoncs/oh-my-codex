@@ -1,5 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { DEFAULT_TEAM_CHILD_MODEL } from '../../config/models.js';
 import { synthesizeDelegationPlan } from '../delegation-policy.js';
 import type { TeamTask } from '../state.js';
 
@@ -21,7 +22,7 @@ describe('synthesizeDelegationPlan', () => {
   beforeEach(() => {
     originalChildModel = process.env.OMX_TEAM_CHILD_MODEL;
     originalFrontierModel = process.env.OMX_DEFAULT_FRONTIER_MODEL;
-    delete process.env.OMX_TEAM_CHILD_MODEL;
+    process.env.OMX_TEAM_CHILD_MODEL = DEFAULT_TEAM_CHILD_MODEL;
     delete process.env.OMX_DEFAULT_FRONTIER_MODEL;
   });
 
