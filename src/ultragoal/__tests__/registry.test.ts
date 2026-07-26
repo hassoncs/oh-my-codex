@@ -14,6 +14,7 @@ import {
 import {
   computeUltragoalBriefHash,
   isInheritedOrigin,
+  legacyRunIdForPlan,
   readActiveRunPointer,
   ultragoalRunDir,
 } from '../registry.js';
@@ -128,7 +129,10 @@ describe('ultragoal run namespacing', () => {
       assert.ok(plan.runId);
       assert.ok(!plan.goals.some((goal) => goal.id === 'G001-legacy-governance'), 'new run does not inherit legacy goals');
 
-      const archivedDir = ultragoalRunDir(cwd, 'legacy-unknown0');
+      const archivedDir = ultragoalRunDir(cwd, legacyRunIdForPlan({
+        createdAt: '2026-07-12T09:26:58.842Z',
+        goals: [{ id: 'G001-legacy-governance' }],
+      }));
       assert.ok(existsSync(join(archivedDir, 'goals.json')), 'legacy registry archived, not destroyed');
       const archived = JSON.parse(await readFile(join(archivedDir, 'goals.json'), 'utf-8'));
       assert.equal(archived.goals[0].id, 'G001-legacy-governance');

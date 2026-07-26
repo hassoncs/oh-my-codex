@@ -92,8 +92,22 @@ export function isLegacyRunId(runId: string): boolean {
   return runId.startsWith('legacy-');
 }
 
-export function buildLegacyRunId(briefHash: string): string {
-  return `legacy-${briefHash.slice(0, 8)}`;
+export function buildLegacyRunId(seed: string): string {
+  return `legacy-${computeUltragoalBriefHash(seed).slice(0, 8)}`;
+}
+
+/**
+ * Pre-namespacing registries carry no identity, so derive a stable one from
+ * their own content: two archived registries in one tree must not collide.
+ */
+export function legacyRunIdForPlan(plan: {
+  briefHash?: string;
+  createdAt?: string;
+  goals?: Array<{ id?: string }>;
+}): string {
+  if (plan.briefHash) return `legacy-${plan.briefHash.slice(0, 8)}`;
+  const seed = [plan.createdAt ?? '', ...(plan.goals ?? []).map((goal) => goal.id ?? '')].join('|');
+  return buildLegacyRunId(seed);
 }
 
 export async function readActiveRunPointer(cwd: string): Promise<UltragoalActiveRunPointer | null> {

@@ -20,7 +20,7 @@ import {
   ULTRAGOAL_LEDGER,
   UltragoalRegistryConflictError,
   archiveFlatRegistry,
-  buildLegacyRunId,
+  legacyRunIdForPlan,
   buildUltragoalRunId,
   computeUltragoalBriefHash,
   describeRegistryConflict,
@@ -1020,7 +1020,7 @@ async function resolveRegistryDisposition(
     });
   }
   const archivedTo = archive
-    ? await archiveFlatRegistry(cwd, existing.runId ?? buildLegacyRunId(existing.briefHash ?? 'unknown00'))
+    ? await archiveFlatRegistry(cwd, existing.runId ?? legacyRunIdForPlan(existing))
     : null;
   return { adopt: null, archivedTo };
 }
@@ -1099,7 +1099,7 @@ export async function adoptUltragoalRun(cwd: string, options: { now?: Date } = {
       throw new UltragoalError(`No ultragoal registry found at ${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS} to adopt.`);
     }
     const now = iso(options.now);
-    const runId = existing.runId ?? buildLegacyRunId(existing.briefHash ?? 'unknown00');
+    const runId = existing.runId ?? legacyRunIdForPlan(existing);
     const origin: UltragoalRunOrigin = existing.origin ?? { worktreePath: cwd, createdAt: existing.createdAt };
     origin.adoptedWorktreePaths = Array.from(new Set([...(origin.adoptedWorktreePaths ?? []), cwd]));
     const adopted: UltragoalPlan = { ...existing, runId, origin, updatedAt: now };
@@ -1132,7 +1132,7 @@ async function adoptExistingPlanForRun(
   options: CreateUltragoalOptions,
 ): Promise<UltragoalPlan> {
   const now = iso(options.now);
-  const runId = existing.runId ?? buildLegacyRunId(existing.briefHash ?? briefHash);
+  const runId = existing.runId ?? legacyRunIdForPlan(existing);
   const origin: UltragoalRunOrigin = existing.origin ?? { worktreePath: cwd, createdAt: existing.createdAt };
   if (isInheritedOrigin(origin, cwd)) {
     origin.adoptedWorktreePaths = Array.from(new Set([...(origin.adoptedWorktreePaths ?? []), cwd]));
