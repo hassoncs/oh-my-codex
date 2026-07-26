@@ -137,11 +137,10 @@ import { inferPhaseTargetFromTaskCounts, reconcilePhaseStateForMonitor } from '.
 import { getTeamTmuxSessions } from '../notifications/tmux.js';
 import { hasStructuredVerificationEvidence } from '../verification/verifier.js';
 import { buildRebalanceDecisions } from './rebalance-policy.js';
-import { getStatePath, resolveStateScope } from '../mcp/state-paths.js';
-import {
-  captureWorkflowStateSnapshot,
-  restoreWorkflowStateSnapshot,
-} from '../state/workflow-state-transaction.js';
+import { getBaseStateDir, getStatePath, resolveStateScope } from '../mcp/state-paths.js';
+import { syncCanonicalSkillStateForMode } from '../state/skill-active.js';
+import { withWorkflowStateLock } from '../state/workflow-state-lock.js';
+import { withWorkflowStateTransaction } from '../state/workflow-state-transaction.js';
 import { readModeState, updateModeState } from '../modes/base.js';
 import { resolveWorktreeToolContext, worktreeToolContextEnv } from '../utils/worktree-tool-context.js';
 
@@ -280,28 +279,25 @@ async function syncExactTeamModeStateOnShutdown(
   teamName: string,
   cwd: string,
   sessionId?: string,
-): Promise<void> {
+): Promise<boolean> {
   const path = getStatePath('team', cwd, sessionId);
-  if (!existsSync(path)) return;
+  if (!existsSync(path)) return false;
 
-  try {
-    const parsed = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
-    if (!matchesTeamModeStateForShutdown(parsed, teamName)) return;
+  const parsed = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
+  if (!matchesTeamModeStateForShutdown(parsed, teamName)) return false;
 
-    const next = {
-      ...parsed,
-      active: false,
-      current_phase: 'cancelled',
-      completed_at:
-        typeof parsed.completed_at === 'string' && parsed.completed_at.trim().length > 0
-          ? parsed.completed_at
-          : new Date().toISOString(),
-      team_name: teamName,
-    };
-    await writeFile(path, JSON.stringify(next, null, 2));
-  } catch {
-    // Best-effort compatibility sync only.
-  }
+  const next = {
+    ...parsed,
+    active: false,
+    current_phase: 'cancelled',
+    completed_at:
+      typeof parsed.completed_at === 'string' && parsed.completed_at.trim().length > 0
+        ? parsed.completed_at
+        : new Date().toISOString(),
+    team_name: teamName,
+  };
+  await writeFile(path, JSON.stringify(next, null, 2));
+  return true;
 }
 
 async function syncTeamModeStateOnShutdown(
@@ -309,11 +305,42 @@ async function syncTeamModeStateOnShutdown(
   cwd: string,
   leaderSessionId?: string,
 ): Promise<void> {
-  await syncExactTeamModeStateOnShutdown(teamName, cwd);
   const normalizedLeaderSessionId = typeof leaderSessionId === 'string' ? leaderSessionId.trim() : '';
-  if (normalizedLeaderSessionId) {
-    await syncExactTeamModeStateOnShutdown(teamName, cwd, normalizedLeaderSessionId);
-  }
+  const baseStateDir = getBaseStateDir(cwd);
+  await withWorkflowStateLock(baseStateDir, () =>
+    withWorkflowStateTransaction(baseStateDir, cwd, normalizedLeaderSessionId || undefined, async () => {
+      const rootPath = getStatePath('team', cwd);
+      const sessionPath = normalizedLeaderSessionId
+        ? getStatePath('team', cwd, normalizedLeaderSessionId)
+        : null;
+      const hasDetailState = existsSync(rootPath) || Boolean(sessionPath && existsSync(sessionPath));
+      const rootMatched = await syncExactTeamModeStateOnShutdown(teamName, cwd);
+      const sessionMatched = normalizedLeaderSessionId
+        ? await syncExactTeamModeStateOnShutdown(teamName, cwd, normalizedLeaderSessionId)
+        : false;
+      if (hasDetailState && !rootMatched && !sessionMatched) return;
+
+      if (normalizedLeaderSessionId) {
+        await syncCanonicalSkillStateForMode({
+          cwd,
+          baseStateDir,
+          mode: 'team',
+          active: false,
+          currentPhase: 'cancelled',
+          sessionId: normalizedLeaderSessionId,
+          source: 'team-shutdown',
+        });
+      }
+      await syncCanonicalSkillStateForMode({
+        cwd,
+        baseStateDir,
+        mode: 'team',
+        active: false,
+        currentPhase: 'cancelled',
+        source: 'team-shutdown',
+      });
+    }),
+  );
 }
 
 async function assertTeamStartupIsNonDestructive(
@@ -3196,13 +3223,15 @@ export async function startTeam(
     };
     if (options.commitModeState) {
       const scope = await resolveStateScope(leaderCwd);
-      const workflowSnapshot = await captureWorkflowStateSnapshot(leaderCwd, scope.sessionId);
-      try {
-        await options.commitModeState(runtime);
-      } catch (error) {
-        await restoreWorkflowStateSnapshot(workflowSnapshot);
-        throw error;
-      }
+      const baseStateDir = getBaseStateDir(leaderCwd);
+      await withWorkflowStateLock(baseStateDir, () =>
+        withWorkflowStateTransaction(
+          baseStateDir,
+          leaderCwd,
+          scope.sessionId,
+          () => options.commitModeState!(runtime),
+        ),
+      );
     }
     await startupTiming.flush();
 

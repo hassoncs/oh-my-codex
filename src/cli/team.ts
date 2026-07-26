@@ -53,10 +53,8 @@ import {
   type PreflightedWorkflowTransition,
 } from '../state/workflow-transition-reconcile.js';
 import { withWorkflowStateLock } from '../state/workflow-state-lock.js';
-import {
-  captureWorkflowStateSnapshot,
-  restoreWorkflowStateSnapshot,
-} from '../state/workflow-state-transaction.js';
+import { syncCanonicalSkillStateForMode } from '../state/skill-active.js';
+import { withWorkflowStateTransaction } from '../state/workflow-state-transaction.js';
 
 interface TeamCliOptions {
   verbose?: boolean;
@@ -98,13 +96,9 @@ function persistExactTeamModeState(
   const statePath = getStatePath('team', cwd, sessionId);
   if (!existsSync(statePath)) return false;
 
-  try {
-    const current = JSON.parse(readFileSync(statePath, 'utf-8')) as Record<string, unknown>;
-    writeFileSync(statePath, JSON.stringify({ ...current, ...updates }, null, 2));
-    return true;
-  } catch {
-    return false;
-  }
+  const current = JSON.parse(readFileSync(statePath, 'utf-8')) as Record<string, unknown>;
+  writeFileSync(statePath, JSON.stringify({ ...current, ...updates }, null, 2));
+  return true;
 }
 
 function readPersistedTeamFollowupState(cwd: string): {
@@ -1280,9 +1274,8 @@ async function ensureTeamModeState(
   const cwd = process.cwd();
   const scope = await resolveStateScope(cwd);
   const baseStateDir = getBaseStateDir(cwd);
-  await withWorkflowStateLock(baseStateDir, async () => {
-    const snapshot = await captureWorkflowStateSnapshot(cwd, scope.sessionId);
-    try {
+  await withWorkflowStateLock(baseStateDir, () =>
+    withWorkflowStateTransaction(baseStateDir, cwd, scope.sessionId, async () => {
       const existing = await readModeState('team', cwd);
       if (!existing?.active) {
         await startMode('team', parsed.task, 50, cwd, {
@@ -1307,11 +1300,8 @@ async function ensureTeamModeState(
         allowNestedAutopilotTeam: preflight?.allowNestedAutopilotTeam,
         workflowLockHeld: true,
       });
-    } catch (error) {
-      await restoreWorkflowStateSnapshot(snapshot);
-      throw error;
-    }
-  });
+    }),
+  );
 
 }
 
@@ -1368,35 +1358,58 @@ async function persistTeamShutdownModeState(
   const hasScopedState = scopedSessionId
     ? existsSync(getStatePath('team', cwd, scopedSessionId))
     : false;
+  const baseStateDir = getBaseStateDir(cwd);
+  await withWorkflowStateLock(baseStateDir, () =>
+    withWorkflowStateTransaction(baseStateDir, cwd, scopedSessionId, async () => {
+      if (hasRootState || hasScopedState) {
+        if (hasRootState) {
+          persistExactTeamModeState(cwd, shutdownState);
+        }
+        if (scopedSessionId && hasScopedState) {
+          persistExactTeamModeState(cwd, shutdownState, scopedSessionId);
+          await syncCanonicalSkillStateForMode({
+            cwd,
+            baseStateDir,
+            mode: 'team',
+            active: false,
+            currentPhase: 'cancelled',
+            sessionId: scopedSessionId,
+            source: 'team-cli-shutdown',
+          });
+        }
+        await syncCanonicalSkillStateForMode({
+          cwd,
+          baseStateDir,
+          mode: 'team',
+          active: false,
+          currentPhase: 'cancelled',
+          source: 'team-cli-shutdown',
+        });
+        return;
+      }
 
-  if (hasRootState || hasScopedState) {
-    if (hasRootState) {
-      persistExactTeamModeState(cwd, shutdownState);
-    }
-    if (scopedSessionId && hasScopedState) {
-      persistExactTeamModeState(cwd, shutdownState, scopedSessionId);
-    }
-    return;
-  }
+      const existing = await readModeState('team', cwd);
+      if (!existing) {
+        if (configSnapshot) {
+          await ensureTeamModeState({
+            task: configSnapshot.task,
+            workerCount: configSnapshot.workerCount,
+            agentType: configSnapshot.agentType,
+            explicitAgentType: false,
+            explicitWorkerCount: false,
+            teamName,
+            allowRepoAwareDagHandoff: false,
+          });
+        } else {
+          await startMode('team', `shutdown team ${teamName}`, 50, cwd);
+        }
+      }
 
-  const existing = await readModeState('team', cwd);
-  if (!existing) {
-    if (configSnapshot) {
-      await ensureTeamModeState({
-        task: configSnapshot.task,
-        workerCount: configSnapshot.workerCount,
-        agentType: configSnapshot.agentType,
-        explicitAgentType: false,
-        explicitWorkerCount: false,
-        teamName,
-        allowRepoAwareDagHandoff: false,
+      await updateModeState('team', shutdownState, cwd, scopedSessionId, {
+        workflowLockHeld: true,
       });
-    } else {
-      await startMode('team', `shutdown team ${teamName}`, 50, cwd);
-    }
-  }
-
-  await updateModeState('team', shutdownState, cwd);
+    }),
+  );
 }
 
 

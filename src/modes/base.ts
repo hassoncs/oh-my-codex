@@ -33,10 +33,7 @@ import {
 } from '../mcp/state-paths.js';
 import { completeRalplanSession, validateRalplanTerminalConsensus } from '../state/operations.js';
 import { withWorkflowStateLock } from '../state/workflow-state-lock.js';
-import {
-  captureWorkflowStateSnapshot,
-  restoreWorkflowStateSnapshot,
-} from '../state/workflow-state-transaction.js';
+import { withWorkflowStateTransaction } from '../state/workflow-state-transaction.js';
 
 export interface ModeState {
   active: boolean;
@@ -187,10 +184,7 @@ export async function startMode(
     );
   }
   await mkdir(baseStateDir, { recursive: true });
-  const snapshots = isTrackedWorkflowMode(mode)
-    ? await captureWorkflowStateSnapshot(projectRoot ?? process.cwd(), scope.sessionId)
-    : null;
-  try {
+  const run = async (): Promise<ModeState> => {
     let transitionMessage: string | undefined;
     if (isTrackedWorkflowMode(mode)) {
       const transition = await reconcileWorkflowTransition(projectRoot ?? process.cwd(), mode, {
@@ -235,10 +229,15 @@ export async function startMode(
       });
     }
     return state;
-  } catch (error) {
-    if (snapshots) await restoreWorkflowStateSnapshot(snapshots);
-    throw error;
-  }
+  };
+  return isTrackedWorkflowMode(mode)
+    ? withWorkflowStateTransaction(
+      baseStateDir,
+      projectRoot ?? process.cwd(),
+      scope.sessionId,
+      run,
+    )
+    : run();
 }
 
 /**
@@ -327,112 +326,122 @@ export async function updateModeState(
       }),
     );
   }
-  const current = mode === 'ralph' && scope.sessionId
+  const run = async (): Promise<ModeState> => {
+    const current = mode === 'ralph' && scope.sessionId
     ? await readModeStateForActiveDecision(mode, scope.sessionId, projectRoot)
     : explicitSessionId
       ? await readModeStateForSession(mode, explicitSessionId, projectRoot)
       : await readModeState(mode, projectRoot);
-  if (!current) throw new Error(`Mode ${mode} not found`);
-  await mkdir(scope.stateDir, { recursive: true });
+    if (!current) throw new Error(`Mode ${mode} not found`);
+    await mkdir(scope.stateDir, { recursive: true });
 
-  if (mode === 'ralph') {
-    assertRalphUpdateMatchesSession(current, scope.sessionId);
-  }
+    if (mode === 'ralph') {
+      assertRalphUpdateMatchesSession(current, scope.sessionId);
+    }
 
-  const updatedBase = { ...current, ...updates };
-  delete updatedBase.trustedPipelineProgress;
-  if (!Object.prototype.hasOwnProperty.call(updates, 'run_outcome')) {
-    delete updatedBase.run_outcome;
-  }
-  if (mode === 'ralph' && scope.sessionId && typeof updatedBase.owner_omx_session_id !== 'string') {
-    updatedBase.owner_omx_session_id = scope.sessionId;
-  }
-  const normalizedBase = normalizeModeStateOrThrow(mode, updatedBase as ModeState);
-  if (mode === 'ralplan') {
-    const validationError = validateRalplanTerminalConsensus(
-      projectRoot ?? process.cwd(),
-      normalizedBase as Record<string, unknown>,
-      scope.sessionId,
-    );
-    if (validationError) throw new Error(validationError);
-  }
-  if (mode === 'autopilot') {
-    const isPipelineOrchestratorProgressWrite = options.trustedPipelineProgress === true;
-    const currentAutopilotChildPhase = deriveAutopilotChildPhase({ ...current, mode: 'autopilot' });
-    const nextAutopilotChildPhase = deriveAutopilotChildPhase({ ...normalizedBase, mode: 'autopilot' });
-    const completionTransitionError = validateAutopilotCompletionTransition(
-      current as Record<string, unknown>,
-      normalizedBase as Record<string, unknown>,
-      { allowUnknownActivePhaseCompletion: options.trustedPipelineProgress === true },
-    );
-    if (completionTransitionError) throw new Error(completionTransitionError);
-    if (!isPipelineOrchestratorProgressWrite) {
-      if (
-        currentAutopilotChildPhase === 'deep-interview'
-        && isForwardAutopilotPhase(currentAutopilotChildPhase, nextAutopilotChildPhase)
-        && !isNextAutopilotPhase(currentAutopilotChildPhase, nextAutopilotChildPhase)
-      ) {
-        throw new Error('Cannot skip Autopilot ralplan gate: deep-interview may only advance to ralplan.');
-      }
-      if (
-        currentAutopilotChildPhase === 'deep-interview'
-        && isNextAutopilotPhase(currentAutopilotChildPhase, nextAutopilotChildPhase)
-      ) {
-        const gate = await canAdvanceAutopilotDeepInterviewToRalplan({
-          cwd: projectRoot ?? process.cwd(),
-          sessionId: scope.sessionId,
-          baseStateDir,
-          currentState: current as Record<string, unknown>,
-          nextState: normalizedBase as Record<string, unknown>,
-        });
-        if (!gate.allowed) throw new Error(buildAutopilotDeepInterviewRalplanGateError(gate));
-      }
-      if (
-        currentAutopilotChildPhase === 'ralplan'
-        && isForwardAutopilotPhase(currentAutopilotChildPhase, nextAutopilotChildPhase)
-        && !isNextAutopilotPhase(currentAutopilotChildPhase, nextAutopilotChildPhase)
-      ) {
-        throw new Error('Cannot skip Autopilot ultragoal gate: ralplan may only advance to ultragoal.');
-      }
-      if (
-        currentAutopilotChildPhase === 'ralplan'
-        && isNextAutopilotPhase(currentAutopilotChildPhase, nextAutopilotChildPhase)
-      ) {
-        const gate = canAdvanceAutopilotRalplanToUltragoal({
-          cwd: projectRoot ?? process.cwd(),
-          sessionId: scope.sessionId,
-          currentState: current as Record<string, unknown>,
-          nextState: normalizedBase as Record<string, unknown>,
-        });
-        if (!gate.allowed) throw new Error(buildAutopilotRalplanUltragoalGateError(gate));
+    const updatedBase = { ...current, ...updates };
+    delete updatedBase.trustedPipelineProgress;
+    if (!Object.prototype.hasOwnProperty.call(updates, 'run_outcome')) {
+      delete updatedBase.run_outcome;
+    }
+    if (mode === 'ralph' && scope.sessionId && typeof updatedBase.owner_omx_session_id !== 'string') {
+      updatedBase.owner_omx_session_id = scope.sessionId;
+    }
+    const normalizedBase = normalizeModeStateOrThrow(mode, updatedBase as ModeState);
+    if (mode === 'ralplan') {
+      const validationError = validateRalplanTerminalConsensus(
+        projectRoot ?? process.cwd(),
+        normalizedBase as Record<string, unknown>,
+        scope.sessionId,
+      );
+      if (validationError) throw new Error(validationError);
+    }
+    if (mode === 'autopilot') {
+      const isPipelineOrchestratorProgressWrite = options.trustedPipelineProgress === true;
+      const currentAutopilotChildPhase = deriveAutopilotChildPhase({ ...current, mode: 'autopilot' });
+      const nextAutopilotChildPhase = deriveAutopilotChildPhase({ ...normalizedBase, mode: 'autopilot' });
+      const completionTransitionError = validateAutopilotCompletionTransition(
+        current as Record<string, unknown>,
+        normalizedBase as Record<string, unknown>,
+        { allowUnknownActivePhaseCompletion: options.trustedPipelineProgress === true },
+      );
+      if (completionTransitionError) throw new Error(completionTransitionError);
+      if (!isPipelineOrchestratorProgressWrite) {
+        if (
+          currentAutopilotChildPhase === 'deep-interview'
+          && isForwardAutopilotPhase(currentAutopilotChildPhase, nextAutopilotChildPhase)
+          && !isNextAutopilotPhase(currentAutopilotChildPhase, nextAutopilotChildPhase)
+        ) {
+          throw new Error('Cannot skip Autopilot ralplan gate: deep-interview may only advance to ralplan.');
+        }
+        if (
+          currentAutopilotChildPhase === 'deep-interview'
+          && isNextAutopilotPhase(currentAutopilotChildPhase, nextAutopilotChildPhase)
+        ) {
+          const gate = await canAdvanceAutopilotDeepInterviewToRalplan({
+            cwd: projectRoot ?? process.cwd(),
+            sessionId: scope.sessionId,
+            baseStateDir,
+            currentState: current as Record<string, unknown>,
+            nextState: normalizedBase as Record<string, unknown>,
+          });
+          if (!gate.allowed) throw new Error(buildAutopilotDeepInterviewRalplanGateError(gate));
+        }
+        if (
+          currentAutopilotChildPhase === 'ralplan'
+          && isForwardAutopilotPhase(currentAutopilotChildPhase, nextAutopilotChildPhase)
+          && !isNextAutopilotPhase(currentAutopilotChildPhase, nextAutopilotChildPhase)
+        ) {
+          throw new Error('Cannot skip Autopilot ultragoal gate: ralplan may only advance to ultragoal.');
+        }
+        if (
+          currentAutopilotChildPhase === 'ralplan'
+          && isNextAutopilotPhase(currentAutopilotChildPhase, nextAutopilotChildPhase)
+        ) {
+          const gate = canAdvanceAutopilotRalplanToUltragoal({
+            cwd: projectRoot ?? process.cwd(),
+            sessionId: scope.sessionId,
+            currentState: current as Record<string, unknown>,
+            nextState: normalizedBase as Record<string, unknown>,
+          });
+          if (!gate.allowed) throw new Error(buildAutopilotRalplanUltragoalGateError(gate));
+        }
       }
     }
-  }
-  const updated = withModeRuntimeContext(current, normalizedBase) as ModeState;
-  await writeFile(getStatePath(mode, projectRoot, scope.sessionId), JSON.stringify(updated, null, 2));
-  await syncRunStateFromModeState(updated, projectRoot, scope.sessionId);
-  if (isTrackedWorkflowMode(mode)) {
-    const cwd = projectRoot ?? process.cwd();
-    const ralplanCompletionHandled = mode === 'ralplan' && await completeRalplanSession({
-      cwd,
-      baseStateDir,
-      state: updated as Record<string, unknown>,
-      explicitSessionId: scope.sessionId,
-    });
-    if (!ralplanCompletionHandled) {
-      await syncCanonicalSkillStateForMode({
+    const updated = withModeRuntimeContext(current, normalizedBase) as ModeState;
+    await writeFile(getStatePath(mode, projectRoot, scope.sessionId), JSON.stringify(updated, null, 2));
+    await syncRunStateFromModeState(updated, projectRoot, scope.sessionId);
+    if (isTrackedWorkflowMode(mode)) {
+      const cwd = projectRoot ?? process.cwd();
+      const ralplanCompletionHandled = mode === 'ralplan' && await completeRalplanSession({
         cwd,
         baseStateDir,
-        mode,
-        active: updated.active === true,
-        currentPhase: typeof updated.current_phase === 'string' ? updated.current_phase : undefined,
-        sessionId: scope.sessionId,
-        source: 'updateModeState',
-        workflowTransitionOptions: options,
+        state: updated as Record<string, unknown>,
+        explicitSessionId: scope.sessionId,
       });
+      if (!ralplanCompletionHandled) {
+        await syncCanonicalSkillStateForMode({
+          cwd,
+          baseStateDir,
+          mode,
+          active: updated.active === true,
+          currentPhase: typeof updated.current_phase === 'string' ? updated.current_phase : undefined,
+          sessionId: scope.sessionId,
+          source: 'updateModeState',
+          workflowTransitionOptions: options,
+        });
+      }
     }
-  }
-  return updated;
+    return updated;
+  };
+  return isTrackedWorkflowMode(mode)
+    ? withWorkflowStateTransaction(
+      baseStateDir,
+      projectRoot ?? process.cwd(),
+      scope.sessionId,
+      run,
+    )
+    : run();
 }
 
 /**

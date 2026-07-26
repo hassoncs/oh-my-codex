@@ -6,9 +6,15 @@ import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { executeStateOperation } from '../operations.js';
+import { executeStateOperation, setStateWriteCommitHookForTests } from '../operations.js';
+import { setSkillActiveWriteHookForTests } from '../skill-active.js';
+import {
+  setWorkflowStateLockTestConfig,
+} from '../workflow-state-lock.js';
 import { subagentTrackingPath } from '../../subagents/tracker.js';
-import { updateModeState } from '../../modes/base.js';
+import { startMode, updateModeState } from '../../modes/base.js';
+
+const CHILD_NODE_ARGS = import.meta.url.endsWith('.ts') ? ['--import', import.meta.resolve('tsx')] : [];
 
 async function withAmbientTmuxEnv<T>(env: NodeJS.ProcessEnv, run: () => Promise<T>): Promise<T> {
   const previousTmux = process.env.TMUX;
@@ -126,7 +132,7 @@ async function runStateWriteInChild(
     process.stdout.write(JSON.stringify(response));
   `;
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [...process.execArgv, '--input-type=module', '--eval', script], {
+    const child = spawn(process.execPath, [...CHILD_NODE_ARGS, '--input-type=module', '--eval', script], {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -139,6 +145,68 @@ async function runStateWriteInChild(
     child.on('close', (code) => {
       if (code !== 0) {
         reject(new Error(`state_write_child_failed:${code}:${stderr}`));
+        return;
+      }
+      resolve(JSON.parse(stdout) as { payload: unknown; isError?: boolean });
+    });
+  });
+}
+
+async function runStateClearInChild(
+  operationsUrl: string,
+  workflowLockUrl: string,
+  workingDirectory: string,
+  mode: 'team' | 'autopilot',
+  barriers: {
+    detailReadyPath?: string;
+    detailReleasePath?: string;
+    contendedPath?: string;
+  } = {},
+): Promise<{ payload: unknown; isError?: boolean }> {
+  const script = `
+    const { existsSync } = await import('node:fs');
+    const { writeFile } = await import('node:fs/promises');
+    const { executeStateOperation, setStateWriteCommitHookForTests } = await import(${JSON.stringify(operationsUrl)});
+    const { setWorkflowStateLockTestConfig } = await import(${JSON.stringify(workflowLockUrl)});
+    const detailReadyPath = ${JSON.stringify(barriers.detailReadyPath ?? '')};
+    const detailReleasePath = ${JSON.stringify(barriers.detailReleasePath ?? '')};
+    const contendedPath = ${JSON.stringify(barriers.contendedPath ?? '')};
+    if (detailReadyPath) {
+      setStateWriteCommitHookForTests(async (stage) => {
+        if (stage !== 'clear-detail-written') return;
+        await writeFile(detailReadyPath, 'ready');
+        while (!existsSync(detailReleasePath)) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+      });
+    }
+    if (contendedPath) {
+      setWorkflowStateLockTestConfig({
+        hook: async (stage) => {
+          if (stage === 'contended') await writeFile(contendedPath, 'contended');
+        },
+      });
+    }
+    const response = await executeStateOperation('state_clear', {
+      workingDirectory: ${JSON.stringify(workingDirectory)},
+      mode: ${JSON.stringify(mode)},
+    });
+    process.stdout.write(JSON.stringify(response));
+  `;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [...CHILD_NODE_ARGS, '--input-type=module', '--eval', script], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf-8');
+    child.stderr.setEncoding('utf-8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`state_clear_child_failed:${code}:${stderr}`));
         return;
       }
       resolve(JSON.parse(stdout) as { payload: unknown; isError?: boolean });
@@ -974,6 +1042,232 @@ describe('state operations directory initialization', () => {
       assert.equal(teamState.first_field, 'first');
       assert.equal(teamState.second_field, 'second');
     } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('rolls back exact detail and canonical bytes when state_write canonical sync fails', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-canonical-rollback-'));
+    try {
+      const initial = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        mode: 'team',
+        active: true,
+        current_phase: 'running',
+        state: { stable: 'before' },
+      });
+      assert.equal(initial.isError, undefined);
+      const stateDir = join(wd, '.omx', 'state');
+      const detailPath = join(stateDir, 'team-state.json');
+      const canonicalPath = join(stateDir, 'skill-active-state.json');
+      const detailBefore = await readFile(detailPath, 'utf-8');
+      const canonicalBefore = await readFile(canonicalPath, 'utf-8');
+      setSkillActiveWriteHookForTests((path) => {
+        if (path === canonicalPath) {
+          throw Object.assign(new Error('simulated state_write canonical EIO'), { code: 'EIO' });
+        }
+      });
+
+      const failed = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        mode: 'team',
+        active: false,
+        current_phase: 'cancelled',
+        state: { stable: 'after' },
+      });
+
+      assert.equal(failed.isError, true);
+      assert.match(String((failed.payload as { error?: string }).error), /simulated state_write canonical EIO/);
+      assert.equal(await readFile(detailPath, 'utf-8'), detailBefore);
+      assert.equal(await readFile(canonicalPath, 'utf-8'), canonicalBefore);
+      assert.equal(existsSync(join(stateDir, '.workflow-state-transaction.json')), false);
+    } finally {
+      setSkillActiveWriteHookForTests();
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes state_clear before a concurrent state_write across processes', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-clear-write-'));
+    try {
+      const initial = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        mode: 'team',
+        active: true,
+        current_phase: 'running',
+      });
+      assert.equal(initial.isError, undefined);
+
+      const operationsUrl = new URL('../operations.js', import.meta.url).href;
+      const workflowLockUrl = new URL('../workflow-state-lock.js', import.meta.url).href;
+      const detailReadyPath = join(wd, 'clear-ready');
+      const detailReleasePath = join(wd, 'clear-release');
+      const contendedPath = join(wd, 'write-contended');
+      const clear = runStateClearInChild(operationsUrl, workflowLockUrl, wd, 'team', {
+        detailReadyPath,
+        detailReleasePath,
+      });
+      await waitForFile(detailReadyPath);
+      const write = runStateWriteInChild(operationsUrl, workflowLockUrl, wd, 'team', {
+        written_after_clear: true,
+      }, {
+        contendedPath,
+      });
+      await waitForFile(contendedPath);
+      await writeFile(detailReleasePath, 'release');
+      const [cleared, written] = await Promise.all([clear, write]);
+
+      assert.equal(cleared.isError, undefined);
+      assert.equal(written.isError, undefined);
+      const detail = JSON.parse(
+        await readFile(join(wd, '.omx', 'state', 'team-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(detail.active, true);
+      assert.equal(detail.written_after_clear, true);
+      const active = await executeStateOperation('state_list_active', { workingDirectory: wd });
+      assert.deepEqual(active.payload, { active_modes: ['team'] });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes state_clear before a concurrent startMode', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-clear-start-'));
+    try {
+      const initial = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        mode: 'team',
+        active: true,
+        current_phase: 'running',
+      });
+      assert.equal(initial.isError, undefined);
+
+      const operationsUrl = new URL('../operations.js', import.meta.url).href;
+      const workflowLockUrl = new URL('../workflow-state-lock.js', import.meta.url).href;
+      const detailReadyPath = join(wd, 'clear-ready');
+      const detailReleasePath = join(wd, 'clear-release');
+      const contendedPath = join(wd, 'start-contended');
+      const clear = runStateClearInChild(operationsUrl, workflowLockUrl, wd, 'team', {
+        detailReadyPath,
+        detailReleasePath,
+      });
+      await waitForFile(detailReadyPath);
+      setWorkflowStateLockTestConfig({
+        hook: async (stage) => {
+          if (stage === 'contended') await writeFile(contendedPath, 'contended');
+        },
+      });
+      const started = startMode('team', 'start after clear', 5, wd);
+      await waitForFile(contendedPath);
+      await writeFile(detailReleasePath, 'release');
+      const [cleared, state] = await Promise.all([clear, started]);
+
+      assert.equal(cleared.isError, undefined);
+      assert.equal(state.active, true);
+      assert.equal(state.task_description, 'start after clear');
+      const active = await executeStateOperation('state_list_active', { workingDirectory: wd });
+      assert.equal(
+        (active.payload as { active_modes?: string[] }).active_modes?.includes('team'),
+        true,
+      );
+    } finally {
+      setWorkflowStateLockTestConfig();
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('restores session detail, canonical, and native-stop bytes when state_clear sync fails', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-clear-rollback-'));
+    try {
+      const sessionId = 'sess-clear-rollback';
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      const initial = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        session_id: sessionId,
+        mode: 'team',
+        active: true,
+        current_phase: 'running',
+      });
+      assert.equal(initial.isError, undefined);
+      const nativePaths = [
+        join(stateDir, 'native-stop-state.json'),
+        join(sessionDir, 'native-stop-state.json'),
+      ];
+      for (const path of nativePaths) {
+        await writeFile(path, JSON.stringify({ sessions: { [sessionId]: { stopped: true } } }));
+      }
+      const paths = [
+        join(sessionDir, 'team-state.json'),
+        join(stateDir, 'skill-active-state.json'),
+        join(sessionDir, 'skill-active-state.json'),
+        ...nativePaths,
+      ];
+      const before = new Map(await Promise.all(paths.map(async (path) => [path, await readFile(path, 'utf-8')] as const)));
+      const sessionCanonicalPath = join(sessionDir, 'skill-active-state.json');
+      setSkillActiveWriteHookForTests((path) => {
+        if (path === sessionCanonicalPath) throw new Error('simulated clear canonical EIO');
+      });
+
+      const failed = await executeStateOperation('state_clear', {
+        workingDirectory: wd,
+        session_id: sessionId,
+        mode: 'team',
+      });
+
+      assert.equal(failed.isError, true);
+      assert.match(String((failed.payload as { error?: string }).error), /simulated clear canonical EIO/);
+      for (const [path, content] of before) {
+        assert.equal(await readFile(path, 'utf-8'), content);
+      }
+    } finally {
+      setSkillActiveWriteHookForTests();
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('restores every scoped detail and canonical file when all_sessions clear sync fails', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-clear-all-rollback-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionIds = ['sess-clear-all-a', 'sess-clear-all-b'];
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, 'team-state.json'), '{"active":true,"mode":"team","current_phase":"root"}');
+      await writeFile(join(stateDir, 'skill-active-state.json'), '{"version":1,"active":true,"active_skills":[{"skill":"team"}]}');
+      for (const sessionId of sessionIds) {
+        const sessionDir = join(stateDir, 'sessions', sessionId);
+        await mkdir(sessionDir, { recursive: true });
+        await writeFile(join(sessionDir, 'team-state.json'), `{"active":true,"mode":"team","current_phase":"${sessionId}"}`);
+        await writeFile(join(sessionDir, 'skill-active-state.json'), `{"version":1,"active":true,"active_skills":[{"skill":"team","session_id":"${sessionId}"}]}`);
+      }
+      const paths = [
+        join(stateDir, 'team-state.json'),
+        join(stateDir, 'skill-active-state.json'),
+        ...sessionIds.flatMap((sessionId) => [
+          join(stateDir, 'sessions', sessionId, 'team-state.json'),
+          join(stateDir, 'sessions', sessionId, 'skill-active-state.json'),
+        ]),
+      ];
+      const before = new Map(await Promise.all(paths.map(async (path) => [path, await readFile(path, 'utf-8')] as const)));
+      setSkillActiveWriteHookForTests(() => {
+        throw new Error('simulated all_sessions canonical EIO');
+      });
+
+      const failed = await executeStateOperation('state_clear', {
+        workingDirectory: wd,
+        mode: 'team',
+        all_sessions: true,
+      });
+
+      assert.equal(failed.isError, true);
+      assert.match(String((failed.payload as { error?: string }).error), /simulated all_sessions canonical EIO/);
+      for (const [path, content] of before) {
+        assert.equal(await readFile(path, 'utf-8'), content);
+      }
+    } finally {
+      setSkillActiveWriteHookForTests();
       await rm(wd, { recursive: true, force: true });
     }
   });

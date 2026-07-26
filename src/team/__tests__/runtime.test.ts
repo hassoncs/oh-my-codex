@@ -60,6 +60,7 @@ import { buildInternalTeamName, resolveTeamIdentityScope } from '../team-identit
 import { writePersistedApprovedTeamExecutionBinding } from '../approved-execution.js';
 import { readModeState, startMode } from '../../modes/base.js';
 
+const CHILD_NODE_ARGS = import.meta.url.endsWith('.ts') ? ['--import', import.meta.resolve('tsx')] : [];
 const coverageRun = process.env.NODE_V8_COVERAGE ? true : false;
 const skipSlowLifecycleUnderCoverage = coverageRun
   ? 'covered by the team-state-runtime lane; skipped under c8 to keep the coverage gate bounded around slow process-lifecycle waits'
@@ -363,6 +364,51 @@ async function waitForFileText(
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error(`timed out waiting for ${filePath}`);
+}
+
+async function runContendedWorkflowWrite(
+  cwd: string,
+  contendedPath: string,
+): Promise<{ payload: unknown; isError?: boolean }> {
+  const operationsUrl = new URL('../../state/operations.js', import.meta.url).href;
+  const workflowLockUrl = new URL('../../state/workflow-state-lock.js', import.meta.url).href;
+  const script = `
+    const { writeFile } = await import('node:fs/promises');
+    const { executeStateOperation } = await import(${JSON.stringify(operationsUrl)});
+    const { setWorkflowStateLockTestConfig } = await import(${JSON.stringify(workflowLockUrl)});
+    setWorkflowStateLockTestConfig({
+      hook: async (stage) => {
+        if (stage === 'contended') await writeFile(${JSON.stringify(contendedPath)}, 'contended');
+      },
+    });
+    const response = await executeStateOperation('state_write', {
+      workingDirectory: ${JSON.stringify(cwd)},
+      mode: 'autopilot',
+      active: true,
+      current_phase: 'deep-interview',
+      state: { concurrent_commit: true },
+    });
+    process.stdout.write(JSON.stringify(response));
+  `;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [...CHILD_NODE_ARGS, '--input-type=module', '--eval', script], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf-8');
+    child.stderr.setEncoding('utf-8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`concurrent_workflow_write_failed:${code}:${stderr}`));
+        return;
+      }
+      resolve(JSON.parse(stdout) as { payload: unknown; isError?: boolean });
+    });
+  });
 }
 
 async function resolveRuntimeTeamName(cwd: string, requestedName: string): Promise<string> {
@@ -3755,6 +3801,69 @@ process.on('SIGTERM', () => process.exit(0));
         assert.equal(await readFile(path, 'utf-8'), content);
       }
       assert.throws(() => process.kill(workerPid, 0));
+    } finally {
+      if (workerPid > 0) {
+        try {
+          process.kill(workerPid, 'SIGKILL');
+        } catch {}
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not let failed startup rollback overwrite a concurrent workflow commit', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-mode-commit-concurrent-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    const contendedPath = join(cwd, 'concurrent-contended');
+    await mkdir(binDir, { recursive: true });
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      `
+process.stdin.resume();
+setInterval(() => {}, 1000);
+process.on('SIGTERM', () => process.exit(0));
+`,
+    );
+
+    let workerPid = 0;
+    const concurrent = {
+      write: null as Promise<{ payload: unknown; isError?: boolean }> | null,
+    };
+    try {
+      await assert.rejects(
+        withPromptModeCodexEnv(binDir, {}, () =>
+          withoutTeamWorkerEnv(() =>
+            startTeam(
+              'team-mode-commit-concurrent',
+              'failed startup rollback must preserve later workflow commit',
+              'executor',
+              1,
+              [{ subject: 's', description: 'd', owner: 'worker-1' }],
+              cwd,
+              {
+                commitModeState: async (runtime) => {
+                  workerPid = runtime.config.workers[0]?.pid ?? 0;
+                  await startMode('team', 'partial mode-state commit', 5, cwd);
+                  concurrent.write = runContendedWorkflowWrite(cwd, contendedPath);
+                  await waitForFileText(contendedPath, (content) => content === 'contended', 10_000);
+                  throw new Error('simulated_concurrent_mode_state_commit_failure');
+                },
+              },
+            ))),
+        /simulated_concurrent_mode_state_commit_failure/,
+      );
+
+      assert.ok(concurrent.write);
+      const response = await concurrent.write;
+      assert.equal(response.isError, undefined);
+      const autopilot = await readModeState('autopilot', cwd);
+      assert.equal(autopilot?.active, true);
+      assert.equal(autopilot?.concurrent_commit, true);
+      const canonical = JSON.parse(
+        await readFile(join(cwd, '.omx', 'state', 'skill-active-state.json'), 'utf-8'),
+      ) as { active_skills?: Array<{ skill?: string }> };
+      assert.deepEqual(canonical.active_skills?.map((entry) => entry.skill), ['autopilot']);
     } finally {
       if (workerPid > 0) {
         try {

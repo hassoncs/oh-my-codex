@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 
 import { withModeRuntimeContext } from './mode-state-context.js';
 import {
+  getAllScopedStateDirs,
   getAllScopedStatePaths,
   getAuthoritativeActiveStateDirs,
   getBaseStateDir,
@@ -51,6 +52,7 @@ import {
 } from './workflow-transition.js';
 import { reconcileWorkflowTransition } from './workflow-transition-reconcile.js';
 import { withWorkflowStateLock } from './workflow-state-lock.js';
+import { withWorkflowStateTransaction } from './workflow-state-transaction.js';
 import {
   buildAutopilotDeepInterviewRalplanGateError,
   canAdvanceAutopilotDeepInterviewToRalplan,
@@ -129,10 +131,12 @@ export interface StateOperationResponse {
   isError?: boolean;
 }
 
-let stateWriteCommitHookForTests: ((stage: 'detail-written', mode: string) => void | Promise<void>) | null = null;
+type StateMutationCommitStage = 'detail-written' | 'clear-detail-written';
+
+let stateWriteCommitHookForTests: ((stage: StateMutationCommitStage, mode: string) => void | Promise<void>) | null = null;
 
 export function setStateWriteCommitHookForTests(
-  hook?: (stage: 'detail-written', mode: string) => void | Promise<void>,
+  hook?: (stage: StateMutationCommitStage, mode: string) => void | Promise<void>,
 ): void {
   stateWriteCommitHookForTests = hook ?? null;
 }
@@ -789,7 +793,9 @@ export async function executeStateOperation(
         let ensureRalphArtifacts = false;
 
         await withWorkflowStateLock(baseStateDir, async () => {
-          await withStateWriteLock(path, async () => {
+          try {
+            await withWorkflowStateTransaction(baseStateDir, cwd, effectiveSessionId, async () => {
+              await withStateWriteLock(path, async () => {
           let existing: Record<string, unknown> = {};
           if (existsSync(path)) {
             try {
@@ -1007,40 +1013,44 @@ export async function executeStateOperation(
           const merged = withModeRuntimeContext(existing, mergedRaw);
           await writeAtomicFile(path, JSON.stringify(merged, null, 2));
           await stateWriteCommitHookForTests?.('detail-written', mode);
-          });
-
-          if (validationError) return;
-
-          if (mode === SKILL_ACTIVE_STATE_MODE) {
-            const state = await readSkillActiveState(path);
-            if (state) {
-              await writeSkillActiveStateCopiesForStateDir(baseStateDir, state, effectiveSessionId);
-            }
-          } else {
-            if (mode === 'ralph' && ensureRalphArtifacts) {
-              await ensureCanonicalRalphArtifacts(cwd, effectiveSessionId);
-            }
-            const data = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
-            const ralplanCompletionHandled = mode === 'ralplan'
-              && !isApprovedUnsupportedNativeNonCleanRecoveryState(data, { cwd, sessionId: effectiveSessionId })
-              && await completeRalplanSession({
-                cwd,
-                baseStateDir,
-                state: data,
-                explicitSessionId: effectiveSessionId,
-                requireNativeSubagents: true,
               });
-            if (!ralplanCompletionHandled) {
-              await syncCanonicalSkillStateForMode({
-                cwd,
-                baseStateDir,
-                mode,
-                active: data.active === true,
-                currentPhase: typeof data.current_phase === 'string' ? data.current_phase : undefined,
-                sessionId: effectiveSessionId,
-                source: 'state-operations',
-              });
-            }
+
+              if (validationError) throw new Error(validationError);
+
+              if (mode === SKILL_ACTIVE_STATE_MODE) {
+                const state = await readSkillActiveState(path);
+                if (state) {
+                  await writeSkillActiveStateCopiesForStateDir(baseStateDir, state, effectiveSessionId);
+                }
+              } else {
+                if (mode === 'ralph' && ensureRalphArtifacts) {
+                  await ensureCanonicalRalphArtifacts(cwd, effectiveSessionId);
+                }
+                const data = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
+                const ralplanCompletionHandled = mode === 'ralplan'
+                  && !isApprovedUnsupportedNativeNonCleanRecoveryState(data, { cwd, sessionId: effectiveSessionId })
+                  && await completeRalplanSession({
+                    cwd,
+                    baseStateDir,
+                    state: data,
+                    explicitSessionId: effectiveSessionId,
+                    requireNativeSubagents: true,
+                  });
+                if (!ralplanCompletionHandled) {
+                  await syncCanonicalSkillStateForMode({
+                    cwd,
+                    baseStateDir,
+                    mode,
+                    active: data.active === true,
+                    currentPhase: typeof data.current_phase === 'string' ? data.current_phase : undefined,
+                    sessionId: effectiveSessionId,
+                    source: 'state-operations',
+                  });
+                }
+              }
+            });
+          } catch (error) {
+            if (!validationError) throw error;
           }
         });
 
@@ -1069,62 +1079,89 @@ export async function executeStateOperation(
 
         const mode = validateStateModeSegment(rawArgs.mode);
         const allSessions = rawArgs.all_sessions === true;
-
-        if (!allSessions) {
-          const path = getStatePath(mode, cwd, effectiveSessionId);
-          if (
-            mode !== SKILL_ACTIVE_STATE_MODE
-            && effectiveSessionId
-            && existsSync(getStatePath(mode, cwd))
-          ) {
-            await writeClearedSessionScopedModeState(path, mode, effectiveSessionId);
-          } else if (existsSync(path)) {
-            await unlink(path);
-          }
-          const nativeStopCleared = effectiveSessionId
-            ? await clearSessionNativeStopState(baseStateDir, effectiveSessionId)
-            : [];
-          if (mode !== SKILL_ACTIVE_STATE_MODE) {
-            await syncCanonicalSkillStateForMode({
-              cwd,
-              baseStateDir,
-              mode,
-              active: false,
-              sessionId: effectiveSessionId,
-              source: 'state-operations',
-            });
-          }
-          return { payload: { cleared: true, mode, path, ...(nativeStopCleared.length > 0 ? { native_stop_cleared: nativeStopCleared } : {}) } };
+        const paths = allSessions
+          ? await getAllScopedStatePaths(mode, cwd)
+          : [getStatePath(mode, cwd, effectiveSessionId)];
+        const transactionPaths = [...paths];
+        if (effectiveSessionId) {
+          transactionPaths.push(
+            join(baseStateDir, 'native-stop-state.json'),
+            join(baseStateDir, 'sessions', effectiveSessionId, 'native-stop-state.json'),
+          );
+        }
+        if (allSessions) {
+          transactionPaths.push(
+            ...(await getAllScopedStateDirs(cwd)).map((dir) => join(dir, 'skill-active-state.json')),
+          );
         }
 
-        const removedPaths: string[] = [];
-        const paths = await getAllScopedStatePaths(mode, cwd);
-        for (const path of paths) {
-          if (!existsSync(path)) continue;
-          await unlink(path);
-          removedPaths.push(path);
-        }
-        if (mode !== SKILL_ACTIVE_STATE_MODE) {
-          await syncCanonicalSkillStateForMode({
-            cwd,
-            baseStateDir,
-            mode,
-            active: false,
-            source: 'state-operations',
-            allSessions: true,
-          });
-        }
+        return await withWorkflowStateLock(baseStateDir, () =>
+          withWorkflowStateTransaction(baseStateDir, cwd, effectiveSessionId, async () => {
+            if (!allSessions) {
+              const [path] = paths;
+              if (
+                mode !== SKILL_ACTIVE_STATE_MODE
+                && effectiveSessionId
+                && existsSync(getStatePath(mode, cwd))
+              ) {
+                await writeClearedSessionScopedModeState(path!, mode, effectiveSessionId);
+              } else if (existsSync(path!)) {
+                await unlink(path!);
+              }
+              const nativeStopCleared = effectiveSessionId
+                ? await clearSessionNativeStopState(baseStateDir, effectiveSessionId)
+                : [];
+              await stateWriteCommitHookForTests?.('clear-detail-written', mode);
+              if (mode !== SKILL_ACTIVE_STATE_MODE) {
+                await syncCanonicalSkillStateForMode({
+                  cwd,
+                  baseStateDir,
+                  mode,
+                  active: false,
+                  sessionId: effectiveSessionId,
+                  source: 'state-operations',
+                });
+              }
+              return {
+                payload: {
+                  cleared: true,
+                  mode,
+                  path,
+                  ...(nativeStopCleared.length > 0 ? { native_stop_cleared: nativeStopCleared } : {}),
+                },
+              };
+            }
 
-        return {
-          payload: {
-            cleared: true,
-            mode,
-            all_sessions: true,
-            removed: removedPaths.length,
-            paths: removedPaths,
-            warning: 'all_sessions clears global and session-scoped state files',
-          },
-        };
+            const removedPaths: string[] = [];
+            for (const path of paths) {
+              if (!existsSync(path)) continue;
+              await unlink(path);
+              removedPaths.push(path);
+            }
+            await stateWriteCommitHookForTests?.('clear-detail-written', mode);
+            if (mode !== SKILL_ACTIVE_STATE_MODE) {
+              await syncCanonicalSkillStateForMode({
+                cwd,
+                baseStateDir,
+                mode,
+                active: false,
+                source: 'state-operations',
+                allSessions: true,
+              });
+            }
+
+            return {
+              payload: {
+                cleared: true,
+                mode,
+                all_sessions: true,
+                removed: removedPaths.length,
+                paths: removedPaths,
+                warning: 'all_sessions clears global and session-scoped state files',
+              },
+            };
+          }, transactionPaths),
+        );
       }
 
       case 'state_list_active': {

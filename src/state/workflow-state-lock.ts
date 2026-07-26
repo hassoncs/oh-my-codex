@@ -1,5 +1,8 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+
+import { recoverWorkflowStateTransaction } from './workflow-state-transaction.js';
 
 const DEFAULT_LOCK_STALE_MS = 120_000;
 const DEFAULT_LOCK_TIMEOUT_MS = 10_000;
@@ -22,6 +25,7 @@ interface WorkflowStateLockTestConfig {
 }
 
 let testConfig: WorkflowStateLockTestConfig = {};
+const lockContext = new AsyncLocalStorage<Map<string, { active: boolean }>>();
 
 export function setWorkflowStateLockTestConfig(config: WorkflowStateLockTestConfig = {}): void {
   testConfig = config;
@@ -113,14 +117,17 @@ export async function withWorkflowStateLock<T>(
   baseStateDir: string,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const lockDir = join(baseStateDir, '.workflow-state.lock');
+  const normalizedBaseStateDir = resolve(baseStateDir);
+  if (lockContext.getStore()?.get(normalizedBaseStateDir)?.active) return fn();
+
+  const lockDir = join(normalizedBaseStateDir, '.workflow-state.lock');
   const ownerPath = join(lockDir, 'owner');
   const token = ownerToken();
   const timeoutMs = testConfig.timeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
   const retryMs = testConfig.retryMs ?? DEFAULT_LOCK_RETRY_MS;
   const heartbeatMs = testConfig.heartbeatMs ?? DEFAULT_LOCK_HEARTBEAT_MS;
   const deadline = Date.now() + timeoutMs;
-  await mkdir(baseStateDir, { recursive: true });
+  await mkdir(normalizedBaseStateDir, { recursive: true });
 
   while (true) {
     try {
@@ -156,7 +163,17 @@ export async function withWorkflowStateLock<T>(
   heartbeat.unref();
 
   try {
-    return await fn();
+    const marker = { active: true };
+    const active = new Map(lockContext.getStore() ?? []);
+    active.set(normalizedBaseStateDir, marker);
+    return await lockContext.run(active, async () => {
+      try {
+        await recoverWorkflowStateTransaction(normalizedBaseStateDir);
+        return await fn();
+      } finally {
+        marker.active = false;
+      }
+    });
   } finally {
     clearInterval(heartbeat);
     const currentOwner = await readOwner(ownerPath);

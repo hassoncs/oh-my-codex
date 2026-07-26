@@ -2217,6 +2217,24 @@ describe('executeTeamApiOperation: cleanup', () => {
         join(stateDir, 'sessions', sessionId, 'team-state.json'),
         JSON.stringify(activeState, null, 2),
       );
+      await writeFile(
+        join(stateDir, 'skill-active-state.json'),
+        JSON.stringify({
+          version: 1,
+          active: true,
+          skill: 'team',
+          active_skills: [{ skill: 'team', active: true, session_id: sessionId }],
+        }, null, 2),
+      );
+      await writeFile(
+        join(stateDir, 'sessions', sessionId, 'skill-active-state.json'),
+        JSON.stringify({
+          version: 1,
+          active: true,
+          skill: 'team',
+          active_skills: [{ skill: 'team', active: true, session_id: sessionId }],
+        }, null, 2),
+      );
 
       const result = await executeTeamApiOperation('cleanup', {
         team_name: 'cleanup-mode-sync',
@@ -2236,6 +2254,23 @@ describe('executeTeamApiOperation: cleanup', () => {
       assert.equal(scopedState.active, false);
       assert.equal(scopedState.current_phase, 'cancelled');
       assert.ok(typeof scopedState.completed_at === 'string' && scopedState.completed_at.length > 0);
+
+      for (const path of [
+        join(stateDir, 'skill-active-state.json'),
+        join(stateDir, 'sessions', sessionId, 'skill-active-state.json'),
+      ]) {
+        const raw = await readFile(path, 'utf-8').catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return null;
+          throw error;
+        });
+        const canonical = raw ? JSON.parse(raw) as {
+          active_skills?: Array<{ skill?: string; active?: boolean }>;
+        } : null;
+        assert.equal(
+          canonical?.active_skills?.some((entry) => entry.skill === 'team' && entry.active !== false) ?? false,
+          false,
+        );
+      }
     } finally {
       await cleanup();
     }
