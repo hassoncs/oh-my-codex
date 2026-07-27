@@ -62,6 +62,9 @@ A startup-only direct-trigger path is acceptable only when all of the following
 conditions hold:
 
 - It runs only for the first worker inbox trigger during team startup.
+- Fresh Team admission holds the canonical workflow lock across the one-Team
+  guard, worker-worktree provisioning, mode admission, and initial state write.
+  A concurrent loser fails before worker spawn or canonical identity mutation.
 - Durable assignment state is already written: task JSON, identity JSON, inbox,
   manifest/config pane id, and dispatch request metadata.
 - It does not replace or bypass mailbox dispatch for follow-up worker messages.
@@ -97,6 +100,8 @@ Use this checklist when reviewing the implementation:
       require startup evidence after fallback.
 - [ ] Failed admitted startup preserves worker edits and tears down started
       prompt workers.
+- [ ] Concurrent same-name and different-name starts admit exactly one Team;
+      losers cannot provision, spawn, or overwrite canonical Team state.
 - [ ] Tests isolate readiness latency, hook receipt/evidence latency, and the
       startup fast path separately so failures identify the phase that regressed.
 

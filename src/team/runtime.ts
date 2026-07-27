@@ -139,7 +139,7 @@ import { hasStructuredVerificationEvidence } from '../verification/verifier.js';
 import { buildRebalanceDecisions } from './rebalance-policy.js';
 import { getBaseStateDir, resolveStateScope } from '../mcp/state-paths.js';
 import { syncCanonicalSkillStateForMode } from '../state/skill-active.js';
-import { startMode, updateModeState } from '../modes/base.js';
+import { readModeStateForActiveDecision, startMode, updateModeState } from '../modes/base.js';
 import { withWorkflowStateLock } from '../state/workflow-state-lock.js';
 import {
   withWorkflowStateTransaction,
@@ -374,10 +374,21 @@ async function assertTeamStartupIsNonDestructive(
   teamName: string,
   cwd: string,
   leaderSessionId: string,
+  workflowSessionId?: string,
 ): Promise<void> {
   const activeTeams = await findActiveTeams(cwd, leaderSessionId);
   if (activeTeams.length > 0) {
     throw new Error(`leader_session_conflict: active team exists (${activeTeams.join(', ')})`);
+  }
+
+  const activeModeState = await readModeStateForActiveDecision('team', workflowSessionId, cwd);
+  if (activeModeState?.active) {
+    const activeTeamName = typeof activeModeState.team_name === 'string'
+      ? activeModeState.team_name.trim()
+      : '';
+    throw new Error(
+      `leader_session_conflict: active team exists (${activeTeamName || 'team admission in progress'})`,
+    );
   }
 
   const [existingConfig, existingManifest, existingPhase] = await Promise.all([
@@ -2585,11 +2596,6 @@ export async function startTeam(
   const sanitized = buildInternalTeamName(displayName, identityScope);
   const leaderSessionId = identityScope.sessionId || identityScope.paneId || identityScope.tmuxTarget || identityScope.runId;
 
-  await assertTeamStartupIsNonDestructive(sanitized, leaderCwd, leaderSessionId);
-  if (displayName !== sanitized) {
-    await assertTeamStartupIsNonDestructive(displayName, leaderCwd, leaderSessionId);
-  }
-
   if (workerLaunchMode === 'interactive') {
     if (!isTmuxAvailable()) {
       throw new Error('Team mode requires tmux. Install with: apt install tmux / brew install tmux');
@@ -2674,64 +2680,70 @@ export async function startTeam(
   const startupRetryDelayS = resolveStartupDispatchRetryDelayS(launchEnv);
   const skipWorkerReadyWait = shouldSkipWorkerReadyWait(launchEnv);
   let admissionCommitted = false;
+  const scope = await resolveStateScope(leaderCwd);
+  const baseStateDir = getBaseStateDir(leaderCwd);
+  const commitModeState = options.commitModeState ?? (async (
+    admission: {
+      teamName: string;
+      sanitizedName: string;
+      cwd: string;
+      config: Pick<TeamConfig, 'worker_count' | 'workers' | 'display_name'>;
+    },
+    authority: WorkflowStateMutationAuthority,
+  ): Promise<void> => {
+    await startMode('team', task, 50, leaderCwd, {
+      allowNestedAutopilotTeam: true,
+      workflowLockLease: authority.lockLease,
+      workflowTransactionLease: authority.transactionLease,
+    });
+    await updateModeState('team', {
+      current_phase: 'team-exec',
+      team_name: admission.teamName,
+      display_name: admission.config.display_name,
+      agent_count: admission.config.worker_count,
+    }, leaderCwd, scope.sessionId, {
+      allowNestedAutopilotTeam: true,
+      workflowLockLease: authority.lockLease,
+      workflowTransactionLease: authority.transactionLease,
+    });
+  });
 
   try {
     if (activeWorktreeMode) {
       assertCleanLeaderWorkspaceForWorkerWorktrees(leaderCwd);
-      for (let i = 1; i <= workerCount; i++) {
-        const workerName = `worker-${i}`;
-        const planned = planWorktreeTarget({
-          cwd: leaderCwd,
-          scope: 'team',
-          mode: effectiveWorktreeMode,
-          teamName: sanitized,
-          workerName,
-        });
-        const ensured = ensureWorktree(planned);
-        provisionedWorktrees.push(ensured);
-        if (ensured.enabled) {
-          workerWorkspaceByName.set(workerName, {
-            cwd: ensured.worktreePath,
-            worktreeRepoRoot: ensured.repoRoot,
-            worktreePath: ensured.worktreePath,
-            worktreeBranch: ensured.branchName ?? undefined,
-            worktreeBaseRef: ensured.baseRef,
-            worktreeDetached: ensured.detached,
-            worktreeCreated: ensured.created,
-          });
-        }
-      }
     }
 
-    const scope = await resolveStateScope(leaderCwd);
-    const baseStateDir = getBaseStateDir(leaderCwd);
-    const commitModeState = options.commitModeState ?? (async (
-      admission: {
-        teamName: string;
-        sanitizedName: string;
-        cwd: string;
-        config: Pick<TeamConfig, 'worker_count' | 'workers' | 'display_name'>;
-      },
-      authority: WorkflowStateMutationAuthority,
-    ): Promise<void> => {
-      await startMode('team', task, 50, leaderCwd, {
-        allowNestedAutopilotTeam: true,
-        workflowLockLease: authority.lockLease,
-        workflowTransactionLease: authority.transactionLease,
-      });
-      await updateModeState('team', {
-        current_phase: 'team-exec',
-        team_name: admission.teamName,
-        display_name: admission.config.display_name,
-        agent_count: admission.config.worker_count,
-      }, leaderCwd, scope.sessionId, {
-        allowNestedAutopilotTeam: true,
-        workflowLockLease: authority.lockLease,
-        workflowTransactionLease: authority.transactionLease,
-      });
-    });
-    await withWorkflowStateLock(baseStateDir, leaderCwd, (lockLease) =>
-      withWorkflowStateTransaction(
+    await withWorkflowStateLock(baseStateDir, leaderCwd, async (lockLease) => {
+      await assertTeamStartupIsNonDestructive(sanitized, leaderCwd, leaderSessionId, scope.sessionId);
+      if (displayName !== sanitized) {
+        await assertTeamStartupIsNonDestructive(displayName, leaderCwd, leaderSessionId, scope.sessionId);
+      }
+      if (activeWorktreeMode) {
+        for (let i = 1; i <= workerCount; i++) {
+          const workerName = `worker-${i}`;
+          const planned = planWorktreeTarget({
+            cwd: leaderCwd,
+            scope: 'team',
+            mode: effectiveWorktreeMode,
+            teamName: sanitized,
+            workerName,
+          });
+          const ensured = ensureWorktree(planned);
+          provisionedWorktrees.push(ensured);
+          if (ensured.enabled) {
+            workerWorkspaceByName.set(workerName, {
+              cwd: ensured.worktreePath,
+              worktreeRepoRoot: ensured.repoRoot,
+              worktreePath: ensured.worktreePath,
+              worktreeBranch: ensured.branchName ?? undefined,
+              worktreeBaseRef: ensured.baseRef,
+              worktreeDetached: ensured.detached,
+              worktreeCreated: ensured.created,
+            });
+          }
+        }
+      }
+      await withWorkflowStateTransaction(
         baseStateDir,
         leaderCwd,
         scope.sessionId,
@@ -2752,8 +2764,8 @@ export async function startTeam(
         }, { lockLease, transactionLease }),
         [],
         { lockLease },
-      ),
-    );
+      );
+    });
     admissionCommitted = true;
 
     await detectAndCleanStaleTeam(sanitized, leaderCwd, workerCount, options.confirmStaleCleanup);

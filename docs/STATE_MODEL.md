@@ -65,6 +65,23 @@ Workflow mutation authority pins filesystem identity, not only lexical paths:
 This prevents a symlink or project-alias retarget from redirecting state,
 Autopilot context snapshots, or rollback after authority was acquired.
 
+### 5. Team admission and scale-down safety
+
+Fresh Team startup is one serialized admission under the canonical workflow lock:
+
+- the one-Team guard, worker-worktree provisioning, mode admission, and initial
+  Team state write share one lock boundary
+- simultaneous same-name or different-name starts have exactly one winner; a
+  loser fails before worker spawn or canonical Team identity mutation
+- resume remains an explicit lifecycle path, not an idempotent fresh start
+
+Non-force scale-down never becomes an implicit kill:
+
+- `force: false` waits for every selected worker to drain
+- expiry returns `scale_down_drain_timeout:<workers>`, restores workers still in
+  `draining`, and preserves panes, config, worktrees, and process-local work
+- only `force: true` may bypass drain completion and tear workers down
+
 ## Terminal lifecycle outcome compatibility
 
 For the explicit terminal stop model, treat workflow `current_phase` and user-facing terminal lifecycle outcome as related but separate concepts.

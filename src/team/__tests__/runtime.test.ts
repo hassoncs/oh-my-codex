@@ -59,7 +59,7 @@ import { readTeamEvents } from '../state/events.js';
 import { sanitizeTeamName } from '../tmux-session.js';
 import { buildInternalTeamName, resolveTeamIdentityScope } from '../team-identity.js';
 import { writePersistedApprovedTeamExecutionBinding } from '../approved-execution.js';
-import { readModeState, startMode } from '../../modes/base.js';
+import { readModeState, startMode, updateModeState } from '../../modes/base.js';
 
 const CHILD_NODE_ARGS = import.meta.url.endsWith('.ts') ? ['--import', import.meta.resolve('tsx')] : [];
 const coverageRun = process.env.NODE_V8_COVERAGE ? true : false;
@@ -1688,6 +1688,104 @@ process.on('SIGTERM', () => process.exit(0));`,
       else delete process.env.OMX_SESSION_ID;
       if (typeof prevLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = prevLaunchMode;
       else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam serializes concurrent admission so only one team can start', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-concurrent-team-start-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    const spawnCapturePath = join(cwd, 'worker-spawns');
+    await mkdir(binDir, { recursive: true });
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      `
+require('fs').appendFileSync(process.env.OMX_CONCURRENT_START_CAPTURE, process.env.OMX_TEAM_INTERNAL_WORKER + '\\n');
+process.stdin.resume();
+setInterval(() => {}, 1000);
+process.on('SIGTERM', () => process.exit(0));
+`,
+    );
+
+    let releaseFirstAdmission!: () => void;
+    const firstAdmissionRelease = new Promise<void>((resolve) => {
+      releaseFirstAdmission = resolve;
+    });
+    let markFirstAdmissionEntered!: () => void;
+    const firstAdmissionEntered = new Promise<void>((resolve) => {
+      markFirstAdmissionEntered = resolve;
+    });
+    let runtimeTeamName = '';
+
+    try {
+      await withPromptModeCodexEnv(binDir, {
+        OMX_SESSION_ID: 'sess-concurrent-team-start',
+        OMX_CONCURRENT_START_CAPTURE: spawnCapturePath,
+      }, async () => {
+        const firstStart = withoutTeamWorkerEnv(() => startTeam(
+          'first-concurrent-team',
+          'first concurrent team owns admission',
+          'executor',
+          1,
+          [{ subject: 'first', description: 'first task', owner: 'worker-1' }],
+          cwd,
+          {
+            commitModeState: async (admission, authority) => {
+              await startMode('team', 'first concurrent team owns admission', 50, cwd, {
+                allowNestedAutopilotTeam: true,
+                workflowLockLease: authority.lockLease,
+                workflowTransactionLease: authority.transactionLease,
+              });
+              await updateModeState('team', {
+                current_phase: 'team-exec',
+                team_name: admission.teamName,
+                display_name: admission.config.display_name,
+                agent_count: admission.config.worker_count,
+              }, cwd, 'sess-concurrent-team-start', {
+                allowNestedAutopilotTeam: true,
+                workflowLockLease: authority.lockLease,
+                workflowTransactionLease: authority.transactionLease,
+              });
+              markFirstAdmissionEntered();
+              await firstAdmissionRelease;
+            },
+          },
+        ));
+
+        await firstAdmissionEntered;
+        const secondStart = withoutTeamWorkerEnv(() => startTeam(
+          'second-concurrent-team',
+          'second concurrent team must lose admission',
+          'executor',
+          1,
+          [{ subject: 'second', description: 'second task', owner: 'worker-1' }],
+          cwd,
+        ));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        releaseFirstAdmission();
+
+        const [firstResult, secondResult] = await Promise.allSettled([firstStart, secondStart]);
+        assert.equal(firstResult.status, 'fulfilled');
+        assert.equal(secondResult.status, 'rejected');
+        if (firstResult.status !== 'fulfilled' || secondResult.status !== 'rejected') return;
+        const runtime = firstResult.value;
+        runtimeTeamName = runtime.teamName;
+        assert.match(
+          String(secondResult.reason),
+          /leader_session_conflict: active team exists \(first-concurrent-team-[a-f0-9]{8}\)/,
+        );
+
+        const spawns = (await readFile(spawnCapturePath, 'utf-8')).trim().split('\n');
+        assert.deepEqual(spawns, [`${runtime.teamName}/worker-1`]);
+        const mode = await readModeState('team', cwd);
+        assert.equal(mode?.team_name, runtime.teamName);
+        const teams = await readdir(join(cwd, '.omx', 'state', 'team'), { withFileTypes: true });
+        assert.equal(teams.some((entry) => entry.name.startsWith('second-concurrent-team-')), false);
+      });
+    } finally {
+      releaseFirstAdmission();
+      if (runtimeTeamName) await shutdownTeam(runtimeTeamName, cwd, { force: true }).catch(() => {});
       await rm(cwd, { recursive: true, force: true });
     }
   });

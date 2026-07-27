@@ -2130,6 +2130,73 @@ describe('scaleDown', () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it('preserves a busy worker after non-force drain timeout and force still tears it down', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-drain-timeout-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-drain-timeout-tmux-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+    try {
+      await initTeamState('drain-timeout', 'task', 'executor', 2, cwd);
+      const config = await readTeamConfig('drain-timeout', cwd);
+      assert.ok(config);
+      if (!config) return;
+      config.workers[1]!.pane_id = '%22';
+      await saveTeamConfig(config, cwd);
+      await writeWorkerStatus('drain-timeout', 'worker-2', {
+        state: 'working',
+        current_task_id: 't-2',
+        updated_at: new Date().toISOString(),
+      }, cwd);
+
+      await writeFile(
+        tmuxStubPath,
+        `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "\${1:-}" in
+  show-option)
+    echo "${config.tmux_pane_owner_id}"
+    ;;
+  list-panes)
+    echo "%22 0"
+    ;;
+esac
+exit 0
+`,
+      );
+      await writeFile(tmuxLogPath, '');
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+
+      const timedOut = await scaleDown(
+        'drain-timeout',
+        cwd,
+        { workerNames: ['worker-2'], drainTimeoutMs: 0 },
+        { OMX_TEAM_SCALING_ENABLED: '1' },
+      );
+      assert.deepEqual(timedOut, { ok: false, error: 'scale_down_drain_timeout:worker-2' });
+      assert.equal((await readTeamConfig('drain-timeout', cwd))?.workers.some((worker) => worker.name === 'worker-2'), true);
+      assert.equal((await readWorkerStatus('drain-timeout', 'worker-2', cwd)).state, 'working');
+      assert.doesNotMatch(await readFile(tmuxLogPath, 'utf-8'), /kill-pane -t %22/);
+
+      const forced = await scaleDown(
+        'drain-timeout',
+        cwd,
+        { workerNames: ['worker-2'], force: true },
+        { OMX_TEAM_SCALING_ENABLED: '1' },
+      );
+      assert.equal(forced.ok, true);
+      assert.equal((await readTeamConfig('drain-timeout', cwd))?.workers.some((worker) => worker.name === 'worker-2'), false);
+      assert.match(await readFile(tmuxLogPath, 'utf-8'), /kill-pane -t %22/);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
 });
 
 

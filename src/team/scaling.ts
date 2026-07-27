@@ -996,6 +996,26 @@ export async function scaleDown(
         if (allDrained.every(Boolean)) break;
         await new Promise(r => setTimeout(r, 2_000));
       }
+
+      const undrainedWorkers: string[] = [];
+      for (const worker of targetWorkers) {
+        const status = await readWorkerStatus(sanitized, worker.name, leaderCwd);
+        if (
+          status.state !== 'idle'
+          && status.state !== 'done'
+          && isWorkerAlive(sessionName, worker.index, worker.pane_id)
+        ) {
+          undrainedWorkers.push(worker.name);
+        }
+      }
+      if (undrainedWorkers.length > 0) {
+        const restoreErrors = await restorePreviousStatuses();
+        return {
+          ok: false,
+          error: `scale_down_drain_timeout:${undrainedWorkers.join(',')}`
+            + (restoreErrors.length > 0 ? `;scale_down_restore_failed:${restoreErrors.join('|')}` : ''),
+        };
+      }
     }
 
     const worktreesToPreserve: EnsureWorktreeResult[] = targetWorkers
