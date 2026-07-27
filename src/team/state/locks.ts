@@ -1,11 +1,12 @@
 import { existsSync } from 'fs';
-import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
 
 interface TeamPathDeps {
   teamDir: (teamName: string, cwd: string) => string;
   taskClaimLockDir: (teamName: string, taskId: string, cwd: string) => string;
   mailboxLockDir: (teamName: string, workerName: string, cwd: string) => string;
+  renameLockDir?: (from: string, to: string) => Promise<void>;
 }
 
 interface WorkerStatusPathDeps extends TeamPathDeps {
@@ -18,17 +19,82 @@ function lockOwnerToken(): string {
   return `${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
 }
 
-async function maybeRecoverStaleLock(lockDir: string, lockStaleMs: number): Promise<boolean> {
+interface LockSnapshot {
+  dev: number;
+  ino: number;
+  mtimeMs: number;
+  owner: string | null;
+}
+
+async function readLockSnapshot(lockDir: string): Promise<LockSnapshot | null> {
   try {
-    const info = await stat(lockDir);
-    const ageMs = Date.now() - info.mtimeMs;
-    if (ageMs > lockStaleMs) {
-      await rm(lockDir, { recursive: true, force: true });
-      return true;
+    const before = await stat(lockDir);
+    let owner: string | null = null;
+    try {
+      owner = (await readFile(join(lockDir, 'owner'), 'utf8')).trim();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
-  } catch {
+    const after = await stat(lockDir);
+    if (before.dev !== after.dev || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs) return null;
+    return { dev: after.dev, ino: after.ino, mtimeMs: after.mtimeMs, owner };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
   }
-  return false;
+}
+
+function lockOwnerIsAlive(owner: string | null): boolean {
+  const match = owner?.match(/^(\d+)\./);
+  if (!match) return false;
+  const pid = Number.parseInt(match[1]!, 10);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+function sameLockSnapshot(left: LockSnapshot, right: LockSnapshot): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.mtimeMs === right.mtimeMs
+    && left.owner === right.owner;
+}
+
+async function maybeRecoverStaleLock(
+  lockDir: string,
+  lockStaleMs: number,
+  deps: TeamPathDeps,
+): Promise<boolean> {
+  const observed = await readLockSnapshot(lockDir);
+  if (!observed || Date.now() - observed.mtimeMs <= lockStaleMs || lockOwnerIsAlive(observed.owner)) return false;
+
+  const quarantineDir = `${lockDir}.stale-${lockOwnerToken()}`;
+  try {
+    await (deps.renameLockDir ?? rename)(lockDir, quarantineDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+
+  const quarantined = await readLockSnapshot(quarantineDir);
+  if (!quarantined || !sameLockSnapshot(observed, quarantined)) {
+    try {
+      await rename(quarantineDir, lockDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new Error(`Lock recovery conflict for ${lockDir}; preserved replacement at ${quarantineDir}`);
+      }
+      throw error;
+    }
+    return false;
+  }
+
+  await rm(quarantineDir, { recursive: true, force: true });
+  return true;
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -60,7 +126,7 @@ export async function withScalingLock<T>(
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
       if (err.code !== 'EEXIST') throw error;
-      if (await maybeRecoverStaleLock(lockDir, lockStaleMs)) continue;
+      if (await maybeRecoverStaleLock(lockDir, lockStaleMs, deps)) continue;
       if (Date.now() > deadline) {
         throw new Error(`Timed out acquiring scaling lock for team ${teamName}`);
       }
@@ -106,7 +172,7 @@ export async function withTeamLock<T>(
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
       if (err.code !== 'EEXIST') throw error;
-      if (await maybeRecoverStaleLock(lockDir, lockStaleMs)) continue;
+      if (await maybeRecoverStaleLock(lockDir, lockStaleMs, deps)) continue;
       if (Date.now() > deadline) {
         throw new Error(`Timed out acquiring team lifecycle lock for ${teamName}`);
       }
@@ -146,7 +212,7 @@ export async function withTaskClaimLock<T>(
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
       if (err.code !== 'EEXIST') throw error;
-      if (await maybeRecoverStaleLock(lockDir, lockStaleMs)) continue;
+      if (await maybeRecoverStaleLock(lockDir, lockStaleMs, deps)) continue;
       if (Date.now() > deadline) return { ok: false };
       await sleep(LOCK_OWNER_RETRY_MS);
     }
@@ -202,7 +268,7 @@ async function withWorkerScopedLock<T>(
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
       if (err.code !== 'EEXIST') throw error;
-      if (await maybeRecoverStaleLock(lockDir, lockStaleMs)) continue;
+      if (await maybeRecoverStaleLock(lockDir, lockStaleMs, deps)) continue;
       if (Date.now() > deadline) {
         throw new Error(`Timed out acquiring ${lockKind} lock for ${teamName}/${workerName}`);
       }
