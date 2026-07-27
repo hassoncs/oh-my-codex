@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -12,8 +12,63 @@ import { markQuestionAnswered, readQuestionRecord } from '../../question/state.j
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, '..', '..', '..');
 const omxBin = join(repoRoot, 'dist', 'cli', 'omx.js');
+const QUESTION_CLI_TEST_WAIT_ATTEMPTS = 3_000;
 const tempDirs: string[] = [];
+const questionCliChildren = new Set<ChildProcess>();
+const closedQuestionCliChildren = new WeakSet<ChildProcess>();
 let originalProcessExitCode: string | number | null | undefined;
+
+function trackQuestionCliChild<T extends ChildProcess>(child: T): T {
+  questionCliChildren.add(child);
+  child.once('close', () => {
+    closedQuestionCliChildren.add(child);
+    questionCliChildren.delete(child);
+  });
+  return child;
+}
+
+async function waitForChildClose(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (closedQuestionCliChildren.has(child)) return true;
+  return new Promise((resolve) => {
+    const onClose = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      child.off('close', onClose);
+      resolve(false);
+    }, timeoutMs);
+    child.once('close', onClose);
+  });
+}
+
+function signalQuestionCliChild(child: ChildProcess, signal: NodeJS.Signals): void {
+  try {
+    if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return;
+    try {
+      child.kill(signal);
+    } catch (fallbackError) {
+      if ((fallbackError as NodeJS.ErrnoException).code !== 'ESRCH') throw fallbackError;
+    }
+  }
+}
+
+async function terminateQuestionCliChild(child: ChildProcess): Promise<void> {
+  if (closedQuestionCliChildren.has(child)) return;
+  const terminated = waitForChildClose(child, 1_000);
+  signalQuestionCliChild(child, 'SIGTERM');
+  if (await terminated) return;
+  const killed = waitForChildClose(child, 1_000);
+  signalQuestionCliChild(child, 'SIGKILL');
+  if (!await killed) throw new Error(`question_cli_test_child_teardown_failed:${child.pid ?? 'unknown'}`);
+}
+
+async function terminateQuestionCliChildren(): Promise<void> {
+  await Promise.all([...questionCliChildren].map(terminateQuestionCliChild));
+}
 
 async function makeRepo(): Promise<string> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-question-cli-'));
@@ -32,6 +87,7 @@ function makeQuestionCliEnv(cwd: string, overrides: NodeJS.ProcessEnv = {}): Nod
 
 afterEach(async () => {
   process.exitCode = originalProcessExitCode;
+  await terminateQuestionCliChildren();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -40,7 +96,7 @@ async function waitForQuestionRecordFile(
   diagnostics: () => string,
   options: { attempts?: number; intervalMs?: number } = {},
 ): Promise<string> {
-  const attempts = options.attempts ?? 250;
+  const attempts = options.attempts ?? QUESTION_CLI_TEST_WAIT_ATTEMPTS;
   const intervalMs = options.intervalMs ?? 20;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const entries = await readdir(questionsDir);
@@ -52,7 +108,7 @@ async function waitForQuestionRecordFile(
 }
 
 async function waitForQuestionRenderer(recordPath: string): Promise<Awaited<ReturnType<typeof readQuestionRecord>>> {
-  for (let attempt = 0; attempt < 250; attempt += 1) {
+  for (let attempt = 0; attempt < QUESTION_CLI_TEST_WAIT_ATTEMPTS; attempt += 1) {
     const record = await readQuestionRecord(recordPath);
     if (record?.renderer) return record;
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -76,8 +132,10 @@ describe('omx question CLI', () => {
       }), '--json'], {
         cwd,
         env: makeQuestionCliEnv(cwd, { OMX_TEAM_WORKER: 'demo/worker-1', OMX_AUTO_UPDATE: '0' }),
+        detached: process.platform !== 'win32',
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      trackQuestionCliChild(child);
       let stdout = '';
       let stderr = '';
       child.stdout.on('data', (chunk) => { stdout += String(chunk); });
@@ -105,8 +163,10 @@ describe('omx question CLI', () => {
     const child = spawn(process.execPath, [omxBin, 'question', '--input', input, '--json'], {
       cwd,
       env: makeQuestionCliEnv(cwd, { OMX_AUTO_UPDATE: '0', OMX_NOTIFY_FALLBACK: '0', OMX_HOOK_DERIVED_SIGNALS: '0', OMX_QUESTION_TEST_RENDERER: 'noop' }),
+      detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    trackQuestionCliChild(child);
 
     let stdout = '';
     let stderr = '';
@@ -119,7 +179,7 @@ describe('omx question CLI', () => {
     const recordPath = join(questionsDir, recordFile);
 
     let record = null;
-    for (let attempt = 0; attempt < 250; attempt += 1) {
+    for (let attempt = 0; attempt < QUESTION_CLI_TEST_WAIT_ATTEMPTS; attempt += 1) {
       record = await readQuestionRecord(recordPath);
       if (record?.status === 'prompting') break;
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -187,8 +247,10 @@ describe('omx question CLI', () => {
         OMX_HOOK_DERIVED_SIGNALS: '0',
         OMX_QUESTION_TEST_RENDERER: 'noop',
       }),
+      detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    trackQuestionCliChild(child);
 
     let stdout = '';
     let stderr = '';
@@ -201,7 +263,7 @@ describe('omx question CLI', () => {
     const recordPath = join(questionsDir, recordFile);
 
     let record = null;
-    for (let attempt = 0; attempt < 250; attempt += 1) {
+    for (let attempt = 0; attempt < QUESTION_CLI_TEST_WAIT_ATTEMPTS; attempt += 1) {
       record = await readQuestionRecord(recordPath);
       if (record?.status === 'prompting') break;
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -311,8 +373,10 @@ describe('omx question CLI', () => {
         OMX_QUESTION_TEST_RENDERER: 'noop',
         [AUTOPILOT_DEEP_INTERVIEW_QUESTION_OWNER_ENV]: obligationId,
       }),
+      detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    trackQuestionCliChild(child);
 
     let stdout = '';
     let stderr = '';
@@ -323,7 +387,7 @@ describe('omx question CLI', () => {
     const recordFile = await waitForQuestionRecordFile(questionsDir, () => `stderr=${stderr}; stdout=${stdout}`);
     const recordPath = join(questionsDir, recordFile);
     let record = null;
-    for (let attempt = 0; attempt < 250; attempt += 1) {
+    for (let attempt = 0; attempt < QUESTION_CLI_TEST_WAIT_ATTEMPTS; attempt += 1) {
       record = await readQuestionRecord(recordPath);
       if (record?.status === 'prompting') break;
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -371,8 +435,10 @@ describe('omx question CLI', () => {
     const child = spawn(process.execPath, [omxBin, 'question', '--input', input, '--json'], {
       cwd,
       env: makeQuestionCliEnv(cwd, { OMX_AUTO_UPDATE: '0', OMX_NOTIFY_FALLBACK: '0', OMX_HOOK_DERIVED_SIGNALS: '0', OMX_QUESTION_TEST_RENDERER: 'noop' }),
+      detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    trackQuestionCliChild(child);
 
     let stdout = '';
     let stderr = '';
@@ -385,7 +451,7 @@ describe('omx question CLI', () => {
     const recordPath = join(questionsDir, recordFile);
 
     let record = null;
-    for (let attempt = 0; attempt < 250; attempt += 1) {
+    for (let attempt = 0; attempt < QUESTION_CLI_TEST_WAIT_ATTEMPTS; attempt += 1) {
       record = await readQuestionRecord(recordPath);
       if (record?.status === 'prompting') break;
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -456,8 +522,10 @@ esac
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
         }),
+        detached: process.platform !== 'win32',
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      trackQuestionCliChild(child);
       let stdout = '';
       let stderr = '';
       child.stdout.on('data', (chunk) => { stdout += String(chunk); });
@@ -538,8 +606,10 @@ esac
           OMX_HOOK_DERIVED_SIGNALS: '0',
           OMX_QUESTION_WAIT_TIMEOUT_MS: '5000',
         }),
+        detached: process.platform !== 'win32',
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      trackQuestionCliChild(child);
       let stdout = '';
       let stderr = '';
       child.stdout.on('data', (chunk) => { stdout += String(chunk); });
@@ -581,8 +651,10 @@ esac
           OMX_QUESTION_TEST_RENDERER: 'noop',
           OMX_QUESTION_WAIT_TIMEOUT_MS: '50',
         }),
+        detached: process.platform !== 'win32',
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      trackQuestionCliChild(child);
       let stdout = '';
       let stderr = '';
       child.stdout.on('data', (chunk) => { stdout += String(chunk); });
@@ -595,6 +667,63 @@ esac
     assert.equal(payload.ok, false);
     assert.equal(payload.error.code, 'question_runtime_failed');
     assert.match(payload.error.message, /Timed out waiting for question answer after 50ms/i);
+  });
+
+  it('terminates tracked unanswered CLI children during test cleanup', async () => {
+    const cwd = await makeRepo();
+    const input = JSON.stringify({
+      question: 'Pick one',
+      options: [{ label: 'A', value: 'a' }],
+      allow_other: true,
+      session_id: 'sess-q',
+    });
+    const child = spawn(process.execPath, [omxBin, 'question', '--input', input, '--json'], {
+      cwd,
+      env: makeQuestionCliEnv(cwd, {
+        OMX_AUTO_UPDATE: '0',
+        OMX_NOTIFY_FALLBACK: '0',
+        OMX_HOOK_DERIVED_SIGNALS: '0',
+        OMX_QUESTION_TEST_RENDERER: 'noop',
+      }),
+      detached: process.platform !== 'win32',
+      stdio: 'ignore',
+    });
+    trackQuestionCliChild(child);
+
+    const questionsDir = join(cwd, '.omx', 'state', 'sessions', 'sess-q', 'questions');
+    const recordFile = await waitForQuestionRecordFile(questionsDir, () => `child_pid=${child.pid ?? 'unknown'}`);
+    const record = await waitForQuestionRenderer(join(questionsDir, recordFile));
+    assert.equal(record?.status, 'prompting');
+
+    await terminateQuestionCliChildren();
+
+    assert.equal(closedQuestionCliChildren.has(child), true);
+    assert.equal(questionCliChildren.size, 0);
+  });
+
+  it('closes tracked process groups when a descendant inherits stdio', { skip: process.platform === 'win32' }, async () => {
+    const child = spawn(process.execPath, ['--eval', [
+      "const { spawn } = require('node:child_process');",
+      "spawn(process.execPath, ['--eval', 'setInterval(() => {}, 30000)'], { stdio: ['ignore', 'inherit', 'inherit'] });",
+      "process.stdout.write('ready\\n');",
+      'setInterval(() => {}, 30000);',
+    ].join(' ')], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    trackQuestionCliChild(child);
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('question_cli_descendant_ready_timeout')), 2_000);
+      child.stdout.once('data', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+
+    await terminateQuestionCliChildren();
+
+    assert.equal(closedQuestionCliChildren.has(child), true);
+    assert.equal(questionCliChildren.size, 0);
   });
 
   it('fails closed outside an attached tmux pane without creating a detached session', async () => {
@@ -630,8 +759,10 @@ exit 0
       const child = spawn(process.execPath, [omxBin, 'question', '--input', input, '--json'], {
         cwd,
         env: childEnv,
+        detached: process.platform !== 'win32',
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      trackQuestionCliChild(child);
       let stdout = '';
       let stderr = '';
       child.stdout.on('data', (chunk) => { stdout += String(chunk); });
@@ -703,8 +834,10 @@ exit 0
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
         }),
+        detached: process.platform !== 'win32',
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      trackQuestionCliChild(child);
       let stdout = '';
       let stderr = '';
       child.stdout.on('data', (chunk) => { stdout += String(chunk); });
@@ -776,8 +909,10 @@ esac
     const child = spawn(process.execPath, [omxBin, 'question', '--input', input, '--json'], {
       cwd,
       env: childEnv,
+      detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    trackQuestionCliChild(child);
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk) => { stdout += String(chunk); });
