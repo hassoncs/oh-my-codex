@@ -5582,6 +5582,103 @@ describe('state operations directory initialization', () => {
     }
   });
 
+  it('preserves partial Autopilot state across repeated continue, cancel, resume, and cleanup', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-autopilot-continue-cancel-resume-'));
+    try {
+      await withOmxRootEnv(wd, async () => {
+        const sessionId = 'sess-autopilot-continue-cancel-resume';
+        const sessionDir = join(wd, '.omx', 'state', 'sessions', sessionId);
+        const statePath = join(sessionDir, 'autopilot-state.json');
+        await mkdir(sessionDir, { recursive: true });
+        await writeFile(statePath, JSON.stringify({
+          active: true,
+          mode: 'autopilot',
+          current_phase: 'ultragoal',
+          checkpoint_count: 1,
+          handoff_artifacts: {
+            ultragoal: {
+              goals: '.omx/ultragoal/goals.json',
+              active_goal_id: 'G008',
+            },
+          },
+        }, null, 2));
+
+        for (const checkpointCount of [2, 3]) {
+          const continued = await executeStateOperation('state_write', {
+            workingDirectory: wd,
+            session_id: sessionId,
+            mode: 'autopilot',
+            active: true,
+            current_phase: 'ultragoal',
+            checkpoint_count: checkpointCount,
+          });
+          assert.equal(continued.isError, undefined);
+        }
+
+        const cancelled = await executeStateOperation('state_write', {
+          workingDirectory: wd,
+          session_id: sessionId,
+          mode: 'autopilot',
+          active: false,
+          current_phase: 'cancelled',
+          completed_at: '2026-07-27T18:00:00.000Z',
+        });
+        assert.equal(cancelled.isError, undefined);
+
+        const resumed = await executeStateOperation('state_write', {
+          workingDirectory: wd,
+          session_id: sessionId,
+          mode: 'autopilot',
+          active: true,
+          current_phase: 'ultragoal',
+          completed_at: null,
+          resumed_at: '2026-07-27T18:01:00.000Z',
+          checkpoint_count: 4,
+        });
+        assert.equal(resumed.isError, undefined);
+
+        const continuedAgain = await executeStateOperation('state_write', {
+          workingDirectory: wd,
+          session_id: sessionId,
+          mode: 'autopilot',
+          active: true,
+          current_phase: 'ultragoal',
+          checkpoint_count: 5,
+        });
+        assert.equal(continuedAgain.isError, undefined);
+
+        const resumedState = JSON.parse(await readFile(statePath, 'utf-8')) as Record<string, unknown>;
+        assert.equal(resumedState.active, true);
+        assert.equal(resumedState.current_phase, 'ultragoal');
+        assert.equal(resumedState.checkpoint_count, 5);
+        assert.equal(resumedState.completed_at, null);
+        assert.equal(resumedState.run_outcome, 'continue');
+        assert.deepEqual(resumedState.handoff_artifacts, {
+          ultragoal: {
+            goals: '.omx/ultragoal/goals.json',
+            active_goal_id: 'G008',
+          },
+        });
+
+        const cleared = await executeStateOperation('state_clear', {
+          workingDirectory: wd,
+          session_id: sessionId,
+          mode: 'autopilot',
+        });
+        assert.equal(cleared.isError, undefined);
+        assert.equal(existsSync(statePath), false);
+        const readAfterClear = await executeStateOperation('state_read', {
+          workingDirectory: wd,
+          session_id: sessionId,
+          mode: 'autopilot',
+        });
+        assert.deepEqual(readAfterClear.payload, { exists: false, mode: 'autopilot' });
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('allows Autopilot ultraqa completion with clean review and QA evidence', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-autopilot-ultraqa-complete-allow-'));
     try {
