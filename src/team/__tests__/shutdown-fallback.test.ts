@@ -45,6 +45,13 @@ describe('shutdown fallback worktree reports', () => {
     await writeFile(
       fakeCodexPath,
       `#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+const worker = String(process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER || '');
+const [teamName, workerName] = worker.split('/');
+const workerDir = path.join(process.env.OMX_TEAM_STATE_ROOT, 'team', teamName, 'workers', workerName);
+fs.mkdirSync(workerDir, { recursive: true });
+fs.writeFileSync(path.join(workerDir, 'status.json'), JSON.stringify({ state: 'working', current_task_id: null, updated_at: new Date().toISOString() }));
 process.stdin.resume();
 setInterval(() => {}, 1000);
 process.on('SIGTERM', () => process.exit(0));
@@ -56,11 +63,13 @@ process.on('SIGTERM', () => process.exit(0));
     const prevTmux = process.env.TMUX;
     const prevLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
     const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const prevStartupEvidenceTimeout = process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
 
     process.env.PATH = `${binDir}:${prevPath ?? ''}`;
     delete process.env.TMUX;
     process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'prompt';
     process.env.OMX_TEAM_WORKER_CLI = 'codex';
+    process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = '100';
 
     let runtime: TeamRuntime | null = null;
     let preservedWorktreePath: string | null = null;
@@ -134,6 +143,8 @@ process.on('SIGTERM', () => process.exit(0));
       else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
       if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
       else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof prevStartupEvidenceTimeout === 'string') process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = prevStartupEvidenceTimeout;
+      else delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
       await rm(binDir, { recursive: true, force: true }).catch(() => {});
       if (preservedWorktreePath) {
         await rm(preservedWorktreePath, { recursive: true, force: true }).catch(() => {});

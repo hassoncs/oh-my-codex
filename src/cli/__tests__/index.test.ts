@@ -1,7 +1,7 @@
 import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, utimesSync } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir as fsReaddir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir as fsReaddir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -1036,7 +1036,7 @@ describe("cleanupPostLaunchModeStateFiles", () => {
   it("rolls back detail, canonical, and run-state when cleanup persistence fails", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-postlaunch-rollback-"));
     const sessionId = "sess-postlaunch-rollback";
-    const stateDir = join(wd, ".omx", "state");
+    const stateDir = join(await realpath(wd), ".omx", "state");
     const sessionStateDir = join(stateDir, "sessions", sessionId);
     const detailPath = join(sessionStateDir, "team-state.json");
     const canonicalPath = join(sessionStateDir, "skill-active-state.json");
@@ -1289,7 +1289,7 @@ describe("cleanupPostLaunchModeStateFiles", () => {
   it("retries a transient parse failure before cancelling the rewritten mode state", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-postlaunch-mode-retry-"));
     const sessionId = "sess-postlaunch-retry";
-    const stateDir = join(wd, ".omx", "state");
+    const stateDir = join(await realpath(wd), ".omx", "state");
     const sessionStateDir = join(stateDir, "sessions", sessionId);
     const statePath = join(sessionStateDir, "ralph-state.json");
     const writes: Array<{ path: string; content: string }> = [];

@@ -3557,6 +3557,8 @@ process.on('SIGTERM', () => process.exit(0));
       else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
       if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
       else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof previousStartupEvidenceTimeout === 'string') process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = previousStartupEvidenceTimeout;
+      else delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
       await rm(wd, { recursive: true, force: true });
     }
   });
@@ -3570,6 +3572,7 @@ process.on('SIGTERM', () => process.exit(0));
     const previousTmux = process.env.TMUX;
     const previousLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
     const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const previousStartupEvidenceTimeout = process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
     const teamTask = 'issue 771 rehydrate team mode state';
     const teamName = parseTeamStartArgs(['1:executor', teamTask]).parsed.teamName;
 
@@ -3577,7 +3580,14 @@ process.on('SIGTERM', () => process.exit(0));
     await writeFile(
       fakeCodexPath,
       `#!/usr/bin/env node
-setTimeout(() => process.exit(0), 3000);
+const fs = require('fs');
+const path = require('path');
+const worker = String(process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER || '');
+const [teamName, workerName] = worker.split('/');
+const workerDir = path.join(process.env.OMX_TEAM_STATE_ROOT, 'team', teamName, 'workers', workerName);
+fs.mkdirSync(workerDir, { recursive: true });
+fs.writeFileSync(path.join(workerDir, 'status.json'), JSON.stringify({ state: 'working', current_task_id: null, updated_at: new Date().toISOString() }));
+setTimeout(() => process.exit(0), 5000);
 process.stdin.resume();
 process.on('SIGTERM', () => process.exit(0));
 `,
@@ -3590,6 +3600,7 @@ process.on('SIGTERM', () => process.exit(0));
       delete process.env.TMUX;
       process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'prompt';
       process.env.OMX_TEAM_WORKER_CLI = 'codex';
+      process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = '100';
 
       await withMockPromptModeCodexAllowed(() =>
         withoutTeamTestWorkerEnv(() => teamCommand(['1:executor', teamTask])));
@@ -3620,6 +3631,8 @@ process.on('SIGTERM', () => process.exit(0));
       else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
       if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
       else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof previousStartupEvidenceTimeout === 'string') process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = previousStartupEvidenceTimeout;
+      else delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
       await rm(wd, { recursive: true, force: true });
     }
   });
@@ -3640,6 +3653,13 @@ process.on('SIGTERM', () => process.exit(0));
     await writeFile(
       fakeCodexPath,
       `#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+const worker = String(process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER || '');
+const [teamName, workerName] = worker.split('/');
+const workerDir = path.join(process.env.OMX_TEAM_STATE_ROOT, 'team', teamName, 'workers', workerName);
+fs.mkdirSync(workerDir, { recursive: true });
+fs.writeFileSync(path.join(workerDir, 'status.json'), JSON.stringify({ state: 'working', current_task_id: null, updated_at: new Date().toISOString() }));
 setTimeout(() => process.exit(0), 3000);
 process.stdin.resume();
 process.on('SIGTERM', () => process.exit(0));

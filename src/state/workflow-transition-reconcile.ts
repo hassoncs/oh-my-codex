@@ -1,6 +1,6 @@
 import { existsSync } from 'fs';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'fs/promises';
+import { mkdir, readFile, realpath, writeFile } from 'fs/promises';
 import { dirname, join, resolve } from 'path';
 import { getBaseStateDir, getStatePath } from '../mcp/state-paths.js';
 import {
@@ -64,7 +64,7 @@ async function workflowAuthorityDigest(
   sessionId?: string,
   baseStateDir?: string,
 ): Promise<string> {
-  const resolvedBaseStateDir = baseStateDir ? resolve(baseStateDir) : getBaseStateDir(cwd);
+  const resolvedBaseStateDir = await canonicalTransitionStateRoot(cwd, baseStateDir);
   const canonicalPaths = [
     join(resolvedBaseStateDir, 'skill-active-state.json'),
     ...(sessionId
@@ -76,7 +76,7 @@ async function workflowAuthorityDigest(
       mode,
       cwd,
       sessionId,
-      baseStateDir,
+      resolvedBaseStateDir,
     )),
     ...canonicalPaths,
   ];
@@ -92,6 +92,11 @@ async function workflowAuthorityDigest(
     hash.update('\0');
   }
   return hash.digest('hex');
+}
+
+async function canonicalTransitionStateRoot(cwd: string, baseStateDir?: string): Promise<string> {
+  const resolved = baseStateDir ? resolve(baseStateDir) : getBaseStateDir(cwd);
+  return await realpath(resolved).catch(() => resolved);
 }
 
 function safeString(value: unknown): string {
@@ -350,7 +355,7 @@ export async function preflightWorkflowTransition(
     action,
     allowNestedAutopilotTeam: options.allowNestedAutopilotTeam === true,
     authorityDigest: await workflowAuthorityDigest(cwd, sessionId, baseStateDir),
-    baseStateDir: baseStateDir ? resolve(baseStateDir) : undefined,
+    baseStateDir: await canonicalTransitionStateRoot(cwd, baseStateDir),
     cwd: resolve(cwd),
     currentModesSource: options.currentModes ? 'override' : 'authoritative',
     decision,
@@ -394,7 +399,7 @@ export async function reconcileWorkflowTransition(
   }
   let decision: WorkflowTransitionDecision;
   if (options.preflight) {
-    const expectedBaseStateDir = baseStateDir ? resolve(baseStateDir) : undefined;
+    const expectedBaseStateDir = await canonicalTransitionStateRoot(cwd, baseStateDir);
     if (options.preflight.requestedMode !== requestedMode) {
       throw new Error(`workflow_transition_preflight_mode_mismatch:${options.preflight.requestedMode}:${requestedMode}`);
     }

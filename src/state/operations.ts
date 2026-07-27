@@ -780,7 +780,8 @@ export async function executeStateOperation(
         const effectiveSessionId = stateScope.sessionId;
         const { baseStateDir, rootSource } = getBaseStateDirWithSource(cwd);
         const mode = validateStateModeSegment(rawArgs.mode);
-        let path = getStatePath(mode, cwd, effectiveSessionId);
+        const reportedPath = getStatePath(mode, cwd, effectiveSessionId);
+        let path = reportedPath;
         const {
           mode: _mode,
           workingDirectory: _workingDirectory,
@@ -1081,7 +1082,7 @@ export async function executeStateOperation(
           payload: {
             success: true,
             mode,
-            path,
+            path: reportedPath,
             ...(transitionMessage ? { transition: transitionMessage } : {}),
           },
         };
@@ -1092,6 +1093,7 @@ export async function executeStateOperation(
         const effectiveSessionId = stateScope.sessionId;
         const { baseStateDir, rootSource } = getBaseStateDirWithSource(cwd);
         const mode = validateStateModeSegment(rawArgs.mode);
+        const reportedPath = getStatePath(mode, cwd, effectiveSessionId);
         const allSessions = rawArgs.all_sessions === true;
         return await withWorkflowStateLock(baseStateDir, cwd, async (lockLease) => {
           const lockedBaseStateDir = lockLease.baseStateDir;
@@ -1155,7 +1157,7 @@ export async function executeStateOperation(
                 payload: {
                   cleared: true,
                   mode,
-                  path,
+                  path: reportedPath,
                   ...(nativeStopCleared.length > 0 ? { native_stop_cleared: nativeStopCleared } : {}),
                 },
               };

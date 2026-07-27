@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmod, mkdtemp, rename, rm, writeFile, readFile, mkdir, utimes } from 'fs/promises';
+import { chmod, mkdtemp, rename, rm, writeFile, readFile, mkdir, utimes, realpath } from 'fs/promises';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'os';
@@ -1908,7 +1908,8 @@ exit 1
         updated_at: new Date().toISOString(),
       }, cwd);
 
-      const stateDir = join(cwd, '.omx', 'state');
+      const canonicalCwd = await realpath(cwd);
+      const stateDir = join(canonicalCwd, '.omx', 'state');
       const taskPath = join(stateDir, 'team', teamName, 'tasks', `task-${task.id}.json`);
       const intentPath = join(stateDir, 'team', teamName, 'retry-intents', `task-${task.id}.json`);
       const paths = [

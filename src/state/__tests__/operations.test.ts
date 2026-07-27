@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -1058,7 +1058,7 @@ describe('state operations directory initialization', () => {
         state: { stable: 'before' },
       });
       assert.equal(initial.isError, undefined);
-      const stateDir = join(wd, '.omx', 'state');
+      const stateDir = join(await realpath(wd), '.omx', 'state');
       const detailPath = join(stateDir, 'team-state.json');
       const canonicalPath = join(stateDir, 'skill-active-state.json');
       const detailBefore = await readFile(detailPath, 'utf-8');
@@ -1237,7 +1237,7 @@ describe('state operations directory initialization', () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-clear-rollback-'));
     try {
       const sessionId = 'sess-clear-rollback';
-      const stateDir = join(wd, '.omx', 'state');
+      const stateDir = join(await realpath(wd), '.omx', 'state');
       const sessionDir = join(stateDir, 'sessions', sessionId);
       await mkdir(sessionDir, { recursive: true });
       await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
@@ -4425,6 +4425,7 @@ describe('state operations directory initialization', () => {
     try {
       const wd = join(root, 'source');
       const teamStateRoot = join(root, 'team-state');
+      await mkdir(wd, { recursive: true });
       const sessionId = 'sess-autopilot-team-question';
       const sessionDir = join(teamStateRoot, 'sessions', sessionId);
       const questionId = 'question-team-satisfied';

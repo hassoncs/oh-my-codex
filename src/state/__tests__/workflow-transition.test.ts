@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -166,7 +166,7 @@ describe('workflow transition rules', () => {
     await withIsolatedStateEnv(async () => {
       const wd = await mkdtemp(join(tmpdir(), 'omx-workflow-active-scope-'));
       try {
-        const stateDir = join(wd, '.omx', 'state');
+        const stateDir = join(await realpath(wd), '.omx', 'state');
         const sessionDir = join(stateDir, 'sessions', 'sess-current');
         await mkdir(sessionDir, { recursive: true });
         await writeFile(
@@ -489,7 +489,7 @@ describe('workflow transition rules', () => {
     await withIsolatedStateEnv(async () => {
       const wd = await mkdtemp(join(tmpdir(), 'omx-workflow-start-rollback-'));
       try {
-        const stateDir = join(wd, '.omx', 'state');
+        const stateDir = join(await realpath(wd), '.omx', 'state');
         const sessionId = 'sess-start-rollback';
         const sessionDir = join(stateDir, 'sessions', sessionId);
         await mkdir(sessionDir, { recursive: true });

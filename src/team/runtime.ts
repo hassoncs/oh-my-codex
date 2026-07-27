@@ -4347,6 +4347,8 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   restoreTeamModelInstructionsFile(sanitized);
 
   for (const report of shutdownReports) {
+    const worker = config.workers.find((entry) => entry.name === report.workerName);
+    if (worker?.worktree_created !== true) continue;
     await rm(report.reportPath, { force: true }).catch((err) => {
       process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
     });
