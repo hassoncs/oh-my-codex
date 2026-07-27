@@ -9,7 +9,7 @@ This skill is for a Codex session that was started as an OMX Team worker (a tmux
 
 ## Identity
 
-You MUST be running with `OMX_TEAM_WORKER` set. It looks like:
+You MUST be running with `OMX_TEAM_INTERNAL_WORKER` or `OMX_TEAM_WORKER` set. Prefer `OMX_TEAM_INTERNAL_WORKER`; it uses the canonical team key required by write operations. It looks like:
 
 `<team-name>/worker-<n>`
 
@@ -26,7 +26,7 @@ When a worker inbox tells you to load this skill, resolve the first existing pat
 
 ## Startup Protocol (ACK)
 
-1. Parse `OMX_TEAM_WORKER` into:
+1. Parse `OMX_TEAM_INTERNAL_WORKER` (fallback: `OMX_TEAM_WORKER`) into:
    - `teamName` (before the `/`)
    - `workerName` (after the `/`, usually `worker-<n>`)
 2. Send a startup ACK to the lead mailbox **before task work**:
@@ -68,7 +68,7 @@ omx team api send-message --input "{\"team_name\":\"<teamName>\",\"from_worker\"
    - Do NOT directly write lifecycle fields (`status`, `owner`, `result`, `error`) in task files.
 9. Use `omx team api release-task-claim --json` only for rollback/requeue to `pending` (not for completion).
 10. Update your worker status:
-   `<team_state_root>/team/<teamName>/workers/<workerName>/status.json` with `{"state":"idle", ...}`
+   `omx team api write-worker-status --input '{"team_name":"<teamName>","worker":"<workerName>","state":"idle"}' --json`
 
 ## Mailbox
 
@@ -111,7 +111,7 @@ When your inbox/task activates the Team Big Five / ATEM-inspired protocol (depen
 - Shared mental model / single source of truth: treat task JSON, inbox, mailbox, approved handoff, and leader updates as canonical.
 - Closed-loop communication / ACK-readback: acknowledge handoffs with what you understood, affected artifact/path, owner, and next action.
 - Mutual performance monitoring: check boundary contracts, shared files, and verification evidence before completion.
-- Backup/reassignment behavior: if blocked, write blocked status with the smallest needed help/reassignment request and continue any safe unblocked slice.
+- Backup/reassignment behavior: if blocked, use `omx team api write-worker-status --json` with the smallest needed help/reassignment request and continue any safe unblocked slice.
 - Adaptability checkpoint: changed assumptions, dependencies, or verification results require a brief leader-facing update before widening scope.
 - Team orientation: optimize for the integrated team result; report integration risks, missing tests, and peer impacts instead of local-only success.
 

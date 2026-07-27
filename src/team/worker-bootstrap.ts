@@ -393,7 +393,7 @@ You are a team worker in team "${teamName}". Your identity and assigned tasks ar
    - \`omx team api transition-task-status --json\` with from \`"in_progress"\` to \`"completed"\` or \`"failed"\`
    - Include \`result\` (for completed) or \`error\` (for failed) in the transition patch
 11. Use \`omx team api release-task-claim --json\` only for rollback/requeue to \`pending\` (not for completion)
-12. Update your status: write {"state": "idle", "updated_at": "<current ISO timestamp>"} to <team_state_root>/team/${teamName}/workers/{your-name}/status.json
+12. Update your status: \`omx team api write-worker-status --input "{\\"team_name\\":\\"${teamName}\\",\\"worker\\":\\"<your-worker-name>\\",\\"state\\":\\"idle\\"}" --json\`
 13. Wait for new instructions (the lead will send them via your terminal)
 14. Check your mailbox for messages at <team_state_root>/team/${teamName}/mailbox/{your-name}.json
 15. For legacy team_* MCP tools (hard-deprecated), switch to \`omx team api\` CLI interop; do not pass workingDirectory unless the lead explicitly tells you to
@@ -423,9 +423,9 @@ When your mailbox receives a message, process delivery explicitly:
 
 ## Rules
 - Do NOT edit files outside the paths listed in your task description
-- If you need to modify a shared file, report to the lead by writing to your status file with state "blocked"
+- If you need to modify a shared file, report blocked status through \`omx team api write-worker-status --json\`
 - Do NOT write lifecycle fields (\`status\`, \`owner\`, \`result\`, \`error\`) directly in task files; use claim-safe lifecycle APIs
-- If blocked, write {"state": "blocked", "reason": "..."} to your status file
+- If blocked, use \`omx team api write-worker-status --input "{\\"team_name\\":\\"${teamName}\\",\\"worker\\":\\"<your-worker-name>\\",\\"state\\":\\"blocked\\",\\"reason\\":\\"...\\"}" --json\`
 - You may spawn Codex native subagents when parallel execution improves throughput.
 - Use subagents only for independent, bounded subtasks that can run safely within this worker pane.
 </team_worker_protocol>
@@ -730,7 +730,7 @@ function renderCoordinationProtocol(task: TeamTask): string {
     shared_mental_model: "- Shared mental model / single source of truth: treat task JSON, inbox, mailbox, approved handoff, and leader updates as canonical; restate changed assumptions before acting.",
     closed_loop_communication: "- Closed-loop communication / ACK-readback handoffs: acknowledge handoffs with what you understood, the artifact/path affected, owner, and next action.",
     mutual_performance_monitoring: "- Mutual performance monitoring at boundaries: check upstream/downstream contracts, shared files, and verification evidence before completion.",
-    backup_behavior: "- Backup behavior: if blocked, write blocked status with the smallest needed help/reassignment request and continue any safe unblocked slice.",
+    backup_behavior: "- Backup behavior: if blocked, use `omx team api write-worker-status --json` with the smallest needed help/reassignment request and continue any safe unblocked slice.",
     adaptability_checkpoint: "- Adaptability checkpoint: when assumptions, dependencies, or verification results change, pause for a brief leader-facing update before widening scope.",
     team_orientation: "- Team orientation: optimize for the team outcome, not just your local task; call out integration risks, missing tests, and peer impacts.",
   };
@@ -926,7 +926,7 @@ ${approvedContextSection}${workerGoalSection}
    This ensures your changes are available for incremental integration into the leader branch.
 10. Complete/fail it via lifecycle transition API (\`omx team api transition-task-status --json\`) from \`"in_progress"\` to \`"completed"\` or \`"failed"\` (include \`result\`/\`error\`)
 11. Use \`omx team api release-task-claim --json\` only for rollback to \`pending\`
-12. Write \`{"state": "idle", "updated_at": "<current ISO timestamp>"}\` to \`${teamStateRoot}/team/${teamName}/workers/${workerName}/status.json\`
+12. Run \`omx team api write-worker-status --input "{\\"team_name\\":\\"${teamName}\\",\\"worker\\":\\"${workerName}\\",\\"state\\":\\"idle\\"}" --json\`
 13. Wait for the next instruction from the lead
 14. For legacy team_* MCP tools (hard-deprecated), use \`omx team api\`; do not pass \`workingDirectory\` unless the lead explicitly asks (if resolution fails, use leader cwd: \`${leaderCwd}\`)
 
@@ -956,7 +956,7 @@ ${buildVerificationSection("each assigned task")}
 ## Scope Rules
 - Only edit files described in your task descriptions
 - Do NOT edit files that belong to other workers
-- If you need to modify a shared/common file, write \`{"state": "blocked", "reason": "need to edit shared file X"}\` to your status file and wait
+- If you need to modify a shared/common file, run \`omx team api write-worker-status --input "{\\"team_name\\":\\"${teamName}\\",\\"worker\\":\\"${workerName}\\",\\"state\\":\\"blocked\\",\\"reason\\":\\"need to edit shared file X\\"}" --json\` and wait
 - You may spawn Codex native subagents when parallel execution improves throughput.
 - Use subagents only for independent, bounded subtasks that can run safely within this worker pane.
 ${specializationSection}`;
@@ -1045,7 +1045,7 @@ ${workerGoalSection}
    This ensures your changes are available for incremental integration into the leader branch.
 6. Complete/fail via lifecycle transition API (\`omx team api transition-task-status --json\`) from \`"in_progress"\` to \`"completed"\` or \`"failed"\` (include \`result\`/\`error\`)
 7. Use \`omx team api release-task-claim --json\` only for rollback to \`pending\`
-8. Write \`{"state": "idle", "updated_at": "<current ISO timestamp>"}\` to your status file
+8. Run \`omx team api write-worker-status --input "{\\"team_name\\":\\"${teamName}\\",\\"worker\\":\\"${workerName}\\",\\"state\\":\\"idle\\"}" --json\`
 
 ${coordinationGateSection}
 ${coordinationSection}

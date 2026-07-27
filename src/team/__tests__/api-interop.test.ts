@@ -175,7 +175,7 @@ describe('resolveTeamApiOperation', () => {
     assert.equal(resolveTeamApiOperation('  SEND_MESSAGE  '), 'send-message');
   });
 
-  it('resolves all 34 operations from the operation list', () => {
+  it('resolves all 35 operations from the operation list', () => {
     for (const op of TEAM_API_OPERATIONS) {
       assert.equal(resolveTeamApiOperation(op), op);
     }
@@ -217,8 +217,8 @@ describe('LEGACY_TEAM_MCP_TOOLS', () => {
 });
 
 describe('TEAM_API_OPERATIONS', () => {
-  it('contains 34 operations', () => {
-    assert.equal(TEAM_API_OPERATIONS.length, 34);
+  it('contains 35 operations', () => {
+    assert.equal(TEAM_API_OPERATIONS.length, 35);
   });
 
   it('all use kebab-case', () => {
@@ -1365,6 +1365,93 @@ describe('executeTeamApiOperation: read-worker-status', () => {
       team_name: 'x',
     }, '/tmp');
     assert.equal(result.ok, false);
+  });
+});
+
+// ─── write-worker-status ──────────────────────────────────────────────────
+
+describe('executeTeamApiOperation: write-worker-status', () => {
+  it('writes status for the exact configured worker identity', async () => {
+    const { cwd, cleanup } = await setupTeam('wr-status');
+    const previousInternalWorker = process.env.OMX_TEAM_INTERNAL_WORKER;
+    const previousWorker = process.env.OMX_TEAM_WORKER;
+    try {
+      process.env.OMX_TEAM_INTERNAL_WORKER = 'wr-status/worker-1';
+      process.env.OMX_TEAM_WORKER = 'display-name/worker-1';
+      const result = await executeTeamApiOperation('write-worker-status', {
+        team_name: 'wr-status',
+        worker: 'worker-1',
+        state: 'blocked',
+        current_task_id: '1',
+        reason: 'waiting for shared file',
+      }, cwd);
+
+      assert.equal(result.ok, true);
+
+      delete process.env.OMX_TEAM_INTERNAL_WORKER;
+      process.env.OMX_TEAM_WORKER = 'wr-status/worker-1';
+      const fallbackResult = await executeTeamApiOperation('write-worker-status', {
+        team_name: 'wr-status', worker: 'worker-1', state: 'blocked', current_task_id: '1', reason: 'waiting for shared file',
+      }, cwd);
+      assert.equal(fallbackResult.ok, true);
+
+      const status = await executeTeamApiOperation('read-worker-status', {
+        team_name: 'wr-status', worker: 'worker-1',
+      }, cwd);
+      assert.equal(status.ok, true);
+      if (status.ok) {
+        assert.deepEqual(status.data.status, {
+          state: 'blocked',
+          current_task_id: '1',
+          reason: 'waiting for shared file',
+          updated_at: (status.data.status as { updated_at: string }).updated_at,
+        });
+        assert.match((status.data.status as { updated_at: string }).updated_at, /^\d{4}-\d{2}-\d{2}T/);
+      }
+    } finally {
+      if (typeof previousInternalWorker === 'string') process.env.OMX_TEAM_INTERNAL_WORKER = previousInternalWorker;
+      else delete process.env.OMX_TEAM_INTERNAL_WORKER;
+      if (typeof previousWorker === 'string') process.env.OMX_TEAM_WORKER = previousWorker;
+      else delete process.env.OMX_TEAM_WORKER;
+      await cleanup();
+    }
+  });
+
+  it('rejects mismatched identity, internal states, and unsupported fields', async () => {
+    const { cwd, cleanup } = await setupTeam('wr-status-denied');
+    const previousInternalWorker = process.env.OMX_TEAM_INTERNAL_WORKER;
+    const previousWorker = process.env.OMX_TEAM_WORKER;
+    try {
+      process.env.OMX_TEAM_INTERNAL_WORKER = 'wr-status-denied/worker-2';
+      process.env.OMX_TEAM_WORKER = 'wr-status-denied/worker-1';
+      const mismatched = await executeTeamApiOperation('write-worker-status', {
+        team_name: 'wr-status-denied', worker: 'worker-1', state: 'idle',
+      }, cwd);
+      assert.equal(mismatched.ok, false);
+      if (!mismatched.ok) assert.equal(mismatched.error.code, 'worker_identity_mismatch');
+
+      process.env.OMX_TEAM_INTERNAL_WORKER = 'wr-status-denied/worker-1';
+      const draining = await executeTeamApiOperation('write-worker-status', {
+        team_name: 'wr-status-denied', worker: 'worker-1', state: 'draining',
+      }, cwd);
+      assert.equal(draining.ok, false);
+      if (!draining.ok) assert.equal(draining.error.code, 'invalid_input');
+
+      const suppliedTimestamp = await executeTeamApiOperation('write-worker-status', {
+        team_name: 'wr-status-denied',
+        worker: 'worker-1',
+        state: 'idle',
+        updated_at: '2026-01-01T00:00:00.000Z',
+      }, cwd);
+      assert.equal(suppliedTimestamp.ok, false);
+      if (!suppliedTimestamp.ok) assert.equal(suppliedTimestamp.error.code, 'invalid_input');
+    } finally {
+      if (typeof previousInternalWorker === 'string') process.env.OMX_TEAM_INTERNAL_WORKER = previousInternalWorker;
+      else delete process.env.OMX_TEAM_INTERNAL_WORKER;
+      if (typeof previousWorker === 'string') process.env.OMX_TEAM_WORKER = previousWorker;
+      else delete process.env.OMX_TEAM_WORKER;
+      await cleanup();
+    }
   });
 });
 

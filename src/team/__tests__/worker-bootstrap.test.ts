@@ -54,6 +54,9 @@ describe("worker bootstrap", () => {
     assert.match(workerSkill, /omx team api claim-task/);
     assert.match(workerSkill, /omx team api transition-task-status/);
     assert.match(workerSkill, /omx team api release-task-claim/);
+    assert.match(workerSkill, /omx team api write-worker-status/);
+    assert.match(workerSkill, /OMX_TEAM_INTERNAL_WORKER.*fallback.*OMX_TEAM_WORKER/i);
+    assert.doesNotMatch(workerSkill, /status\.json` with `\{"state"/);
     assert.match(
       workerSkill,
       /\$\{CODEX_HOME:-~\/\.codex\}\/skills\/worker\/SKILL\.md/,
@@ -108,6 +111,8 @@ describe("worker bootstrap", () => {
     assert.match(overlay, /omx team api claim-task/);
     assert.match(overlay, /omx team api transition-task-status/);
     assert.match(overlay, /omx team api release-task-claim/);
+    assert.match(overlay, /omx team api write-worker-status/);
+    assert.doesNotMatch(overlay, /write .*status\.json/i);
     assert.doesNotMatch(
       overlay,
       /On completion: write \{"status": "completed"/,
@@ -312,6 +317,8 @@ describe("worker bootstrap", () => {
     assert.match(inbox, /omx team api claim-task/);
     assert.match(inbox, /omx team api transition-task-status/);
     assert.match(inbox, /omx team api release-task-claim/);
+    assert.match(inbox, /omx team api write-worker-status/);
+    assert.doesNotMatch(inbox, /write .*status\.json/i);
     assert.match(
       inbox,
       /\$\{CODEX_HOME:-~\/\.codex\}\/skills\/worker\/SKILL\.md/,
@@ -931,6 +938,8 @@ describe("worker bootstrap", () => {
     assert.match(inbox, /omx team api claim-task/);
     assert.match(inbox, /omx team api transition-task-status/);
     assert.match(inbox, /omx team api release-task-claim/);
+    assert.match(inbox, /omx team api write-worker-status/);
+    assert.doesNotMatch(inbox, /write .*status\.json/i);
     assert.doesNotMatch(
       inbox,
       /Write `\{"status": "completed", "result": "brief summary"\}` when done/,

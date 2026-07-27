@@ -123,7 +123,10 @@ export { markTeamLeaderSessionStopped as teamMarkLeaderSessionStopped } from './
 export { markOwnedTeamsLeaderSessionStopped as teamMarkOwnedTeamsLeaderSessionStopped } from './state.js';
 
 // === Worker status write ===
-export { writeWorkerStatus as teamWriteWorkerStatus } from './state.js';
+export {
+  writeWorkerStatus as teamWriteWorkerStatus,
+  compareAndSetWorkerStatus as teamCompareAndSetWorkerStatus,
+} from './state.js';
 
 // === Scaling lock ===
 export { withScalingLock as teamWithScalingLock } from './state.js';

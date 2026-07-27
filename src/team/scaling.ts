@@ -37,6 +37,7 @@ import {
   teamNormalizePolicy as normalizeTeamPolicy,
   teamReadWorkerStatus as readWorkerStatus,
   teamWriteWorkerStatus as writeWorkerStatus,
+  teamCompareAndSetWorkerStatus as compareAndSetWorkerStatus,
   teamWithScalingLock as withScalingLock,
   teamAppendEvent as appendTeamEvent,
   teamCreateTask as createStateTask,
@@ -948,9 +949,13 @@ export async function scaleDown(
         const previous = previousStatuses.get(worker.name);
         if (!previous) continue;
         try {
-          const current = await readWorkerStatus(sanitized, worker.name, leaderCwd);
-          if (current.state !== 'draining') continue;
-          await writeWorkerStatus(sanitized, worker.name, previous, leaderCwd);
+          await compareAndSetWorkerStatus(
+            sanitized,
+            worker.name,
+            'draining',
+            previous,
+            leaderCwd,
+          );
         } catch (error) {
           errors.push(`${worker.name}:${String(error)}`);
         }

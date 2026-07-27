@@ -51,6 +51,7 @@ import {
   withTeamLock as withTeamLockImpl,
   withTaskClaimLock as withTaskClaimLockImpl,
   withMailboxLock as withMailboxLockImpl,
+  withWorkerStatusLock as withWorkerStatusLockImpl,
 } from './state/locks.js';
 import { getDefaultBridge, isBridgeEnabled, resolveBridgeStateDir, type DispatchRecord } from '../runtime/bridge.js';
 import {
@@ -756,6 +757,13 @@ function mailboxLockDir(teamName: string, workerName: string, cwd: string): stri
   return p;
 }
 
+function workerStatusLockDir(teamName: string, workerName: string, cwd: string): string {
+  validateWorkerName(workerName);
+  const p = join(workerDir(teamName, workerName, cwd), '.lock.status');
+  assertPathWithinDir(p, resolveTeamStateRoot(cwd));
+  return p;
+}
+
 function dispatchRequestsPath(teamName: string, cwd: string): string {
   return join(teamDir(teamName, cwd), 'dispatch', 'requests.json');
 }
@@ -1298,21 +1306,52 @@ export async function updateWorkerHeartbeat(
   await writeAtomic(p, JSON.stringify(heartbeat, null, 2));
 }
 
-// Read worker status (returns {state:'unknown'} on missing/malformed)
-export async function readWorkerStatus(teamName: string, workerName: string, cwd: string): Promise<WorkerStatus> {
-  const unknownStatus: WorkerStatus = { state: 'unknown', updated_at: '1970-01-01T00:00:00.000Z' };
+const UNKNOWN_WORKER_STATUS: WorkerStatus = {
+  state: 'unknown',
+  updated_at: '1970-01-01T00:00:00.000Z',
+};
+
+async function readWorkerStatusUnlocked(
+  teamName: string,
+  workerName: string,
+  cwd: string,
+): Promise<WorkerStatus> {
   const p = join(workerDir(teamName, workerName, cwd), 'status.json');
   try {
-    const raw = await readFile(p, 'utf8');
-    const parsed = JSON.parse(raw) as unknown;
-    if (!isWorkerStatus(parsed)) {
-      return unknownStatus;
-    }
-    return parsed;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return unknownStatus;
-    return unknownStatus;
+    const parsed = JSON.parse(await readFile(p, 'utf8')) as unknown;
+    return isWorkerStatus(parsed) ? parsed : { ...UNKNOWN_WORKER_STATUS };
+  } catch {
+    return { ...UNKNOWN_WORKER_STATUS };
   }
+}
+
+async function writeWorkerStatusUnlocked(
+  teamName: string,
+  workerName: string,
+  status: WorkerStatus,
+  cwd: string,
+): Promise<void> {
+  const p = join(workerDir(teamName, workerName, cwd), 'status.json');
+  await writeAtomic(p, JSON.stringify(status, null, 2));
+}
+
+async function withWorkerStatusLock<T>(
+  teamName: string,
+  workerName: string,
+  cwd: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return withWorkerStatusLockImpl(teamName, workerName, cwd, LOCK_STALE_MS, {
+    teamDir,
+    taskClaimLockDir,
+    mailboxLockDir,
+    workerStatusLockDir,
+  }, fn);
+}
+
+// Read worker status (returns {state:'unknown'} on missing/malformed)
+export async function readWorkerStatus(teamName: string, workerName: string, cwd: string): Promise<WorkerStatus> {
+  return readWorkerStatusUnlocked(teamName, workerName, cwd);
 }
 
 // Atomic write worker status
@@ -1320,10 +1359,26 @@ export async function writeWorkerStatus(
   teamName: string,
   workerName: string,
   status: WorkerStatus,
-  cwd: string
+  cwd: string,
 ): Promise<void> {
-  const p = join(workerDir(teamName, workerName, cwd), 'status.json');
-  await writeAtomic(p, JSON.stringify(status, null, 2));
+  await withWorkerStatusLock(teamName, workerName, cwd, () => (
+    writeWorkerStatusUnlocked(teamName, workerName, status, cwd)
+  ));
+}
+
+export async function compareAndSetWorkerStatus(
+  teamName: string,
+  workerName: string,
+  expectedState: WorkerStatus['state'],
+  status: WorkerStatus,
+  cwd: string,
+): Promise<boolean> {
+  return withWorkerStatusLock(teamName, workerName, cwd, async () => {
+    const current = await readWorkerStatusUnlocked(teamName, workerName, cwd);
+    if (current.state !== expectedState) return false;
+    await writeWorkerStatusUnlocked(teamName, workerName, status, cwd);
+    return true;
+  });
 }
 
 // File-based scaling lock to prevent concurrent scale_up/scale_down operations

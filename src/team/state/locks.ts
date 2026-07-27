@@ -8,6 +8,10 @@ interface TeamPathDeps {
   mailboxLockDir: (teamName: string, workerName: string, cwd: string) => string;
 }
 
+interface WorkerStatusPathDeps extends TeamPathDeps {
+  workerStatusLockDir: (teamName: string, workerName: string, cwd: string) => string;
+}
+
 const LOCK_OWNER_RETRY_MS = 25;
 
 function lockOwnerToken(): string {
@@ -167,19 +171,20 @@ export async function withTaskClaimLock<T>(
   }
 }
 
-export async function withMailboxLock<T>(
+async function withWorkerScopedLock<T>(
   teamName: string,
   workerName: string,
   cwd: string,
   lockStaleMs: number,
   deps: TeamPathDeps,
+  lockDir: string,
+  lockKind: string,
   fn: () => Promise<T>,
 ): Promise<T> {
   const root = deps.teamDir(teamName, cwd);
   if (!existsSync(root)) {
     throw new Error(`Team ${teamName} not found`);
   }
-  const lockDir = deps.mailboxLockDir(teamName, workerName, cwd);
   const ownerPath = join(lockDir, 'owner');
   const ownerToken = lockOwnerToken();
   const deadline = Date.now() + 5000;
@@ -199,7 +204,7 @@ export async function withMailboxLock<T>(
       if (err.code !== 'EEXIST') throw error;
       if (await maybeRecoverStaleLock(lockDir, lockStaleMs)) continue;
       if (Date.now() > deadline) {
-        throw new Error(`Timed out acquiring mailbox lock for ${teamName}/${workerName}`);
+        throw new Error(`Timed out acquiring ${lockKind} lock for ${teamName}/${workerName}`);
       }
       await sleep(LOCK_OWNER_RETRY_MS);
     }
@@ -216,4 +221,44 @@ export async function withMailboxLock<T>(
     } catch {
     }
   }
+}
+
+export async function withMailboxLock<T>(
+  teamName: string,
+  workerName: string,
+  cwd: string,
+  lockStaleMs: number,
+  deps: TeamPathDeps,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return withWorkerScopedLock(
+    teamName,
+    workerName,
+    cwd,
+    lockStaleMs,
+    deps,
+    deps.mailboxLockDir(teamName, workerName, cwd),
+    'mailbox',
+    fn,
+  );
+}
+
+export async function withWorkerStatusLock<T>(
+  teamName: string,
+  workerName: string,
+  cwd: string,
+  lockStaleMs: number,
+  deps: WorkerStatusPathDeps,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return withWorkerScopedLock(
+    teamName,
+    workerName,
+    cwd,
+    lockStaleMs,
+    deps,
+    deps.workerStatusLockDir(teamName, workerName, cwd),
+    'worker status',
+    fn,
+  );
 }

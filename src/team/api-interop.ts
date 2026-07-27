@@ -40,6 +40,7 @@ import {
   teamReadConfig,
   teamReadManifest,
   teamReadWorkerStatus,
+  teamWriteWorkerStatus,
   teamReadWorkerHeartbeat,
   teamUpdateWorkerHeartbeat,
   teamWriteWorkerInbox,
@@ -59,11 +60,14 @@ import {
   type TeamPhaseState,
   type TeamMonitorSnapshotState,
   type TeamSummary,
+  type WorkerStatus,
 } from './team-ops.js';
 import { listTeamLookupCandidates, resolveTeamNameForCurrentContext, TeamLookupAmbiguityError } from './team-identity.js';
 
 const TEAM_UPDATE_TASK_MUTABLE_FIELDS = new Set(['subject', 'description', 'blocked_by', 'requires_code_change']);
 const TEAM_UPDATE_TASK_REQUEST_FIELDS = new Set(['team_name', 'task_id', 'workingDirectory', ...TEAM_UPDATE_TASK_MUTABLE_FIELDS]);
+const TEAM_WRITE_WORKER_STATUS_REQUEST_FIELDS = new Set(['team_name', 'worker', 'state', 'current_task_id', 'reason']);
+const TEAM_WORKER_WRITABLE_STATES = ['idle', 'working', 'blocked', 'done', 'failed'] as const;
 
 export const LEGACY_TEAM_MCP_TOOLS = [
   'team_send_message',
@@ -114,6 +118,7 @@ export const TEAM_API_OPERATIONS = [
   'read-config',
   'read-manifest',
   'read-worker-status',
+  'write-worker-status',
   'read-worker-heartbeat',
   'update-worker-heartbeat',
   'write-worker-inbox',
@@ -926,6 +931,53 @@ export async function executeTeamApiOperation(
         const worker = String(opArgs.worker || '').trim();
         if (!teamName || !worker) return { ok: false, operation, error: { code: 'invalid_input', message: 'team_name and worker are required' } };
         const status = await teamReadWorkerStatus(teamName, worker, cwd);
+        return { ok: true, operation, data: { worker, status } };
+      }
+      case 'write-worker-status': {
+        const unexpectedFields = Object.keys(args).filter((field) => !TEAM_WRITE_WORKER_STATUS_REQUEST_FIELDS.has(field));
+        if (unexpectedFields.length > 0) {
+          return { ok: false, operation, error: { code: 'invalid_input', message: `Unsupported fields: ${unexpectedFields.join(', ')}` } };
+        }
+
+        const teamName = String(opArgs.team_name || '').trim();
+        const worker = String(opArgs.worker || '').trim();
+        const state = String(opArgs.state || '').trim();
+        if (!teamName || !worker || !state) {
+          return { ok: false, operation, error: { code: 'invalid_input', message: 'team_name, worker, state are required' } };
+        }
+        if (!TEAM_WORKER_WRITABLE_STATES.includes(state as typeof TEAM_WORKER_WRITABLE_STATES[number])) {
+          return { ok: false, operation, error: { code: 'invalid_input', message: `state must be one of: ${TEAM_WORKER_WRITABLE_STATES.join(', ')}` } };
+        }
+
+        const currentTaskId = opArgs.current_task_id;
+        if (currentTaskId !== undefined && (typeof currentTaskId !== 'string' || currentTaskId.trim() === '')) {
+          return { ok: false, operation, error: { code: 'invalid_input', message: 'current_task_id must be a non-empty string when provided' } };
+        }
+        const reason = opArgs.reason;
+        if (reason !== undefined && (typeof reason !== 'string' || reason.trim() === '')) {
+          return { ok: false, operation, error: { code: 'invalid_input', message: 'reason must be a non-empty string when provided' } };
+        }
+
+        const callerIdentity = String(process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER || '').trim();
+        if (callerIdentity !== `${teamName}/${worker}`) {
+          return { ok: false, operation, error: { code: 'worker_identity_mismatch', message: `Worker status writes require caller identity ${teamName}/${worker}` } };
+        }
+
+        const config = await teamReadConfig(teamName, cwd);
+        if (!config) {
+          return { ok: false, operation, error: { code: 'team_not_found', message: `Team ${teamName} not found` } };
+        }
+        if (!config.workers.some((configuredWorker) => configuredWorker.name === worker)) {
+          return { ok: false, operation, error: { code: 'worker_not_found', message: `Worker ${worker} not found in team ${teamName}` } };
+        }
+
+        const status: WorkerStatus = {
+          state: state as typeof TEAM_WORKER_WRITABLE_STATES[number],
+          ...(typeof currentTaskId === 'string' ? { current_task_id: currentTaskId.trim() } : {}),
+          ...(typeof reason === 'string' ? { reason: reason.trim() } : {}),
+          updated_at: new Date().toISOString(),
+        };
+        await teamWriteWorkerStatus(teamName, worker, status, cwd);
         return { ok: true, operation, data: { worker, status } };
       }
       case 'read-worker-heartbeat': {

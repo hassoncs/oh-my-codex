@@ -59,6 +59,7 @@ const EXPECTED_STATE_RE_EXPORTS = {
   teamMarkLeaderSessionStopped: 'markTeamLeaderSessionStopped',
   teamMarkOwnedTeamsLeaderSessionStopped: 'markOwnedTeamsLeaderSessionStopped',
   teamWriteWorkerStatus: 'writeWorkerStatus',
+  teamCompareAndSetWorkerStatus: 'compareAndSetWorkerStatus',
   teamWithScalingLock: 'withScalingLock',
   resolveDispatchLockTimeoutMs: 'resolveDispatchLockTimeoutMs',
   writeAtomic: 'writeAtomic',

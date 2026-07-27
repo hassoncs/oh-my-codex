@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, rm, readFile, writeFile, mkdir, chmod, readdir } from 'fs/promises';
+import { mkdtemp, rm, readFile, writeFile, mkdir, chmod, readdir, rename } from 'fs/promises';
 import { dirname, join, relative } from 'path';
 import { tmpdir } from 'os';
 import { existsSync, readFileSync } from 'fs';
@@ -15,9 +15,12 @@ import {
   readWorkerStatus,
   writeWorkerStatus,
   withScalingLock,
+  setWriteAtomicRenameForTests,
+  resetWriteAtomicRenameForTests,
   DEFAULT_MAX_WORKERS,
 } from '../state.js';
 import { isScalingEnabled, scaleUp, scaleDown } from '../scaling.js';
+import { executeTeamApiOperation } from '../api-interop.js';
 import { resolveCanonicalTeamStateRoot } from '../state-root.js';
 import {
   resolvePersistedApprovedTeamExecutionContinuityState,
@@ -2131,22 +2134,26 @@ describe('scaleDown', () => {
     }
   });
 
-  it('preserves completed worker status when another worker times out draining', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-mixed-timeout-'));
-    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-mixed-timeout-tmux-'));
+  it('serializes timeout restoration against a worker completion write', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-status-race-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-status-race-tmux-'));
     const tmuxLogPath = join(fakeBinDir, 'tmux.log');
     const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const workerThreeStatusPath = join(cwd, '.omx', 'state', 'team', 'status-race', 'workers', 'worker-3', 'status.json');
     const previousPath = process.env.PATH;
+    const previousInternalWorker = process.env.OMX_TEAM_INTERNAL_WORKER;
+    const previousWorker = process.env.OMX_TEAM_WORKER;
+    let releaseRestore: (() => void) | undefined;
     try {
-      await initTeamState('mixed-timeout', 'task', 'executor', 3, cwd);
-      const config = await readTeamConfig('mixed-timeout', cwd);
+      await initTeamState('status-race', 'task', 'executor', 3, cwd);
+      const config = await readTeamConfig('status-race', cwd);
       assert.ok(config);
       if (!config) return;
       config.workers[1]!.pane_id = '%22';
       config.workers[2]!.pane_id = '%23';
       await saveTeamConfig(config, cwd);
       for (const workerName of ['worker-2', 'worker-3']) {
-        await writeWorkerStatus('mixed-timeout', workerName, {
+        await writeWorkerStatus('status-race', workerName, {
           state: 'working',
           current_task_id: `task-${workerName}`,
           updated_at: new Date().toISOString(),
@@ -2173,33 +2180,77 @@ exit 0
       await chmod(tmuxStubPath, 0o755);
       process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
 
-      const markWorkerDone = (async () => {
+      let pauseRestore = false;
+      let signalRestoreCompared: (() => void) | undefined;
+      const restoreCompared = new Promise<void>((resolve) => {
+        signalRestoreCompared = resolve;
+      });
+      const restoreReleased = new Promise<void>((resolve) => {
+        releaseRestore = resolve;
+      });
+      setWriteAtomicRenameForTests(async (from, to) => {
+        if (pauseRestore && to === workerThreeStatusPath) {
+          pauseRestore = false;
+          signalRestoreCompared?.();
+          await restoreReleased;
+        }
+        await rename(from, to);
+      });
+
+      const prepareRace = (async () => {
         const deadline = Date.now() + 1_000;
-        while ((await readWorkerStatus('mixed-timeout', 'worker-2', cwd)).state !== 'draining') {
-          if (Date.now() >= deadline) throw new Error('worker-2 never entered draining state');
+        while (true) {
+          const [workerTwo, workerThree] = await Promise.all([
+            readWorkerStatus('status-race', 'worker-2', cwd),
+            readWorkerStatus('status-race', 'worker-3', cwd),
+          ]);
+          if (workerTwo.state === 'draining' && workerThree.state === 'draining') break;
+          if (Date.now() >= deadline) throw new Error('workers never entered draining state');
           await new Promise((resolve) => setTimeout(resolve, 5));
         }
-        await writeWorkerStatus('mixed-timeout', 'worker-2', {
+        await writeWorkerStatus('status-race', 'worker-2', {
           state: 'done',
           updated_at: new Date().toISOString(),
         }, cwd);
+        pauseRestore = true;
       })();
-      const result = await scaleDown(
-        'mixed-timeout',
+      const scaleDownResult = scaleDown(
+        'status-race',
         cwd,
         { workerNames: ['worker-2', 'worker-3'], drainTimeoutMs: 100 },
         { OMX_TEAM_SCALING_ENABLED: '1' },
       );
-      await markWorkerDone;
+      await prepareRace;
+      await restoreCompared;
+
+      process.env.OMX_TEAM_INTERNAL_WORKER = 'status-race/worker-3';
+      delete process.env.OMX_TEAM_WORKER;
+      const completedWrite = executeTeamApiOperation('write-worker-status', {
+        team_name: 'status-race',
+        worker: 'worker-3',
+        state: 'done',
+      }, cwd);
+      if (!releaseRestore) throw new Error('restore release barrier missing');
+      const release = releaseRestore;
+      releaseRestore = undefined;
+      release();
+      const [result, completionResult] = await Promise.all([scaleDownResult, completedWrite]);
 
       assert.deepEqual(result, { ok: false, error: 'scale_down_drain_timeout:worker-3' });
-      assert.equal((await readWorkerStatus('mixed-timeout', 'worker-2', cwd)).state, 'done');
-      assert.equal((await readWorkerStatus('mixed-timeout', 'worker-3', cwd)).state, 'working');
-      assert.equal((await readTeamConfig('mixed-timeout', cwd))?.workers.length, 3);
+      assert.equal(completionResult.ok, true);
+      assert.equal((await readWorkerStatus('status-race', 'worker-2', cwd)).state, 'done');
+      assert.equal((await readWorkerStatus('status-race', 'worker-3', cwd)).state, 'done');
+      assert.equal((await readTeamConfig('status-race', cwd))?.workers.length, 3);
       assert.doesNotMatch(await readFile(tmuxLogPath, 'utf-8'), /kill-pane/);
     } finally {
+      releaseRestore?.();
+      resetWriteAtomicRenameForTests();
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
+      if (typeof previousInternalWorker === 'string') process.env.OMX_TEAM_INTERNAL_WORKER = previousInternalWorker;
+      else delete process.env.OMX_TEAM_INTERNAL_WORKER;
+      if (typeof previousWorker === 'string') process.env.OMX_TEAM_WORKER = previousWorker;
+      else delete process.env.OMX_TEAM_WORKER;
       await rm(cwd, { recursive: true, force: true });
       await rm(fakeBinDir, { recursive: true, force: true });
     }

@@ -357,6 +357,7 @@ const TEAM_API_OPERATION_REQUIRED_FIELDS: Record<TeamApiOperation, string[]> = {
   'read-config': ['team_name'],
   'read-manifest': ['team_name'],
   'read-worker-status': ['team_name', 'worker'],
+  'write-worker-status': ['team_name', 'worker', 'state'],
   'read-worker-heartbeat': ['team_name', 'worker'],
   'update-worker-heartbeat': ['team_name', 'worker', 'pid', 'turn_count', 'alive'],
   'write-worker-inbox': ['team_name', 'worker', 'content'],
@@ -384,6 +385,7 @@ const TEAM_API_OPERATION_OPTIONAL_FIELDS: Partial<Record<TeamApiOperation, strin
   'cleanup': ['force', 'confirm_issues'],
   'transition-task-status': ['result', 'error'],
   'read-shutdown-ack': ['min_updated_at'],
+  'write-worker-status': ['current_task_id', 'reason'],
   'write-worker-identity': [
     'assigned_tasks', 'pid', 'pane_id', 'working_dir',
     'worktree_path', 'worktree_branch', 'worktree_detached', 'team_state_root',
@@ -399,6 +401,7 @@ const TEAM_API_OPERATION_NOTES: Partial<Record<TeamApiOperation, string>> = {
   'release-task-claim': 'Use this only for rollback/requeue to pending (not for completion).',
   'retry-failed-task': 'Only failed tasks can be retried. Retry clears prior ownership, claim, terminal payload, and compliance evidence.',
   'transition-task-status': 'Lifecycle flow is claim-safe and typically transitions in_progress -> completed|failed.',
+  'write-worker-status': 'Worker-only operation. Caller identity must exactly match team_name/worker; state accepts idle|working|blocked|done|failed.',
   'cleanup': 'Uses the runtime shutdown contract; add confirm_issues=true when failed tasks are acknowledged and shutdown should still proceed.',
   'orphan-cleanup': 'Destructive escape hatch for known orphan recovery. Bypasses shutdown orchestration.',
   'read-events': 'Events are returned in canonical form; worker_idle log entries normalize to type worker_state_changed with source_type worker_idle. wakeable_only defaults to false; set wakeable_only=true to mirror omx team await semantics (wakeable events now include merge conflicts and per-signal stale alerts).',
@@ -413,6 +416,7 @@ function sampleValueForTeamApiField(field: string): unknown {
     case 'from_worker': return 'worker-1';
     case 'to_worker': return 'leader-fixed';
     case 'worker': return 'worker-1';
+    case 'state': return 'idle';
     case 'body': return 'ACK';
     case 'subject': return 'Demo task';
     case 'description': return 'Created through CLI interop';

@@ -1887,6 +1887,24 @@ describe('teamCommand api', () => {
     }
   });
 
+  it('documents worker status identity and state contract', async () => {
+    const logs: string[] = [];
+    const originalLog = console.log;
+    try {
+      console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
+      await teamCommand(['api', 'write-worker-status', '--help']);
+      assert.equal(logs.length, 1);
+      assert.match(logs[0] ?? '', /team_name/);
+      assert.match(logs[0] ?? '', /worker/);
+      assert.match(logs[0] ?? '', /state/);
+      assert.match(logs[0] ?? '', /current_task_id/);
+      assert.match(logs[0] ?? '', /Caller identity must exactly match/);
+      assert.match(logs[0] ?? '', /idle\|working\|blocked\|done\|failed/);
+    } finally {
+      console.log = originalLog;
+    }
+  });
+
   it('prints operation-specific help for omx team api <operation> help alias', async () => {
     const logs: string[] = [];
     const originalLog = console.log;
@@ -2235,6 +2253,39 @@ describe('teamCommand api', () => {
     } finally {
       console.log = originalLog;
       process.exitCode = 0;
+    }
+  });
+
+  it('dispatches worker status writes through CLI api', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-team-api-worker-status-'));
+    const previousCwd = process.cwd();
+    const previousInternalWorker = process.env.OMX_TEAM_INTERNAL_WORKER;
+    const logs: string[] = [];
+    const originalLog = console.log;
+    try {
+      process.chdir(wd);
+      await initTeamState('cli-worker-status', 'status test', 'executor', 1, wd);
+      process.env.OMX_TEAM_INTERNAL_WORKER = 'cli-worker-status/worker-1';
+      console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
+
+      await teamCommand([
+        'api',
+        'write-worker-status',
+        '--input',
+        JSON.stringify({ team_name: 'cli-worker-status', worker: 'worker-1', state: 'idle' }),
+        '--json',
+      ]);
+
+      const response = JSON.parse(logs.at(-1) ?? '{}') as { ok?: boolean; data?: { status?: { state?: string; updated_at?: string } } };
+      assert.equal(response.ok, true);
+      assert.equal(response.data?.status?.state, 'idle');
+      assert.match(response.data?.status?.updated_at ?? '', /^\d{4}-\d{2}-\d{2}T/);
+    } finally {
+      console.log = originalLog;
+      process.chdir(previousCwd);
+      if (typeof previousInternalWorker === 'string') process.env.OMX_TEAM_INTERNAL_WORKER = previousInternalWorker;
+      else delete process.env.OMX_TEAM_INTERNAL_WORKER;
+      await rm(wd, { recursive: true, force: true });
     }
   });
 
