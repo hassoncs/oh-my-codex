@@ -2131,6 +2131,80 @@ describe('scaleDown', () => {
     }
   });
 
+  it('preserves completed worker status when another worker times out draining', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-mixed-timeout-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-mixed-timeout-tmux-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+    try {
+      await initTeamState('mixed-timeout', 'task', 'executor', 3, cwd);
+      const config = await readTeamConfig('mixed-timeout', cwd);
+      assert.ok(config);
+      if (!config) return;
+      config.workers[1]!.pane_id = '%22';
+      config.workers[2]!.pane_id = '%23';
+      await saveTeamConfig(config, cwd);
+      for (const workerName of ['worker-2', 'worker-3']) {
+        await writeWorkerStatus('mixed-timeout', workerName, {
+          state: 'working',
+          current_task_id: `task-${workerName}`,
+          updated_at: new Date().toISOString(),
+        }, cwd);
+      }
+
+      await writeFile(
+        tmuxStubPath,
+        `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "\${1:-}" in
+  show-option)
+    echo "${config.tmux_pane_owner_id}"
+    ;;
+  list-panes)
+    printf '%%22 0\\n%%23 0\\n'
+    ;;
+esac
+exit 0
+`,
+      );
+      await writeFile(tmuxLogPath, '');
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+
+      const markWorkerDone = (async () => {
+        const deadline = Date.now() + 1_000;
+        while ((await readWorkerStatus('mixed-timeout', 'worker-2', cwd)).state !== 'draining') {
+          if (Date.now() >= deadline) throw new Error('worker-2 never entered draining state');
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        await writeWorkerStatus('mixed-timeout', 'worker-2', {
+          state: 'done',
+          updated_at: new Date().toISOString(),
+        }, cwd);
+      })();
+      const result = await scaleDown(
+        'mixed-timeout',
+        cwd,
+        { workerNames: ['worker-2', 'worker-3'], drainTimeoutMs: 100 },
+        { OMX_TEAM_SCALING_ENABLED: '1' },
+      );
+      await markWorkerDone;
+
+      assert.deepEqual(result, { ok: false, error: 'scale_down_drain_timeout:worker-3' });
+      assert.equal((await readWorkerStatus('mixed-timeout', 'worker-2', cwd)).state, 'done');
+      assert.equal((await readWorkerStatus('mixed-timeout', 'worker-3', cwd)).state, 'working');
+      assert.equal((await readTeamConfig('mixed-timeout', cwd))?.workers.length, 3);
+      assert.doesNotMatch(await readFile(tmuxLogPath, 'utf-8'), /kill-pane/);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
   it('preserves a busy worker after non-force drain timeout and force still tears it down', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-drain-timeout-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-drain-timeout-tmux-'));

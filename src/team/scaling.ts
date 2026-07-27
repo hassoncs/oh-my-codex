@@ -948,6 +948,8 @@ export async function scaleDown(
         const previous = previousStatuses.get(worker.name);
         if (!previous) continue;
         try {
+          const current = await readWorkerStatus(sanitized, worker.name, leaderCwd);
+          if (current.state !== 'draining') continue;
           await writeWorkerStatus(sanitized, worker.name, previous, leaderCwd);
         } catch (error) {
           errors.push(`${worker.name}:${String(error)}`);
