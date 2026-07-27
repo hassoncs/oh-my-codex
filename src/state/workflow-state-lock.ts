@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import type { Stats } from 'node:fs';
 import { mkdir, open, readFile, readdir, realpath, rename, rm, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
@@ -43,6 +44,11 @@ export interface WorkflowStateLockDependencies {
       | 'after-stale-rename'
       | 'before-owner-write',
   ) => void | Promise<void>;
+  readFile?: (path: string, encoding: 'utf-8') => Promise<string>;
+  realpath?: (path: string) => Promise<string>;
+  rename?: (oldPath: string, newPath: string) => Promise<void>;
+  rm?: (path: string, options?: { recursive?: boolean; force?: boolean }) => Promise<void>;
+  stat?: (path: string) => Promise<Stats>;
   transaction?: WorkflowStateTransactionDependencies;
 }
 
@@ -60,9 +66,28 @@ function ownerToken(): string {
   return `${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
 }
 
-async function readOwner(path: string): Promise<LockOwnerReadResult> {
+async function missingOnly<T>(operation: () => Promise<T>): Promise<T | null> {
   try {
-    const parsed = JSON.parse(await readFile(path, 'utf-8')) as Partial<LockOwner>;
+    return await operation();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function readOwner(
+  path: string,
+  dependencies: WorkflowStateLockDependencies,
+): Promise<LockOwnerReadResult> {
+  let raw: string;
+  try {
+    raw = await (dependencies.readFile ?? readFile)(path, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'missing' };
+    throw error;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<LockOwner>;
     if (
       typeof parsed.token !== 'string'
       || typeof parsed.generation !== 'string'
@@ -83,8 +108,7 @@ async function readOwner(path: string): Promise<LockOwnerReadResult> {
       return { kind: 'invalid' };
     }
     return { kind: 'ok', owner: parsed as LockOwner };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'missing' };
+  } catch {
     return { kind: 'invalid' };
   }
 }
@@ -152,11 +176,11 @@ async function recoverOrphanedPendingLocks(
   for (const entry of await readdir(baseStateDir)) {
     if (!entry.startsWith(pendingPrefix)) continue;
     const pendingDir = join(baseStateDir, entry);
-    const owner = await readOwner(join(pendingDir, 'owner'));
+    const owner = await readOwner(join(pendingDir, 'owner'), dependencies);
     if (owner.kind === 'ok') {
       if (processIsAlive(owner.owner.pid, dependencies)) continue;
     } else {
-      const pendingStat = await stat(pendingDir).catch(() => null);
+      const pendingStat = await missingOnly(() => (dependencies.stat ?? stat)(pendingDir));
       if (!pendingStat || Date.now() - pendingStat.mtimeMs <= staleMs) continue;
     }
     await rm(pendingDir, { recursive: true, force: true });
@@ -173,13 +197,15 @@ async function publishOwnerLock(
 ): Promise<boolean> {
   const pendingDir = `${lockDir}.pending.${owner.token}.${owner.generation}`;
   await mkdir(pendingDir);
+  let operationError: unknown;
+  let operationFailed = false;
   try {
     await writeOwner(join(pendingDir, 'owner'), owner, dependencies);
     await syncDirectory(pendingDir);
     await dependencies.hook?.('before-lock-publish');
-    if (await stat(lockDir).catch(() => null)) return false;
+    if (await missingOnly(() => (dependencies.stat ?? stat)(lockDir))) return false;
     try {
-      await rename(pendingDir, lockDir);
+      await (dependencies.rename ?? rename)(pendingDir, lockDir);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === 'EEXIST' || code === 'ENOTEMPTY') return false;
@@ -187,8 +213,22 @@ async function publishOwnerLock(
     }
     await syncDirectory(baseStateDir);
     return true;
+  } catch (error) {
+    operationError = error;
+    operationFailed = true;
+    throw error;
   } finally {
-    await rm(pendingDir, { recursive: true, force: true }).catch(() => {});
+    try {
+      await (dependencies.rm ?? rm)(pendingDir, { recursive: true, force: true });
+    } catch (cleanupError) {
+      if (operationFailed) {
+        throw new AggregateError(
+          [operationError, cleanupError],
+          `workflow_state_lock_publish_cleanup_failed:${String(operationError)}`,
+        );
+      }
+      throw cleanupError;
+    }
   }
 }
 
@@ -238,8 +278,11 @@ async function writeRecoveryOwner(
 async function recoverOrphanedTakeoverProvenance(
   baseStateDir: string,
   lockDir: string,
+  dependencies: WorkflowStateLockDependencies,
 ): Promise<LockOwner['recovery_owner']> {
-  if (await stat(lockDir).catch(() => null)) return readRecoveryOwner(baseStateDir);
+  if (await missingOnly(() => (dependencies.stat ?? stat)(lockDir))) {
+    return readRecoveryOwner(baseStateDir);
+  }
   const persisted = await readRecoveryOwner(baseStateDir);
   const quarantinePrefix = '.workflow-state.lock.stale.';
   const candidates = await Promise.all(
@@ -247,7 +290,7 @@ async function recoverOrphanedTakeoverProvenance(
       .filter((entry) => entry.startsWith(quarantinePrefix))
       .map(async (entry) => {
         const quarantineDir = join(baseStateDir, entry);
-        const owner = await readOwner(join(quarantineDir, 'owner'));
+        const owner = await readOwner(join(quarantineDir, 'owner'), dependencies);
         if (owner.kind !== 'ok') return null;
         return {
           quarantineDir,
@@ -270,7 +313,7 @@ async function recoverOrphanedTakeoverProvenance(
   const recoveryOwner = persisted ?? valid[0]!.recoveryOwner;
   if (!persisted) await writeRecoveryOwner(baseStateDir, recoveryOwner);
   for (const { quarantineDir } of valid) {
-    await rm(quarantineDir, { recursive: true, force: true });
+    await (dependencies.rm ?? rm)(quarantineDir, { recursive: true, force: true });
   }
   await syncDirectory(baseStateDir);
   return recoveryOwner;
@@ -283,9 +326,9 @@ async function recoverStaleLock(
   contenderToken: string,
   dependencies: WorkflowStateLockDependencies,
 ): Promise<LockOwner['recovery_owner']> {
-  const observedStat = await stat(lockDir).catch(() => null);
+  const observedStat = await missingOnly(() => (dependencies.stat ?? stat)(lockDir));
   if (!observedStat) return undefined;
-  const observedOwnerResult = await readOwner(ownerPath);
+  const observedOwnerResult = await readOwner(ownerPath, dependencies);
   if (observedOwnerResult.kind !== 'ok') return undefined;
   const observedOwner = observedOwnerResult.owner;
   const persistedRecoveryOwner = await readRecoveryOwner(baseStateDir);
@@ -303,7 +346,7 @@ async function recoverStaleLock(
     if (processIsAlive(observedOwner.pid, dependencies)) return undefined;
   }
 
-  const confirmedStat = await stat(lockDir).catch(() => null);
+  const confirmedStat = await missingOnly(() => (dependencies.stat ?? stat)(lockDir));
   if (
     !confirmedStat
     || confirmedStat.dev !== observedStat.dev
@@ -316,15 +359,15 @@ async function recoverStaleLock(
   await dependencies.hook?.('before-stale-rename');
   const quarantineDir = `${lockDir}.stale.${contenderToken}`;
   try {
-    await rename(lockDir, quarantineDir);
+    await (dependencies.rename ?? rename)(lockDir, quarantineDir);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
   await dependencies.hook?.('after-stale-rename');
 
-  const movedStat = await stat(quarantineDir).catch(() => null);
-  const movedOwnerResult = await readOwner(join(quarantineDir, 'owner'));
+  const movedStat = await missingOnly(() => (dependencies.stat ?? stat)(quarantineDir));
+  const movedOwnerResult = await readOwner(join(quarantineDir, 'owner'), dependencies);
   const movedOwner = movedOwnerResult.kind === 'ok' ? movedOwnerResult.owner : null;
   const sameOwner = Boolean(
     movedOwner
@@ -349,8 +392,16 @@ async function recoverStaleLock(
       && (movedOwnerIsFresh || Boolean(movedOwner && processIsAlive(movedOwner.pid, dependencies)))
     )
   ) {
-    await rename(quarantineDir, lockDir).catch(() => {});
-    throw new Error(`workflow_state_lock_takeover_race:${lockDir}`);
+    const raceError = new Error(`workflow_state_lock_takeover_race:${lockDir}`);
+    try {
+      await (dependencies.rename ?? rename)(quarantineDir, lockDir);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [raceError, cleanupError],
+        `workflow_state_lock_takeover_restore_failed:${lockDir}`,
+      );
+    }
+    throw raceError;
   }
 
   const recoveryOwner = observedOwner.recovery_owner ?? {
@@ -358,7 +409,7 @@ async function recoverStaleLock(
     generation: observedOwner.generation,
   };
   await writeRecoveryOwner(baseStateDir, recoveryOwner);
-  await rm(quarantineDir, { recursive: true, force: true });
+  await (dependencies.rm ?? rm)(quarantineDir, { recursive: true, force: true });
   await syncDirectory(baseStateDir);
   return recoveryOwner;
 }
@@ -372,7 +423,9 @@ export async function withWorkflowStateLock<T>(
 ): Promise<T> {
   const requestedBaseStateDir = resolve(baseStateDir);
   if (lease) {
-    const canonicalBaseStateDir = await realpath(requestedBaseStateDir).catch(() => null);
+    const canonicalBaseStateDir = await missingOnly(
+      () => (dependencies.realpath ?? realpath)(requestedBaseStateDir),
+    );
     if (!activeLeases.has(lease) || lease.baseStateDir !== canonicalBaseStateDir) {
       throw new Error(`workflow_state_lock_invalid_lease:${baseStateDir}`);
     }
@@ -393,6 +446,7 @@ export async function withWorkflowStateLock<T>(
   let recoveryOwner = await recoverOrphanedTakeoverProvenance(
     normalizedBaseStateDir,
     lockDir,
+    dependencies,
   );
   let recoveryRequired = false;
 
@@ -465,7 +519,7 @@ export async function withWorkflowStateLock<T>(
       if (heartbeatError) {
         throw new Error(`workflow_state_lock_heartbeat_failed:${String(heartbeatError)}`);
       }
-      const currentOwner = await readOwner(ownerPath);
+      const currentOwner = await readOwner(ownerPath, dependencies);
       if (
         currentOwner.kind !== 'ok'
         || currentOwner.owner.token !== token
@@ -520,7 +574,7 @@ export async function withWorkflowStateLock<T>(
     activeLeases.delete(acquiredLease);
     clearInterval(heartbeat);
     if (heartbeatWrite) await heartbeatWrite;
-    const currentOwner = await readOwner(ownerPath);
+    const currentOwner = await readOwner(ownerPath, dependencies);
     if (
       !recoveryRequired
       && currentOwner.kind === 'ok'

@@ -3,7 +3,18 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename as fsRename,
+  rm,
+  stat as fsStat,
+  symlink,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -1708,4 +1719,228 @@ describe('workflow state lock', () => {
       await rm(baseStateDir, { recursive: true, force: true });
     }
   });
+  it('preserves non-ENOENT owner read failures', async () => {
+    const baseStateDir = await mkdtemp(join(tmpdir(), 'omx-workflow-owner-read-failure-'));
+    const lockDir = canonicalStatePath(baseStateDir, '.workflow-state.lock');
+    const ownerPath = join(lockDir, 'owner');
+    const readError = Object.assign(new Error('owner_read_denied'), { code: 'EACCES' });
+    try {
+      await mkdir(lockDir);
+      await writeFile(ownerPath, JSON.stringify({
+        token: 'blocked-owner',
+        generation: '00000000-0000-4000-8000-000000000041',
+        pid: process.pid,
+        heartbeat_at: new Date().toISOString(),
+      }));
+      configureWorkflowStateLockFaults({
+        timeoutMs: 20,
+        retryMs: 1,
+        readFile: async (path, encoding) => {
+          if (path === ownerPath) throw readError;
+          return readFile(path, encoding);
+        },
+      });
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, async () => {}),
+        (error) => error === readError,
+      );
+    } finally {
+      await rm(baseStateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves non-ENOENT stat probe failures', async () => {
+    const baseStateDir = await mkdtemp(join(tmpdir(), 'omx-workflow-stat-failure-'));
+    const lockDir = canonicalStatePath(baseStateDir, '.workflow-state.lock');
+    const statError = Object.assign(new Error('lock_stat_denied'), { code: 'EACCES' });
+    try {
+      configureWorkflowStateLockFaults({
+        stat: async (path) => {
+          if (path === lockDir) throw statError;
+          return fsStat(path);
+        },
+      });
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, async () => {}),
+        (error) => error === statError,
+      );
+    } finally {
+      await rm(baseStateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves non-ENOENT realpath lease failures', async () => {
+    const baseStateDir = await mkdtemp(join(tmpdir(), 'omx-workflow-realpath-failure-'));
+    const realpathError = Object.assign(new Error('state_realpath_denied'), { code: 'EACCES' });
+    try {
+      configureWorkflowStateLockFaults({
+        realpath: async () => {
+          throw realpathError;
+        },
+      });
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, (lease) =>
+          withWorkflowStateLock(baseStateDir, async () => {}, lease)),
+        (error) => error === realpathError,
+      );
+    } finally {
+      await rm(baseStateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves non-ENOENT transaction root realpath failures', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-workflow-transaction-realpath-failure-'));
+    const baseStateDir = join(cwd, '.omx', 'state');
+    const realpathError = Object.assign(new Error('transaction_realpath_denied'), { code: 'EACCES' });
+    try {
+      await mkdir(baseStateDir, { recursive: true });
+      configureWorkflowStateTransactionFaults({
+        realpath: async () => {
+          throw realpathError;
+        },
+      });
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, (lockLease) =>
+          withWorkflowStateTransaction(
+            baseStateDir,
+            cwd,
+            undefined,
+            async () => {},
+            [],
+            { lockLease },
+          )),
+        (error) => error === realpathError,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('aggregates lock publish and pending cleanup failures', async () => {
+    const baseStateDir = await mkdtemp(join(tmpdir(), 'omx-workflow-publish-cleanup-failure-'));
+    const publishError = new Error('lock_publish_failed');
+    const cleanupError = new Error('pending_cleanup_failed');
+    try {
+      configureWorkflowStateLockFaults({
+        rename: async () => {
+          throw publishError;
+        },
+        rm: async () => {
+          throw cleanupError;
+        },
+      });
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, async () => {}),
+        (error) => {
+          assert(error instanceof AggregateError);
+          assert.match(error.message, /workflow_state_lock_publish_cleanup_failed/);
+          assert.deepEqual(error.errors, [publishError, cleanupError]);
+          return true;
+        },
+      );
+    } finally {
+      await rm(baseStateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('aggregates takeover race and lock restore failures', async () => {
+    const baseStateDir = await mkdtemp(join(tmpdir(), 'omx-workflow-takeover-restore-failure-'));
+    const lockDir = join(baseStateDir, '.workflow-state.lock');
+    const ownerPath = join(lockDir, 'owner');
+    const restoreError = new Error('lock_restore_failed');
+    try {
+      await mkdir(lockDir);
+      await writeFile(ownerPath, JSON.stringify({
+        token: 'stale-owner',
+        generation: '00000000-0000-4000-8000-000000000042',
+        pid: 999_999,
+        heartbeat_at: new Date(0).toISOString(),
+      }));
+      await utimes(lockDir, new Date(0), new Date(0));
+      configureWorkflowStateLockFaults({
+        staleMs: 0,
+        timeoutMs: 20,
+        retryMs: 1,
+        processIsAlive: () => false,
+        rename: async (source, destination) => {
+          if (String(source).includes('.workflow-state.lock.stale.')) throw restoreError;
+          await fsRename(source, destination);
+        },
+        hook: async (stage) => {
+          if (stage !== 'after-stale-rename') return;
+          const quarantine = (await readdir(baseStateDir))
+            .find((entry) => entry.startsWith('.workflow-state.lock.stale.'));
+          assert(quarantine);
+          await writeFile(join(baseStateDir, quarantine, 'owner'), JSON.stringify({
+            token: 'replacement-owner',
+            generation: '00000000-0000-4000-8000-000000000043',
+            pid: process.pid,
+            heartbeat_at: new Date().toISOString(),
+          }));
+        },
+      });
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, async () => {}),
+        (error) => {
+          assert(error instanceof AggregateError);
+          assert.match(error.message, /workflow_state_lock_takeover_restore_failed/);
+          assert.match(String(error.errors[0]), /workflow_state_lock_takeover_race/);
+          assert.equal(error.errors[1], restoreError);
+          return true;
+        },
+      );
+    } finally {
+      await rm(baseStateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('aggregates transaction write and temp cleanup failures', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-workflow-temp-cleanup-failure-'));
+    const baseStateDir = join(cwd, '.omx', 'state');
+    const writeError = new Error('journal_sync_failed');
+    const cleanupError = new Error('journal_temp_cleanup_failed');
+    try {
+      await mkdir(baseStateDir, { recursive: true });
+      configureWorkflowStateTransactionFaults({
+        hook: (stage, path) => {
+          if (stage === 'before-file-sync' && path.endsWith('.workflow-state-transaction.json')) {
+            throw writeError;
+          }
+        },
+        rm: async (path, options) => {
+          if (String(path).includes('.workflow-state-transaction.json.') && String(path).endsWith('.tmp')) {
+            throw cleanupError;
+          }
+          await rm(path, options);
+        },
+      });
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, (lockLease) =>
+          withWorkflowStateTransaction(
+            baseStateDir,
+            cwd,
+            undefined,
+            async () => {},
+            [],
+            { lockLease },
+          )),
+        (error) => {
+          assert(error instanceof AggregateError);
+          assert.match(error.message, /workflow_state_transaction_temp_cleanup_failed/);
+          assert.deepEqual(error.errors, [writeError, cleanupError]);
+          return true;
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
 });

@@ -46,6 +46,8 @@ export interface WorkflowStateTransactionDependencies {
     stage: 'before-file-sync' | 'before-directory-sync' | 'before-journal-delete',
     path: string,
   ) => void | Promise<void>;
+  realpath?: (path: string) => Promise<string>;
+  rm?: (path: string, options?: { force?: boolean }) => Promise<void>;
 }
 
 export interface WorkflowStateTransactionLease {
@@ -64,6 +66,15 @@ export interface WorkflowStateMutationAuthority {
 const activeLeases = new WeakSet<object>();
 const activeTransactions = new Map<string, WorkflowStateTransactionLease | symbol>();
 const OUTSIDE_STATE_TRANSACTION_ROOT = Symbol('outside-state-transaction-root');
+
+async function missingOnly<T>(operation: () => Promise<T>): Promise<T | null> {
+  try {
+    return await operation();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
 
 export async function captureWorkflowStateSnapshot(
   cwd: string,
@@ -166,8 +177,11 @@ async function canonicalStateTransactionRoot(baseStateDir: string): Promise<stri
 async function assertRequestedStateTransactionRoot(
   requestedRoot: string,
   canonicalRoot: string,
+  dependencies: WorkflowStateTransactionDependencies,
 ): Promise<void> {
-  const currentRoot = await realpath(resolve(requestedRoot)).catch(() => null);
+  const currentRoot = await missingOnly(
+    () => (dependencies.realpath ?? realpath)(resolve(requestedRoot)),
+  );
   if (currentRoot !== canonicalRoot) {
     throw new Error(`workflow_state_transaction_root_changed:${requestedRoot}`);
   }
@@ -215,8 +229,12 @@ async function canonicalContextRoot(contextRoot: string): Promise<string> {
 async function assertRequestedContextTransactionRoot(
   requestedCwd: string,
   canonicalRoot: string,
+  dependencies: WorkflowStateTransactionDependencies,
 ): Promise<void> {
-  const currentRoot = await canonicalContextRoot(contextRootForCwd(requestedCwd)).catch(() => null);
+  const currentRoot = await missingOnly(async () => {
+    const cwd = dirname(dirname(resolve(contextRootForCwd(requestedCwd))));
+    return join(await (dependencies.realpath ?? realpath)(cwd), '.omx', 'context');
+  });
   if (currentRoot !== canonicalRoot) {
     throw new Error(`workflow_state_transaction_context_root_changed:${requestedCwd}`);
   }
@@ -509,7 +527,14 @@ async function writeDurableFile(
     await rename(tempPath, safePath);
     await syncDirectory(parentDir, dependencies);
   } catch (error) {
-    await rm(tempPath, { force: true }).catch(() => {});
+    try {
+      await (dependencies.rm ?? rm)(tempPath, { force: true });
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        `workflow_state_transaction_temp_cleanup_failed:${String(error)}`,
+      );
+    }
     throw error;
   }
 }
@@ -722,6 +747,7 @@ export async function withWorkflowStateTransaction<T>(
     dependencies?: WorkflowStateTransactionDependencies;
   } = {},
 ): Promise<T> {
+  const dependencies = options.dependencies ?? {};
   const requestedBaseStateDir = await canonicalStateTransactionRoot(baseStateDirInput);
   const transactionContextRootAlias = contextRootForCwd(cwd);
   const transactionContextRoot = await canonicalContextRoot(transactionContextRootAlias);
@@ -750,8 +776,16 @@ export async function withWorkflowStateTransaction<T>(
 
   try {
     await options.lockLease.assertOwned();
-    await assertRequestedStateTransactionRoot(baseStateDirInput, transactionBaseStateDir);
-    await assertRequestedContextTransactionRoot(cwd, transactionContextRoot);
+    await assertRequestedStateTransactionRoot(
+      baseStateDirInput,
+      transactionBaseStateDir,
+      dependencies,
+    );
+    await assertRequestedContextTransactionRoot(
+      cwd,
+      transactionContextRoot,
+      dependencies,
+    );
 
     const snapshot = await captureWorkflowStateSnapshot(
       cwd,
@@ -771,11 +805,11 @@ export async function withWorkflowStateTransaction<T>(
         transactionId,
         options.lockLease.token,
         options.lockLease.generation,
-        options.dependencies ?? {},
+        dependencies,
       );
     } catch (error) {
       try {
-        await removeWorkflowStateTransaction(transactionBaseStateDir, options.dependencies);
+        await removeWorkflowStateTransaction(transactionBaseStateDir, dependencies);
       } catch (cleanupError) {
         try {
           await options.lockLease.markRecoveryRequired();
@@ -805,8 +839,16 @@ export async function withWorkflowStateTransaction<T>(
         }
         const capture = captureTail.then(async () => {
           await options.lockLease!.assertOwned();
-          await assertRequestedStateTransactionRoot(baseStateDirInput, transactionBaseStateDir);
-          await assertRequestedContextTransactionRoot(cwd, transactionContextRoot);
+          await assertRequestedStateTransactionRoot(
+            baseStateDirInput,
+            transactionBaseStateDir,
+            dependencies,
+          );
+          await assertRequestedContextTransactionRoot(
+            cwd,
+            transactionContextRoot,
+            dependencies,
+          );
           const captured = await persistedEntryPath(
             transactionBaseStateDir,
             transactionContextRoot,
@@ -831,7 +873,7 @@ export async function withWorkflowStateTransaction<T>(
             transactionId,
             options.lockLease!.token,
             options.lockLease!.generation,
-            options.dependencies ?? {},
+            dependencies,
           );
         });
         captureTail = capture;
@@ -864,8 +906,16 @@ export async function withWorkflowStateTransaction<T>(
         throw captureError;
       }
       try {
-        await assertRequestedStateTransactionRoot(baseStateDirInput, transactionBaseStateDir);
-        await assertRequestedContextTransactionRoot(cwd, transactionContextRoot);
+        await assertRequestedStateTransactionRoot(
+          baseStateDirInput,
+          transactionBaseStateDir,
+          dependencies,
+        );
+        await assertRequestedContextTransactionRoot(
+          cwd,
+          transactionContextRoot,
+          dependencies,
+        );
       } catch (rootError) {
         if (callbackFailed) {
           throw new AggregateError(
@@ -883,7 +933,7 @@ export async function withWorkflowStateTransaction<T>(
         options.lockLease.token,
         options.lockLease.generation,
       );
-      await syncWorkflowStatePaths(snapshot, options.dependencies);
+      await syncWorkflowStatePaths(snapshot, dependencies);
       await options.lockLease.assertOwned();
       await assertWorkflowStateTransactionOwned(
         transactionBaseStateDir,
@@ -891,7 +941,7 @@ export async function withWorkflowStateTransaction<T>(
         options.lockLease.token,
         options.lockLease.generation,
       );
-      await removeWorkflowStateTransaction(transactionBaseStateDir, options.dependencies);
+      await removeWorkflowStateTransaction(transactionBaseStateDir, dependencies);
       return result;
     } catch (error) {
       try {
@@ -902,7 +952,7 @@ export async function withWorkflowStateTransaction<T>(
           options.lockLease.token,
           options.lockLease.generation,
         );
-        await restoreWorkflowStateSnapshot(snapshot, options.dependencies);
+        await restoreWorkflowStateSnapshot(snapshot, dependencies);
         await options.lockLease.assertOwned();
         await assertWorkflowStateTransactionOwned(
           transactionBaseStateDir,
@@ -910,7 +960,7 @@ export async function withWorkflowStateTransaction<T>(
           options.lockLease.token,
           options.lockLease.generation,
         );
-        await removeWorkflowStateTransaction(transactionBaseStateDir, options.dependencies);
+        await removeWorkflowStateTransaction(transactionBaseStateDir, dependencies);
       } catch (rollbackError) {
         try {
           await options.lockLease.markRecoveryRequired();
