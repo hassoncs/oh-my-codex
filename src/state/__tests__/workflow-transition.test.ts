@@ -221,16 +221,16 @@ describe('workflow transition rules', () => {
     });
   });
 
-  it('does not auto-complete session mode detail when canonical skill state is absent', async () => {
+  it('derives active session modes from authoritative detail when canonical skill state is absent', async () => {
     await withIsolatedStateEnv(async () => {
       const wd = await mkdtemp(join(tmpdir(), 'omx-workflow-reconcile-detail-only-'));
       try {
         const sessionId = 'sess-detail-only';
         const sessionDir = join(wd, '.omx', 'state', 'sessions', sessionId);
-        const staleRalplanPath = join(sessionDir, 'ralplan-state.json');
+        const ralplanPath = join(sessionDir, 'ralplan-state.json');
         await mkdir(sessionDir, { recursive: true });
         await writeFile(
-          staleRalplanPath,
+          ralplanPath,
           JSON.stringify({ active: true, mode: 'ralplan', current_phase: 'review' }, null, 2),
           'utf-8',
         );
@@ -242,11 +242,124 @@ describe('workflow transition rules', () => {
         });
 
         assert.equal(transition.decision.allowed, true);
-        assert.deepEqual(transition.decision.currentModes, []);
-        assert.deepEqual(transition.completedPaths, []);
+        assert.deepEqual(transition.decision.currentModes, ['ralplan']);
+        assert.deepEqual(transition.completedPaths, [ralplanPath]);
 
-        const staleRalplan = JSON.parse(await readFile(staleRalplanPath, 'utf-8')) as { active?: unknown };
-        assert.equal(staleRalplan.active, true);
+        const ralplan = JSON.parse(await readFile(ralplanPath, 'utf-8')) as { active?: unknown };
+        assert.equal(ralplan.active, false);
+        const projection = JSON.parse(
+          await readFile(join(sessionDir, 'skill-active-state.json'), 'utf-8'),
+        ) as { active?: unknown };
+        assert.equal(projection.active, false);
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('restores a missing root projection mirror from authoritative session state', async () => {
+    await withIsolatedStateEnv(async () => {
+      const wd = await mkdtemp(join(tmpdir(), 'omx-workflow-reconcile-session-mirror-'));
+      try {
+        const sessionId = 'sess-mirror';
+        const stateDir = join(wd, '.omx', 'state');
+        const sessionDir = join(stateDir, 'sessions', sessionId);
+        await mkdir(sessionDir, { recursive: true });
+        await writeFile(
+          join(sessionDir, 'autopilot-state.json'),
+          JSON.stringify({ active: true, mode: 'autopilot', current_phase: 'ultragoal' }, null, 2),
+        );
+        await writeFile(
+          join(sessionDir, 'skill-active-state.json'),
+          JSON.stringify({
+            version: 1,
+            active: true,
+            skill: 'autopilot',
+            phase: 'ultragoal',
+            session_id: sessionId,
+            active_skills: [{
+              skill: 'autopilot',
+              phase: 'ultragoal',
+              active: true,
+              session_id: sessionId,
+            }],
+          }, null, 2),
+        );
+
+        const preflight = await preflightWorkflowTransition(wd, 'autopilot', {
+          action: 'start',
+          sessionId,
+        });
+
+        assert.deepEqual(preflight.currentModes, ['autopilot']);
+        const rootProjection = JSON.parse(
+          await readFile(join(stateDir, 'skill-active-state.json'), 'utf-8'),
+        ) as { active_skills?: Array<{ skill?: unknown; session_id?: unknown }> };
+        assert.deepEqual(
+          rootProjection.active_skills?.map((entry) => ({
+            skill: entry.skill,
+            session_id: entry.session_id,
+          })),
+          [{ skill: 'autopilot', session_id: sessionId }],
+        );
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('repairs a session projection carrying a foreign session id', async () => {
+    await withIsolatedStateEnv(async () => {
+      const wd = await mkdtemp(join(tmpdir(), 'omx-workflow-reconcile-foreign-session-'));
+      try {
+        const sessionId = 'sess-current';
+        const foreignSessionId = 'sess-foreign';
+        const stateDir = join(wd, '.omx', 'state');
+        const sessionDir = join(stateDir, 'sessions', sessionId);
+        const projection = (projectionSessionId: string) => ({
+          version: 1,
+          active: true,
+          skill: 'autopilot',
+          phase: 'ultragoal',
+          session_id: projectionSessionId,
+          active_skills: [{
+            skill: 'autopilot',
+            phase: 'ultragoal',
+            active: true,
+            session_id: projectionSessionId,
+          }],
+        });
+        await mkdir(sessionDir, { recursive: true });
+        await writeFile(
+          join(sessionDir, 'autopilot-state.json'),
+          JSON.stringify({ active: true, mode: 'autopilot', current_phase: 'ultragoal' }, null, 2),
+        );
+        await writeFile(
+          join(stateDir, 'skill-active-state.json'),
+          JSON.stringify(projection(sessionId), null, 2),
+        );
+        await writeFile(
+          join(sessionDir, 'skill-active-state.json'),
+          JSON.stringify(projection(foreignSessionId), null, 2),
+        );
+
+        const preflight = await preflightWorkflowTransition(wd, 'autopilot', {
+          action: 'start',
+          sessionId,
+        });
+
+        assert.deepEqual(preflight.currentModes, ['autopilot']);
+        const sessionProjection = JSON.parse(
+          await readFile(join(sessionDir, 'skill-active-state.json'), 'utf-8'),
+        ) as {
+          session_id?: unknown;
+          active_skills?: Array<{ session_id?: unknown }>;
+        };
+        assert.equal(sessionProjection.session_id, sessionId);
+        assert.deepEqual(
+          sessionProjection.active_skills?.map((entry) => entry.session_id),
+          [sessionId],
+        );
       } finally {
         await rm(wd, { recursive: true, force: true });
       }

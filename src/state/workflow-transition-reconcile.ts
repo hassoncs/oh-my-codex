@@ -1,6 +1,6 @@
 import { existsSync } from 'fs';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, realpath, writeFile } from 'fs/promises';
+import { mkdir, readFile, realpath, rm, writeFile } from 'fs/promises';
 import { dirname, join, resolve } from 'path';
 import { getBaseStateDir, getStatePath } from '../mcp/state-paths.js';
 import {
@@ -13,10 +13,14 @@ import {
   type WorkflowTransitionDecision,
 } from './workflow-transition.js';
 import {
+  clearTerminalSkillActiveMarkers,
+  getSkillActiveStatePathsForStateDir,
   listActiveSkills,
-  readVisibleSkillActiveState,
-  readVisibleSkillActiveStateForStateDir,
+  readSkillActiveState,
   syncCanonicalSkillStateForMode,
+  writeSkillActiveStateCopiesForStateDir,
+  type SkillActiveEntry,
+  type SkillActiveStateLike,
 } from './skill-active.js';
 import { applyRunOutcomeContract } from '../runtime/run-outcome.js';
 import { normalizeTerminalWorkflowState } from './terminal-normalization.js';
@@ -37,6 +41,11 @@ interface TransitionStateLike {
   current_phase?: unknown;
   completed_at?: unknown;
   [key: string]: unknown;
+}
+
+interface AuthoritativeWorkflowSnapshot {
+  currentModes: TrackedWorkflowMode[];
+  states: Map<TrackedWorkflowMode, TransitionStateLike>;
 }
 
 export interface ReconciledWorkflowTransition {
@@ -109,7 +118,11 @@ async function readJsonIfExists(
 ): Promise<TransitionStateLike | null> {
   if (!existsSync(path)) return null;
   try {
-    return JSON.parse(await readFile(path, 'utf-8')) as TransitionStateLike;
+    const parsed = JSON.parse(await readFile(path, 'utf-8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('workflow state must be an object');
+    }
+    return parsed as TransitionStateLike;
   } catch {
     if (options?.throwOnParseError && options.mode) {
       throw new Error(
@@ -135,31 +148,175 @@ function modeStatePathForRoot(
 }
 
 
-async function assertAuthoritativeWorkflowStateReadable(
+async function readAuthoritativeWorkflowSnapshot(
   cwd: string,
   sessionId?: string,
   baseStateDir?: string,
-): Promise<void> {
+): Promise<AuthoritativeWorkflowSnapshot> {
+  const currentModes: TrackedWorkflowMode[] = [];
+  const states = new Map<TrackedWorkflowMode, TransitionStateLike>();
   for (const mode of TRACKED_WORKFLOW_MODES) {
     const candidatePath = modeStatePathForRoot(mode, cwd, sessionId, baseStateDir);
-    await readJsonIfExists(candidatePath, { mode, throwOnParseError: true });
+    const state = await readJsonIfExists(candidatePath, { mode, throwOnParseError: true });
+    if (!state) continue;
+    states.set(mode, state);
+    if (state.active === true) currentModes.push(mode);
+  }
+  return { currentModes, states };
+}
+
+function buildProjectionState(
+  base: SkillActiveStateLike | null,
+  entries: SkillActiveEntry[],
+  fallbackMode: string,
+  sessionId: string | undefined,
+  nowIso: string,
+): SkillActiveStateLike {
+  const inherited = entries.length > 0
+    ? clearTerminalSkillActiveMarkers(base ?? {})
+    : { ...(base ?? {}) };
+  const currentPrimary = safeString(inherited.skill).trim();
+  const primary = entries.find((entry) => entry.skill === currentPrimary) ?? entries[0];
+  return {
+    ...inherited,
+    version: 1,
+    active: entries.length > 0,
+    skill: primary?.skill || currentPrimary || fallbackMode,
+    phase: primary?.phase || safeString(inherited.phase).trim(),
+    updated_at: nowIso,
+    source: 'workflow-transition-reconcile',
+    session_id: primary?.session_id || sessionId,
+    active_skills: entries,
+  };
+}
+
+function projectionMatches(
+  visibleEntries: SkillActiveEntry[],
+  expectedEntries: SkillActiveEntry[],
+  sessionId?: string,
+): boolean {
+  const expectedSessionId = safeString(sessionId).trim();
+  const visibleTrackedEntries = visibleEntries.filter((entry) => (
+    isTrackedWorkflowMode(entry.skill)
+    && safeString(entry.session_id).trim() === expectedSessionId
+  ));
+  if (visibleTrackedEntries.length !== expectedEntries.length) return false;
+  return expectedEntries.every((expected) => visibleTrackedEntries.some((visible) => (
+    visible.skill === expected.skill
+    && safeString(visible.phase).trim() === safeString(expected.phase).trim()
+  )));
+}
+
+async function readProjectionBytes(path: string): Promise<string | null> {
+  return readFile(path, 'utf-8').catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+}
+
+async function restoreProjectionBytes(path: string, content: string | null): Promise<void> {
+  if (content === null) {
+    await rm(path, { force: true });
+    return;
+  }
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, content);
+}
+
+async function writeProjectionCopies(
+  stateDir: string,
+  state: SkillActiveStateLike,
+  sessionId?: string,
+  rootState?: SkillActiveStateLike,
+): Promise<void> {
+  const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(stateDir, sessionId);
+  const previousRoot = await readProjectionBytes(rootPath);
+  const previousSession = sessionPath ? await readProjectionBytes(sessionPath) : null;
+  try {
+    await writeSkillActiveStateCopiesForStateDir(stateDir, state, sessionId, rootState);
+  } catch (error) {
+    try {
+      await restoreProjectionBytes(rootPath, previousRoot);
+      if (sessionPath) await restoreProjectionBytes(sessionPath, previousSession);
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [error, rollbackError],
+        'workflow_projection_reconcile_rollback_failed',
+      );
+    }
+    throw error;
   }
 }
 
-async function visibleTrackedModes(
+async function reconcileVisibleTrackedModes(
   cwd: string,
+  snapshot: AuthoritativeWorkflowSnapshot,
   sessionId?: string,
   baseStateDir?: string,
-): Promise<TrackedWorkflowMode[]> {
-  const canonical = baseStateDir
-    ? await readVisibleSkillActiveStateForStateDir(baseStateDir, sessionId)
-    : await readVisibleSkillActiveState(cwd, sessionId);
-  const canonicalModes = listActiveSkills(canonical ?? {})
-    .filter((entry) => sessionId || safeString(entry.session_id).trim().length === 0)
-    .map((entry) => entry.skill)
-    .filter(isTrackedWorkflowMode);
+): Promise<void> {
+  const stateDir = baseStateDir ?? getBaseStateDir(cwd);
+  const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(stateDir, sessionId);
+  const existingRoot = await readSkillActiveState(rootPath);
+  const existingSession = sessionPath ? await readSkillActiveState(sessionPath) : null;
+  const visiblePath = sessionPath ?? rootPath;
+  const visibleState = sessionPath ? existingSession : existingRoot;
+  const rootEntries = listActiveSkills(existingRoot ?? {});
+  const visibleEntries = listActiveSkills(visibleState ?? {});
+  const existingEntries = [...visibleEntries, ...rootEntries];
+  const nowIso = new Date().toISOString();
+  const expectedEntries = snapshot.currentModes.map((mode): SkillActiveEntry => {
+    const state = snapshot.states.get(mode)!;
+    const existing = existingEntries.find((entry) => entry.skill === mode);
+    return {
+      ...existing,
+      skill: mode,
+      phase: safeString(state.current_phase).trim() || undefined,
+      active: true,
+      activated_at: existing?.activated_at || safeString(state.started_at).trim() || nowIso,
+      updated_at: safeString(state.updated_at).trim() || nowIso,
+      session_id: sessionId,
+    };
+  });
+  const rootSessionEntries = sessionId
+    ? rootEntries.filter((entry) => safeString(entry.session_id).trim() === sessionId)
+    : rootEntries;
+  if (
+    !(existsSync(visiblePath) && visibleState === null)
+    && !(existsSync(rootPath) && existingRoot === null)
+    && projectionMatches(visibleEntries, expectedEntries, sessionId)
+    && projectionMatches(rootSessionEntries, expectedEntries, sessionId)
+  ) {
+    return;
+  }
 
-  return [...new Set(canonicalModes)];
+  const fallbackMode = snapshot.currentModes[0] || safeString(visibleState?.skill).trim() || 'skill-active';
+  if (sessionPath && sessionId) {
+    const nextRootEntries = [
+      ...listActiveSkills(existingRoot ?? {}).filter((entry) => !(
+        isTrackedWorkflowMode(entry.skill)
+        && safeString(entry.session_id).trim() === sessionId
+      )),
+      ...expectedEntries,
+    ];
+    const nextSessionEntries = [
+      ...visibleEntries.filter((entry) => !isTrackedWorkflowMode(entry.skill)),
+      ...expectedEntries,
+    ];
+    const nextRoot = buildProjectionState(existingRoot, nextRootEntries, fallbackMode, undefined, nowIso);
+    const nextSession = buildProjectionState(existingSession, nextSessionEntries, fallbackMode, sessionId, nowIso);
+    await writeProjectionCopies(stateDir, nextSession, sessionId, nextRoot);
+    return;
+  }
+
+  const nextRootEntries = [
+    ...listActiveSkills(existingRoot ?? {}).filter((entry) => (
+      !isTrackedWorkflowMode(entry.skill)
+      || safeString(entry.session_id).trim().length > 0
+    )),
+    ...expectedEntries,
+  ];
+  const nextRoot = buildProjectionState(existingRoot, nextRootEntries, fallbackMode, undefined, nowIso);
+  await writeProjectionCopies(stateDir, nextRoot, undefined, nextRoot);
 }
 
 async function completeSourceModeState(
@@ -332,12 +489,15 @@ export async function preflightWorkflowTransition(
       }),
     );
   }
-  if (!options.currentModes) {
-    await assertAuthoritativeWorkflowStateReadable(cwd, sessionId, baseStateDir);
+  const authoritativeSnapshot = options.currentModes
+    ? null
+    : await readAuthoritativeWorkflowSnapshot(cwd, sessionId, baseStateDir);
+  if (authoritativeSnapshot) {
+    await reconcileVisibleTrackedModes(cwd, authoritativeSnapshot, sessionId, baseStateDir);
   }
   const currentModes = options.currentModes
     ? [...options.currentModes].filter(isTrackedWorkflowMode)
-    : await visibleTrackedModes(cwd, sessionId, baseStateDir);
+    : authoritativeSnapshot!.currentModes;
   await assertWorkflowTransitionContextAllowed(cwd, currentModes, requestedMode, {
     sessionId,
     baseStateDir,
@@ -424,8 +584,7 @@ export async function reconcileWorkflowTransition(
     }
     const currentModes = options.preflight.currentModesSource === 'override'
       ? options.preflight.currentModes
-      : await visibleTrackedModes(cwd, sessionId, baseStateDir);
-    await assertAuthoritativeWorkflowStateReadable(cwd, sessionId, baseStateDir);
+      : (await readAuthoritativeWorkflowSnapshot(cwd, sessionId, baseStateDir)).currentModes;
     await assertWorkflowTransitionContextAllowed(cwd, currentModes, requestedMode, {
       sessionId,
       baseStateDir,

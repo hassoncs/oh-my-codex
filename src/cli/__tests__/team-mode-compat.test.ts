@@ -54,9 +54,16 @@ describe('team mode compatibility preflight', () => {
         await startMode('autopilot', 'run strict lifecycle', 5, wd);
         await updateModeState('autopilot', { current_phase: 'ultragoal' }, wd);
         await writeActiveUltragoal(wd);
+        await rm(join(wd, '.omx', 'state', 'skill-active-state.json'));
 
         const preflight = await preflightTeamModeStart(wd);
         assert.equal(preflight.allowNestedAutopilotTeam, true);
+        assert.deepEqual(preflight.workflowTransition.currentModes, ['autopilot']);
+        const projection = JSON.parse(
+          await readFile(join(wd, '.omx', 'state', 'skill-active-state.json'), 'utf-8'),
+        ) as { active?: unknown; skill?: unknown };
+        assert.equal(projection.active, true);
+        assert.equal(projection.skill, 'autopilot');
         await startMode('team', 'run nested story', 5, wd, {
           allowNestedAutopilotTeam: preflight.allowNestedAutopilotTeam,
           preflightTransition: preflight.workflowTransition,
@@ -64,6 +71,18 @@ describe('team mode compatibility preflight', () => {
 
         assert.equal((await readModeState('autopilot', wd))?.active, true);
         assert.equal((await readModeState('team', wd))?.active, true);
+
+        const canonicalPath = join(wd, '.omx', 'state', 'skill-active-state.json');
+        await rm(canonicalPath);
+        const resumedPreflight = await preflightTeamModeStart(wd);
+        assert.deepEqual(resumedPreflight.workflowTransition.currentModes, ['autopilot', 'team']);
+        const resumedProjection = JSON.parse(await readFile(canonicalPath, 'utf-8')) as {
+          active_skills?: Array<{ skill?: unknown }>;
+        };
+        assert.deepEqual(
+          resumedProjection.active_skills?.map((entry) => entry.skill),
+          ['autopilot', 'team'],
+        );
       } finally {
         await rm(wd, { recursive: true, force: true });
       }
@@ -77,11 +96,15 @@ describe('team mode compatibility preflight', () => {
         await startMode('autopilot', 'run strict lifecycle', 5, wd);
         await updateModeState('autopilot', { current_phase: 'code-review' }, wd);
         await writeActiveUltragoal(wd);
+        const canonicalPath = join(wd, '.omx', 'state', 'skill-active-state.json');
+        await rm(canonicalPath);
 
         await assert.rejects(
           () => preflightTeamModeStart(wd),
           /nested_autopilot_team_requires_active_ultragoal_child/,
         );
+        const projection = JSON.parse(await readFile(canonicalPath, 'utf-8')) as { skill?: unknown };
+        assert.equal(projection.skill, 'autopilot');
 
         await updateModeState('autopilot', { current_phase: 'ultragoal' }, wd);
         await rm(join(wd, '.omx', 'ultragoal'), { recursive: true, force: true });
@@ -96,7 +119,7 @@ describe('team mode compatibility preflight', () => {
     });
   });
 
-  it('rejects canonical-only Autopilot before Team runtime state can mutate', async () => {
+  it('self-heals canonical-only Autopilot without treating the projection as authority', async () => {
     await withIsolatedStateEnv(async () => {
       const wd = await mkdtemp(join(tmpdir(), 'omx-team-autopilot-canonical-only-'));
       try {
@@ -115,14 +138,12 @@ describe('team mode compatibility preflight', () => {
           }],
         }, null, 2));
         await writeActiveUltragoal(wd);
-        const before = await readFile(canonicalPath, 'utf-8');
 
-        await assert.rejects(
-          () => preflightTeamModeStart(wd),
-          /nested_autopilot_team_requires_active_ultragoal_child/,
-        );
+        const preflight = await preflightTeamModeStart(wd);
 
-        assert.equal(await readFile(canonicalPath, 'utf-8'), before);
+        assert.deepEqual(preflight.workflowTransition.currentModes, []);
+        const projection = JSON.parse(await readFile(canonicalPath, 'utf-8')) as { active?: unknown };
+        assert.equal(projection.active, false);
         assert.equal(await readModeState('team', wd), null);
         assert.equal(await readFile(join(stateDir, 'autopilot-state.json'), 'utf-8').catch(() => null), null);
         assert.equal(await readFile(join(stateDir, 'team-state.json'), 'utf-8').catch(() => null), null);
