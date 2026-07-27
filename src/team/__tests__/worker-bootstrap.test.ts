@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile, rm, mkdir } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
+import { execFileSync } from "node:child_process";
 import {
   generateWorkerOverlay,
   applyWorkerOverlay,
@@ -1371,6 +1372,79 @@ describe("worker bootstrap", () => {
       assert.equal(restored, "# Base tracked AGENTS\n\nMUST_PRESERVE_PROJECT_GUIDANCE_SENTINEL\n");
     } finally {
       await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves tracked worker edits instead of restoring generated root AGENTS", async () => {
+    const worktree = await mkdtemp(join(tmpdir(), "omx-worker-root-agents-tracked-edit-"));
+    try {
+      execFileSync("git", ["init"], { cwd: worktree });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: worktree });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: worktree });
+      await writeFile(join(worktree, "AGENTS.md"), "# Original\n", "utf8");
+      execFileSync("git", ["add", "AGENTS.md"], { cwd: worktree });
+      execFileSync("git", ["commit", "-m", "initial"], { cwd: worktree });
+
+      await writeWorkerWorktreeRootAgentsFile({
+        teamName: "tracked-edit-team",
+        workerName: "worker-1",
+        workerRole: "writer",
+        rolePromptContent: "Writer",
+        teamStateRoot: join(worktree, ".omx", "state"),
+        leaderCwd: worktree,
+        worktreePath: worktree,
+      });
+      await writeFile(join(worktree, "AGENTS.md"), "# Worker edit\n", "utf8");
+
+      await assert.rejects(
+        removeWorkerWorktreeRootAgentsFile(
+          "tracked-edit-team",
+          "worker-1",
+          join(worktree, ".omx", "state"),
+          worktree,
+        ),
+        /worker_root_agents_modified/,
+      );
+      assert.equal(await readFile(join(worktree, "AGENTS.md"), "utf8"), "# Worker edit\n");
+      assert.match(execFileSync("git", ["status", "--short"], { cwd: worktree, encoding: "utf8" }), /M AGENTS\.md/);
+    } finally {
+      await rm(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves untracked worker root AGENTS edits", async () => {
+    const worktree = await mkdtemp(join(tmpdir(), "omx-worker-root-agents-untracked-edit-"));
+    try {
+      execFileSync("git", ["init"], { cwd: worktree });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: worktree });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: worktree });
+      await writeFile(join(worktree, "README.md"), "root\n", "utf8");
+      execFileSync("git", ["add", "README.md"], { cwd: worktree });
+      execFileSync("git", ["commit", "-m", "initial"], { cwd: worktree });
+
+      await writeWorkerWorktreeRootAgentsFile({
+        teamName: "untracked-edit-team",
+        workerName: "worker-1",
+        workerRole: "writer",
+        rolePromptContent: "Writer",
+        teamStateRoot: join(worktree, ".omx", "state"),
+        leaderCwd: worktree,
+        worktreePath: worktree,
+      });
+      await writeFile(join(worktree, "AGENTS.md"), "# Worker untracked edit\n", "utf8");
+
+      await assert.rejects(
+        removeWorkerWorktreeRootAgentsFile(
+          "untracked-edit-team",
+          "worker-1",
+          join(worktree, ".omx", "state"),
+          worktree,
+        ),
+        /worker_root_agents_modified/,
+      );
+      assert.equal(await readFile(join(worktree, "AGENTS.md"), "utf8"), "# Worker untracked edit\n");
+    } finally {
+      await rm(worktree, { recursive: true, force: true });
     }
   });
 

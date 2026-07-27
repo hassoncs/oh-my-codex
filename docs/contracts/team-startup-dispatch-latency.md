@@ -2,6 +2,8 @@
 
 Date: 2026-04-30
 
+Closure update: 2026-07-27
+
 Review lane: worker-3
 
 ## Scope
@@ -27,8 +29,10 @@ between pane creation and the first trigger.
 4. The default dispatch policy uses `hook_preferred_with_fallback`, so startup
    inbox dispatch is first queued for the notify hook and then waits for a
    receipt before falling back to direct tmux send.
-5. Startup dispatch can additionally wait for `waitForWorkerStartupEvidence()`
-   before treating the first trigger as settled.
+5. A transport success is provisional. Codex and Claude workers must emit
+   startup evidence after the hook/direct fallback path before startup settles.
+6. All worker attempts settle before `startTeam()` reports the lowest-index
+   failure, so one missing-evidence worker cannot prevent sibling notification.
 
 ## Latency phases that must be instrumented
 
@@ -66,19 +70,21 @@ conditions hold:
   existing explicit auto-accept path has handled the prompt first.
 - It does not mark hook delivery as successful merely because a direct trigger
   was attempted.
-- A ready prompt proves only receiver readiness. Startup may settle from ready
-  receiver plus confirmed notification, but task consumption requires a claim,
-  progress state, or qualifying acknowledgement.
-- Lack of startup evidence is reported as recoverable observability when the
-  worker pane is alive; it must not prevent sibling workers from receiving their
-  startup triggers.
+- A ready prompt or writable prompt-worker stdin proves only receiver readiness.
+  Neither can settle Codex or Claude startup without subsequent startup
+  evidence.
+- Missing startup evidence fails startup after fallback, even when the worker is
+  still alive. Sibling startup attempts must still settle first.
+- Failure after mode admission tears down prompt workers, records failed startup
+  state, and preserves changed worker worktrees. Detached work receives a
+  salvage ref before any cleanup can remove it.
 
 ## Review checklist
 
 Use this checklist when reviewing the implementation:
 
 - [ ] Startup timing instrumentation records all phase markers above without
-      making hook/evidence confirmation part of the first-trigger critical path.
+      making evidence confirmation delay the first safe trigger.
 - [ ] The direct-trigger fast path is startup-only and cannot be reached by
       general mailbox or follow-up dispatch.
 - [ ] Trust and bypass prompt guards reuse the same pane-capture safety semantics
@@ -87,6 +93,10 @@ Use this checklist when reviewing the implementation:
       `delivered`, and `failed`; timing logs are supporting evidence only.
 - [ ] Existing `hook_preferred_with_fallback` mailbox behavior is unchanged for
       non-startup messages.
+- [ ] Prompt-worker stdin notification remains transport-only; Codex and Claude
+      require startup evidence after fallback.
+- [ ] Failed admitted startup preserves worker edits and tears down started
+      prompt workers.
 - [ ] Tests isolate readiness latency, hook receipt/evidence latency, and the
       startup fast path separately so failures identify the phase that regressed.
 
@@ -104,6 +114,10 @@ Focused coverage should include:
    existing hook-preferred/fallback behavior outside startup.
 5. A multi-worker startup test proving worker-1 evidence delay does not block
    worker-2 from receiving a first trigger.
+6. A prompt-worker test proving writable stdin without startup evidence rejects
+   startup with a typed `*_startup_no_evidence_after_fallback` reason.
+7. A failed-startup test proving tracked and untracked worker edits survive in
+   the retained worktree and salvage ref while prompt workers are terminated.
 
 ## Known review risks
 
@@ -116,3 +130,6 @@ Focused coverage should include:
 - Startup evidence differs by worker CLI: Codex ACK-only messages are not enough
   to settle startup, while Claude leader ACK can be evidence. Reviewers should
   keep this distinction when interpreting timing logs.
+- Worktree cleanup must compare against the persisted provisioning base ref, not
+  current leader HEAD. Otherwise concurrent leader commits can make an unchanged
+  detached worker look dirty or hide worker advancement.

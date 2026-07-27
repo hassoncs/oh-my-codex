@@ -5,6 +5,7 @@
 
 import { readFile, writeFile, mkdir, readdir } from 'fs/promises';
 import { existsSync } from 'fs';
+import { join } from 'node:path';
 import { withModeRuntimeContext } from '../state/mode-state-context.js';
 import {
   isTrackedWorkflowMode,
@@ -28,7 +29,6 @@ import {
   getBaseStateDir,
   getReadScopedStateDirs,
   getReadScopedStatePaths,
-  getStatePath,
   resolveStateScope,
 } from '../mcp/state-paths.js';
 import { completeRalplanSession, validateRalplanTerminalConsensus } from '../state/operations.js';
@@ -185,8 +185,16 @@ export async function startMode(
   projectRoot?: string,
   options: StartModeOptions = {},
 ): Promise<ModeState> {
-  const scope = await resolveStateScope(projectRoot);
-  const baseStateDir = getBaseStateDir(projectRoot);
+  const resolvedScope = await resolveStateScope(projectRoot);
+  const baseStateDir = options.workflowLockLease?.baseStateDir ?? getBaseStateDir(projectRoot);
+  const scope = options.workflowLockLease
+    ? {
+      ...resolvedScope,
+      stateDir: resolvedScope.sessionId
+        ? join(baseStateDir, 'sessions', resolvedScope.sessionId)
+        : baseStateDir,
+    }
+    : resolvedScope;
   if (isTrackedWorkflowMode(mode) && !options.workflowLockLease) {
     return withWorkflowStateLock(
       baseStateDir,
@@ -233,8 +241,8 @@ export async function startMode(
 
     const withContext = withModeRuntimeContext({}, stateBase) as ModeState;
     const state = normalizeModeStateOrThrow(mode, withContext);
-    await writeFile(getStatePath(mode, projectRoot, scope.sessionId), JSON.stringify(state, null, 2));
-    await syncRunStateFromModeState(state, projectRoot, scope.sessionId);
+    await writeFile(join(scope.stateDir, `${mode}-state.json`), JSON.stringify(state, null, 2));
+    await syncRunStateFromModeState(state, projectRoot, scope.sessionId, scope.stateDir);
     if (isTrackedWorkflowMode(mode)) {
       await syncCanonicalSkillStateForMode({
         cwd: projectRoot ?? process.cwd(),
@@ -341,8 +349,16 @@ export async function updateModeState(
   explicitSessionId?: string,
   options: UpdateModeStateOptions = {},
 ): Promise<ModeState> {
-  const scope = await resolveStateScope(projectRoot, explicitSessionId);
-  const baseStateDir = getBaseStateDir(projectRoot);
+  const resolvedScope = await resolveStateScope(projectRoot, explicitSessionId);
+  const baseStateDir = options.workflowLockLease?.baseStateDir ?? getBaseStateDir(projectRoot);
+  const scope = options.workflowLockLease
+    ? {
+      ...resolvedScope,
+      stateDir: resolvedScope.sessionId
+        ? join(baseStateDir, 'sessions', resolvedScope.sessionId)
+        : baseStateDir,
+    }
+    : resolvedScope;
   if (isTrackedWorkflowMode(mode) && !options.workflowLockLease) {
     return withWorkflowStateLock(
       baseStateDir,
@@ -354,11 +370,13 @@ export async function updateModeState(
     );
   }
   const run = async (): Promise<ModeState> => {
-    const current = mode === 'ralph' && scope.sessionId
-    ? await readModeStateForActiveDecision(mode, scope.sessionId, projectRoot)
-    : explicitSessionId
-      ? await readModeStateForSession(mode, explicitSessionId, projectRoot)
-      : await readModeState(mode, projectRoot);
+    const current = options.workflowLockLease
+      ? await readModeStateFromPaths([join(scope.stateDir, `${mode}-state.json`)])
+      : mode === 'ralph' && scope.sessionId
+        ? await readModeStateForActiveDecision(mode, scope.sessionId, projectRoot)
+        : explicitSessionId
+          ? await readModeStateForSession(mode, explicitSessionId, projectRoot)
+          : await readModeState(mode, projectRoot);
     if (!current) throw new Error(`Mode ${mode} not found`);
     await mkdir(scope.stateDir, { recursive: true });
 
@@ -436,8 +454,8 @@ export async function updateModeState(
       }
     }
     const updated = withModeRuntimeContext(current, normalizedBase) as ModeState;
-    await writeFile(getStatePath(mode, projectRoot, scope.sessionId), JSON.stringify(updated, null, 2));
-    await syncRunStateFromModeState(updated, projectRoot, scope.sessionId);
+    await writeFile(join(scope.stateDir, `${mode}-state.json`), JSON.stringify(updated, null, 2));
+    await syncRunStateFromModeState(updated, projectRoot, scope.sessionId, scope.stateDir);
     if (isTrackedWorkflowMode(mode)) {
       const cwd = projectRoot ?? process.cwd();
       const ralplanCompletionHandled = mode === 'ralplan' && await completeRalplanSession({

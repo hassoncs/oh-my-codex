@@ -4,14 +4,11 @@ import { dirname, join } from 'node:path';
 
 import { withModeRuntimeContext } from './mode-state-context.js';
 import {
-  getAllScopedStateDirs,
-  getAllScopedStatePaths,
   getAuthoritativeActiveStateDirs,
   getBaseStateDir,
   getBaseStateDirWithSource,
   getReadScopedStateDirs,
   getReadScopedStatePaths,
-  getStateDir,
   getStatePath,
   resolveRuntimeStateScope,
   resolveStateScope,
@@ -235,10 +232,11 @@ async function initializeStateEnvironment(
   cwd: string,
   effectiveSessionId?: string,
   rootSource?: StateRootSource,
+  baseStateDir: string = getBaseStateDir(cwd),
 ): Promise<void> {
-  await mkdir(getStateDir(cwd), { recursive: true });
+  await mkdir(baseStateDir, { recursive: true });
   if (effectiveSessionId) {
-    await mkdir(getStateDir(cwd, effectiveSessionId), { recursive: true });
+    await mkdir(join(baseStateDir, 'sessions', effectiveSessionId), { recursive: true });
   }
   if (rootSource === 'team-env') return;
   const { ensureTmuxHookInitialized } = await import('../cli/tmux-hook.js');
@@ -570,7 +568,7 @@ export async function completeRalplanSession(options: {
   const rootScopeCompletion = !sessionId;
   const nowIso = new Date().toISOString();
   const rootState = buildRalplanTerminalState(options.state, sessionId, nowIso);
-  const rootStatePath = getStatePath('ralplan', options.cwd);
+  const rootStatePath = join(options.baseStateDir, 'ralplan-state.json');
   const existingRootState = await readJsonRecordIfExists(rootStatePath);
   const shouldWriteRootState = shouldWriteRootRalplanTerminalState(existingRootState, sessionId);
 
@@ -579,7 +577,7 @@ export async function completeRalplanSession(options: {
   }
   if (sessionId) {
     await writeAtomicJson(
-      getStatePath('ralplan', options.cwd, sessionId),
+      join(options.baseStateDir, 'sessions', sessionId, 'ralplan-state.json'),
       buildRalplanTerminalState(options.state, sessionId, nowIso),
     );
   }
@@ -719,12 +717,13 @@ function isActiveDetailWorkflowState(state: Record<string, unknown>): boolean {
 }
 
 async function readSessionDetailTransitionModes(
-  cwd: string,
+  baseStateDir: string,
   sessionId: string | undefined,
   requestedMode: TrackedWorkflowMode,
 ): Promise<TrackedWorkflowMode[] | undefined> {
   if (!sessionId || requestedMode !== 'ralplan') return undefined;
-  const autopilotPath = getStatePath('autopilot', cwd, sessionId);
+  const sessionStateDir = join(baseStateDir, 'sessions', sessionId);
+  const autopilotPath = join(sessionStateDir, 'autopilot-state.json');
   if (existsSync(autopilotPath)) {
     try {
       const state = JSON.parse(await readFile(autopilotPath, 'utf-8')) as Record<string, unknown>;
@@ -734,7 +733,7 @@ async function readSessionDetailTransitionModes(
     }
   }
 
-  const deepInterviewPath = getStatePath('deep-interview', cwd, sessionId);
+  const deepInterviewPath = join(sessionStateDir, 'deep-interview-state.json');
   if (!existsSync(deepInterviewPath)) return undefined;
 
   try {
@@ -780,10 +779,8 @@ export async function executeStateOperation(
         const stateScope = await resolveStateScope(cwd, explicitSessionId);
         const effectiveSessionId = stateScope.sessionId;
         const { baseStateDir, rootSource } = getBaseStateDirWithSource(cwd);
-        await initializeStateEnvironment(cwd, effectiveSessionId, rootSource);
-
         const mode = validateStateModeSegment(rawArgs.mode);
-        const path = getStatePath(mode, cwd, effectiveSessionId);
+        let path = getStatePath(mode, cwd, effectiveSessionId);
         const {
           mode: _mode,
           workingDirectory: _workingDirectory,
@@ -796,8 +793,14 @@ export async function executeStateOperation(
         let ensureRalphArtifacts = false;
 
         await withWorkflowStateLock(baseStateDir, cwd, async (lockLease) => {
+          await initializeStateEnvironment(cwd, effectiveSessionId, rootSource, lockLease.baseStateDir);
           try {
-            await withWorkflowStateTransaction(baseStateDir, cwd, effectiveSessionId, async () => {
+            await withWorkflowStateTransaction(baseStateDir, cwd, effectiveSessionId, async (transactionLease) => {
+              const canonicalBaseStateDir = transactionLease.baseStateDir;
+              path = join(
+                effectiveSessionId ? join(canonicalBaseStateDir, 'sessions', effectiveSessionId) : canonicalBaseStateDir,
+                `${mode}-state.json`,
+              );
               await withStateWriteLock(path, async () => {
           let existing: Record<string, unknown> = {};
           if (existsSync(path)) {
@@ -946,7 +949,7 @@ export async function executeStateOperation(
             const gate = await canAdvanceAutopilotDeepInterviewToRalplan({
               cwd,
               sessionId: effectiveSessionId,
-              baseStateDir,
+              baseStateDir: canonicalBaseStateDir,
               currentState: existing as Record<string, unknown>,
               nextState: mergedRaw,
             });
@@ -984,7 +987,7 @@ export async function executeStateOperation(
           }
 
           if (isTrackedWorkflowMode(mode) && mergedRaw.active === true) {
-            const activeCanonicalModes = await readCanonicalActiveWorkflowModes(baseStateDir, effectiveSessionId);
+            const activeCanonicalModes = await readCanonicalActiveWorkflowModes(canonicalBaseStateDir, effectiveSessionId);
             const canonicalDecision = evaluateWorkflowTransition(activeCanonicalModes, mode);
             if (!canonicalDecision.allowed && canonicalDecision.denialReason === 'rollback') {
               validationError = buildWorkflowTransitionError(activeCanonicalModes, mode, 'write');
@@ -994,7 +997,7 @@ export async function executeStateOperation(
               ? (
                 activeCanonicalModes.length > 0
                   ? activeCanonicalModes
-                  : await readSessionDetailTransitionModes(cwd, effectiveSessionId, mode)
+                  : await readSessionDetailTransitionModes(canonicalBaseStateDir, effectiveSessionId, mode)
               )
               : undefined;
             try {
@@ -1002,7 +1005,7 @@ export async function executeStateOperation(
                 action: 'write',
                 sessionId: effectiveSessionId,
                 source: 'state-operations',
-                baseStateDir,
+                baseStateDir: canonicalBaseStateDir,
                 workflowLockLease: lockLease,
                 ...(transitionCurrentModes ? { currentModes: transitionCurrentModes } : {}),
               });
@@ -1024,7 +1027,7 @@ export async function executeStateOperation(
                 const state = await readSkillActiveState(path);
                 if (state) {
                   await writeSkillActiveStateCopiesForStateDir(
-                    baseStateDir,
+                    canonicalBaseStateDir,
                     state,
                     effectiveSessionId,
                     undefined,
@@ -1033,14 +1036,14 @@ export async function executeStateOperation(
                 }
               } else {
                 if (mode === 'ralph' && ensureRalphArtifacts) {
-                  await ensureCanonicalRalphArtifacts(cwd, effectiveSessionId);
+                  await ensureCanonicalRalphArtifacts(cwd, effectiveSessionId, canonicalBaseStateDir);
                 }
                 const data = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
                 const ralplanCompletionHandled = mode === 'ralplan'
                   && !isApprovedUnsupportedNativeNonCleanRecoveryState(data, { cwd, sessionId: effectiveSessionId })
                   && await completeRalplanSession({
                     cwd,
-                    baseStateDir,
+                    baseStateDir: canonicalBaseStateDir,
                     state: data,
                     explicitSessionId: effectiveSessionId,
                     requireNativeSubagents: true,
@@ -1048,7 +1051,7 @@ export async function executeStateOperation(
                 if (!ralplanCompletionHandled) {
                   await syncCanonicalSkillStateForMode({
                     cwd,
-                    baseStateDir,
+                    baseStateDir: canonicalBaseStateDir,
                     mode,
                     active: data.active === true,
                     currentPhase: typeof data.current_phase === 'string' ? data.current_phase : undefined,
@@ -1088,15 +1091,24 @@ export async function executeStateOperation(
         const stateScope = await resolveStateScope(cwd, explicitSessionId);
         const effectiveSessionId = stateScope.sessionId;
         const { baseStateDir, rootSource } = getBaseStateDirWithSource(cwd);
-        await initializeStateEnvironment(cwd, effectiveSessionId, rootSource);
-
         const mode = validateStateModeSegment(rawArgs.mode);
         const allSessions = rawArgs.all_sessions === true;
         return await withWorkflowStateLock(baseStateDir, cwd, async (lockLease) => {
+          const lockedBaseStateDir = lockLease.baseStateDir;
+          await initializeStateEnvironment(cwd, effectiveSessionId, rootSource, lockedBaseStateDir);
+          const sessionRoot = join(lockedBaseStateDir, 'sessions');
+          const sessionDirs = allSessions
+            ? (await readdir(sessionRoot, { withFileTypes: true }).catch(() => []))
+              .filter((entry) => entry.isDirectory())
+              .map((entry) => join(sessionRoot, entry.name))
+            : [];
+          const scopedDirs = allSessions ? [lockedBaseStateDir, ...sessionDirs] : [];
           const paths = allSessions
-            ? await getAllScopedStatePaths(mode, cwd)
-            : [getStatePath(mode, cwd, effectiveSessionId)];
-          const scopedDirs = allSessions ? await getAllScopedStateDirs(cwd) : [];
+            ? scopedDirs.map((dir) => join(dir, `${mode}-state.json`))
+            : [join(
+              effectiveSessionId ? join(lockedBaseStateDir, 'sessions', effectiveSessionId) : lockedBaseStateDir,
+              `${mode}-state.json`,
+            )];
           const transactionPaths = [
             ...paths,
             ...scopedDirs.flatMap((dir) => [
@@ -1106,31 +1118,32 @@ export async function executeStateOperation(
           ];
           if (!allSessions && effectiveSessionId) {
             transactionPaths.push(
-              join(baseStateDir, 'native-stop-state.json'),
-              join(baseStateDir, 'sessions', effectiveSessionId, 'native-stop-state.json'),
+              join(lockedBaseStateDir, 'native-stop-state.json'),
+              join(lockedBaseStateDir, 'sessions', effectiveSessionId, 'native-stop-state.json'),
             );
           }
 
-          return withWorkflowStateTransaction(baseStateDir, cwd, effectiveSessionId, async () => {
+          return withWorkflowStateTransaction(baseStateDir, cwd, effectiveSessionId, async (transactionLease) => {
+            const canonicalBaseStateDir = transactionLease.baseStateDir;
             if (!allSessions) {
               const [path] = paths;
               if (
                 mode !== SKILL_ACTIVE_STATE_MODE
                 && effectiveSessionId
-                && existsSync(getStatePath(mode, cwd))
+                && existsSync(join(canonicalBaseStateDir, `${mode}-state.json`))
               ) {
                 await writeClearedSessionScopedModeState(path!, mode, effectiveSessionId);
               } else if (existsSync(path!)) {
                 await unlink(path!);
               }
               const nativeStopCleared = effectiveSessionId
-                ? await clearSessionNativeStopState(baseStateDir, effectiveSessionId)
+                ? await clearSessionNativeStopState(canonicalBaseStateDir, effectiveSessionId)
                 : [];
               await dependencies.onMutationCommitted?.('clear-detail-written', mode);
               if (mode !== SKILL_ACTIVE_STATE_MODE) {
                 await syncCanonicalSkillStateForMode({
                   cwd,
-                  baseStateDir,
+                  baseStateDir: canonicalBaseStateDir,
                   mode,
                   active: false,
                   sessionId: effectiveSessionId,
@@ -1158,7 +1171,7 @@ export async function executeStateOperation(
             if (mode !== SKILL_ACTIVE_STATE_MODE) {
               await syncCanonicalSkillStateForMode({
                 cwd,
-                baseStateDir,
+                baseStateDir: canonicalBaseStateDir,
                 mode,
                 active: false,
                 source: 'state-operations',

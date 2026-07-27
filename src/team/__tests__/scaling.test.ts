@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { mkdtemp, rm, readFile, writeFile, mkdir, chmod, readdir } from 'fs/promises';
-import { join, relative } from 'path';
+import { dirname, join, relative } from 'path';
 import { tmpdir } from 'os';
 import { existsSync, readFileSync } from 'fs';
 import {
@@ -1784,6 +1784,9 @@ exit 0
           '  split-window)',
           '    echo "%41"',
           '    ;;',
+          '  show-option)',
+          '    echo "team:scale-up-detached-worktree"',
+          '    ;;',
           '  list-panes)',
           '    echo "45454"',
           '    ;;',
@@ -1852,10 +1855,48 @@ exit 0
       assert.equal(worker?.working_dir, worker?.worktree_path);
       assert.equal(worker?.worktree_detached, true);
       assert.equal(worker?.worktree_created, true);
-      assert.equal(existsSync(worker?.worktree_path as string), true);
-      assert.throws(
-        () => execFileSync('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: worker?.worktree_path, stdio: 'pipe' }),
+      assert.equal(
+        worker?.worktree_base_ref,
+        execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf-8' }).trim(),
       );
+      const workerPath = worker?.worktree_path as string;
+      assert.equal(existsSync(workerPath), true);
+      assert.throws(
+        () => execFileSync('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: workerPath, stdio: 'pipe' }),
+      );
+
+      const workerOutput = join(workerPath, 'worker-output.txt');
+      await writeFile(workerOutput, 'preserve me\n');
+      await writeWorkerStatus(teamName, 'worker-2', {
+        state: 'working',
+        current_task_id: 'scale-down-preserve',
+        updated_at: '2026-07-27T00:00:00.000Z',
+      }, repo);
+      await writeFile(tmuxLogPath, '');
+      const preserved = await scaleDown(
+        teamName,
+        repo,
+        { workerNames: ['worker-2'], force: true },
+        { OMX_TEAM_SCALING_ENABLED: '1' },
+      );
+      assert.equal(preserved.ok, false);
+      if (preserved.ok) return;
+      assert.match(preserved.error, /scale_down_worktree_preserved/);
+      assert.equal(existsSync(workerOutput), true);
+      assert.ok((await readTeamConfig(teamName, repo))?.workers.some((entry) => entry.name === 'worker-2'));
+      assert.equal((await readWorkerStatus(teamName, 'worker-2', repo)).state, 'working');
+      assert.doesNotMatch(await readFile(tmuxLogPath, 'utf-8'), /kill-pane -t %41/);
+
+      await rm(workerOutput);
+      const removed = await scaleDown(
+        teamName,
+        repo,
+        { workerNames: ['worker-2'], force: true },
+        { OMX_TEAM_SCALING_ENABLED: '1' },
+      );
+      assert.equal(removed.ok, true);
+      assert.equal(existsSync(workerPath), false);
+      assert.equal((await readTeamConfig(teamName, repo))?.workers.some((entry) => entry.name === 'worker-2'), false);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
@@ -1992,6 +2033,39 @@ describe('scaleDown', () => {
     }
   });
 
+  it('fails before teardown when detached worktree baseline is missing', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-baseline-missing-'));
+    try {
+      await initTeamState('baseline-missing', 'task', 'executor', 2, cwd);
+      const config = await readTeamConfig('baseline-missing', cwd);
+      assert.ok(config);
+      if (!config) return;
+      const workerPath = join(cwd, 'worker-2');
+      await mkdir(workerPath);
+      Object.assign(config.workers[1]!, {
+        worktree_created: true,
+        worktree_detached: true,
+        worktree_repo_root: cwd,
+        worktree_path: workerPath,
+      });
+      await saveTeamConfig(config, cwd);
+
+      const result = await scaleDown(
+        'baseline-missing',
+        cwd,
+        { workerNames: ['worker-2'], force: true },
+        { OMX_TEAM_SCALING_ENABLED: '1' },
+      );
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.equal(result.error, 'scale_down_worktree_baseline_missing:worker-2');
+      assert.equal(existsSync(workerPath), true);
+      assert.ok((await readTeamConfig('baseline-missing', cwd))?.workers.some((worker) => worker.name === 'worker-2'));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('returns error when trying to remove all workers', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-all-'));
     try {
@@ -2075,7 +2149,13 @@ describe('scaleDown worktree AGENTS cleanup', () => {
       await mkdir(join(cwd, '.omx', 'state', 'team', 'scale-down-worktree', 'workers', 'worker-2'), { recursive: true });
       await writeFile(
         join(cwd, '.omx', 'state', 'team', 'scale-down-worktree', 'workers', 'worker-2', 'root-agents-backup.json'),
-        JSON.stringify({ existed: true, tracked: false, previousContent: '# Tracked root instructions\n' }, null, 2),
+        JSON.stringify({
+          existed: true,
+          tracked: false,
+          previousContent: '# Tracked root instructions\n',
+          ownershipToken: 'test-owner',
+          generatedContent: '# Generated runtime instructions\n',
+        }, null, 2),
         'utf8',
       );
       await writeFile(join(worktree, 'AGENTS.md'), '# Generated runtime instructions\n', 'utf8');
@@ -2104,9 +2184,29 @@ describe('scaleDown worktree AGENTS cleanup', () => {
 });
 
 describe('scaleDown teardown hardening', () => {
-  it('scaleDown removes workers when pane is already dead or missing', async () => {
+  it('treats a typed missing pane as an already terminated worker', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-dead-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-dead-tmux-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
     try {
+      await writeFile(
+        tmuxStubPath,
+        `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+if [ "\${1:-}" = "show-option" ]; then
+  echo "can't find pane: %404" >&2
+  exit 2
+fi
+exit 0
+`,
+      );
+      await writeFile(tmuxLogPath, '');
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+
       await initTeamState('dead-pane', 'task', 'executor', 2, cwd);
       const config = await readTeamConfig('dead-pane', cwd);
       assert.ok(config);
@@ -2128,8 +2228,295 @@ describe('scaleDown teardown hardening', () => {
       const updated = await readTeamConfig('dead-pane', cwd);
       assert.ok(updated);
       assert.equal(updated?.workers.some((worker) => worker.name === 'worker-2'), false);
+      assert.doesNotMatch(await readFile(tmuxLogPath, 'utf-8'), /kill-pane/);
     } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
       await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when pane ownership cannot be read for a live target', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-owner-read-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-owner-read-tmux-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+    try {
+      await writeFile(
+        tmuxStubPath,
+        `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+if [ "\${1:-}" = "show-option" ]; then
+  echo "owner read failed" >&2
+  exit 2
+fi
+exit 0
+`,
+      );
+      await writeFile(tmuxLogPath, '');
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+
+      await initTeamState('owner-read', 'task', 'executor', 2, cwd);
+      const config = await readTeamConfig('owner-read', cwd);
+      assert.ok(config);
+      if (!config) return;
+      config.workers[1]!.pane_id = '%22';
+      await saveTeamConfig(config, cwd);
+
+      const result = await scaleDown(
+        'owner-read',
+        cwd,
+        { workerNames: ['worker-2'], force: true },
+        { OMX_TEAM_SCALING_ENABLED: '1' },
+      );
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.match(result.error, /^scale_down_pane_owner_read_failed:worker-2:%22:/);
+      assert.equal((await readTeamConfig('owner-read', cwd))?.workers.some((worker) => worker.name === 'worker-2'), true);
+      assert.doesNotMatch(await readFile(tmuxLogPath, 'utf-8'), /kill-pane/);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when pane belongs to another team', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-foreign-pane-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-foreign-pane-tmux-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+    try {
+      await writeFile(
+        tmuxStubPath,
+        `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+if [ "\${1:-}" = "show-option" ]; then
+  echo "team:another-team"
+fi
+exit 0
+`,
+      );
+      await writeFile(tmuxLogPath, '');
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+
+      await initTeamState('foreign-pane', 'task', 'executor', 2, cwd);
+      const config = await readTeamConfig('foreign-pane', cwd);
+      assert.ok(config);
+      if (!config) return;
+      config.workers[1]!.pane_id = '%22';
+      await saveTeamConfig(config, cwd);
+
+      const result = await scaleDown(
+        'foreign-pane',
+        cwd,
+        { workerNames: ['worker-2'], force: true },
+        { OMX_TEAM_SCALING_ENABLED: '1' },
+      );
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.equal(result.error, 'scale_down_pane_owner_mismatch:worker-2:%22');
+      assert.equal((await readTeamConfig('foreign-pane', cwd))?.workers.some((worker) => worker.name === 'worker-2'), true);
+      assert.doesNotMatch(await readFile(tmuxLogPath, 'utf-8'), /kill-pane/);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it('checkpoints hidden AGENTS edits before preserving dirty worktree ownership', async () => {
+    const repo = await initRepo();
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-hidden-agents-tmux-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+    try {
+      await writeFile(join(repo, 'AGENTS.md'), '# Original instructions\n');
+      execFileSync('git', ['add', 'AGENTS.md'], { cwd: repo, stdio: 'pipe' });
+      execFileSync('git', ['commit', '-m', 'add agents'], { cwd: repo, stdio: 'pipe' });
+      const baseRef = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf-8' }).trim();
+      const worktreePath = join(repo, 'worker-2');
+      execFileSync('git', ['worktree', 'add', '--detach', worktreePath, baseRef], { cwd: repo, stdio: 'pipe' });
+      execFileSync('git', ['update-index', '--skip-worktree', 'AGENTS.md'], { cwd: worktreePath, stdio: 'pipe' });
+      await writeFile(join(worktreePath, 'AGENTS.md'), '# Worker-owned edit\n');
+      const backupPath = execFileSync(
+        'git',
+        ['rev-parse', '--git-path', 'omx/root-agents-backup.json'],
+        { cwd: worktreePath, encoding: 'utf-8' },
+      ).trim();
+      await mkdir(dirname(backupPath), { recursive: true });
+      await writeFile(backupPath, JSON.stringify({
+        existed: true,
+        tracked: true,
+        previousContent: '# Original instructions\n',
+        skipWorktreeApplied: true,
+      }));
+
+      await writeFile(
+        tmuxStubPath,
+        `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+if [ "\${1:-}" = "show-option" ]; then
+  echo "team:hidden-agents"
+fi
+exit 0
+`,
+      );
+      await writeFile(tmuxLogPath, '');
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+
+      await initTeamState('hidden-agents', 'task', 'executor', 2, repo);
+      const config = await readTeamConfig('hidden-agents', repo);
+      assert.ok(config);
+      if (!config) return;
+      Object.assign(config.workers[1]!, {
+        pane_id: '%22',
+        worktree_created: true,
+        worktree_detached: true,
+        worktree_repo_root: repo,
+        worktree_path: worktreePath,
+        worktree_base_ref: baseRef,
+      });
+      await saveTeamConfig(config, repo);
+      await writeWorkerStatus('hidden-agents', 'worker-2', {
+        state: 'working',
+        current_task_id: 'hidden-agents-edit',
+        updated_at: '2026-07-27T00:00:00.000Z',
+      }, repo);
+
+      const result = await scaleDown(
+        'hidden-agents',
+        repo,
+        { workerNames: ['worker-2'], force: true },
+        { OMX_TEAM_SCALING_ENABLED: '1' },
+      );
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.match(result.error, /^scale_down_worktree_preserved:/);
+      assert.equal(await readFile(join(worktreePath, 'AGENTS.md'), 'utf-8'), '# Worker-owned edit\n');
+      assert.match(
+        execFileSync('git', ['ls-files', '-v', '--', 'AGENTS.md'], { cwd: worktreePath, encoding: 'utf-8' }),
+        /^S /,
+      );
+      assert.equal((await readTeamConfig('hidden-agents', repo))?.workers.some((worker) => worker.name === 'worker-2'), true);
+      assert.equal((await readWorkerStatus('hidden-agents', 'worker-2', repo)).state, 'working');
+      assert.doesNotMatch(await readFile(tmuxLogPath, 'utf-8'), /kill-pane/);
+      const salvageRef = execFileSync(
+        'git',
+        [
+          'for-each-ref',
+          '--sort=-creatordate',
+          '--count=1',
+          '--format=%(refname)',
+          'refs/heads/salvage/team-scale-down-hidden-agents-worker-2-*',
+        ],
+        { cwd: repo, encoding: 'utf-8' },
+      ).trim();
+      assert.ok(salvageRef);
+      assert.equal(
+        execFileSync('git', ['show', `${salvageRef}:AGENTS.md`], { cwd: repo, encoding: 'utf-8' }),
+        '# Worker-owned edit\n',
+      );
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(repo, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves worker writes that race after the first worktree check', async () => {
+    const repo = await initRepo();
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-race-tmux-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+    try {
+      const baseRef = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf-8' }).trim();
+      const worktreePath = join(repo, 'worker-2');
+      const racedFile = join(worktreePath, 'after-preflight.txt');
+      execFileSync('git', ['worktree', 'add', '--detach', worktreePath, baseRef], { cwd: repo, stdio: 'pipe' });
+
+      await writeFile(
+        tmuxStubPath,
+        `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "\${1:-}" in
+  show-option)
+    echo "team:post-preflight-race"
+    ;;
+  kill-pane)
+    printf 'late worker edit\\n' > "${racedFile}"
+    ;;
+esac
+exit 0
+`,
+      );
+      await writeFile(tmuxLogPath, '');
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+
+      await initTeamState('post-preflight-race', 'task', 'executor', 2, repo);
+      const config = await readTeamConfig('post-preflight-race', repo);
+      assert.ok(config);
+      if (!config) return;
+      Object.assign(config.workers[1]!, {
+        pane_id: '%22',
+        worktree_created: true,
+        worktree_detached: true,
+        worktree_repo_root: repo,
+        worktree_path: worktreePath,
+        worktree_base_ref: baseRef,
+      });
+      await saveTeamConfig(config, repo);
+
+      const result = await scaleDown(
+        'post-preflight-race',
+        repo,
+        { workerNames: ['worker-2'], force: true },
+        { OMX_TEAM_SCALING_ENABLED: '1' },
+      );
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.match(result.error, /^scale_down_worktree_preserved_after_quiesce:/);
+      assert.equal(await readFile(racedFile, 'utf-8'), 'late worker edit\n');
+      assert.equal((await readTeamConfig('post-preflight-race', repo))?.workers.some((worker) => worker.name === 'worker-2'), true);
+      assert.equal((await readWorkerStatus('post-preflight-race', 'worker-2', repo)).state, 'failed');
+      assert.match(await readFile(tmuxLogPath, 'utf-8'), /kill-pane -t %22/);
+      const salvageRef = execFileSync(
+        'git',
+        [
+          'for-each-ref',
+          '--sort=-creatordate',
+          '--count=1',
+          '--format=%(refname)',
+          'refs/heads/salvage/team-scale-down-post-preflight-race-worker-2-*',
+        ],
+        { cwd: repo, encoding: 'utf-8' },
+      ).trim();
+      assert.ok(salvageRef);
+      assert.equal(
+        execFileSync('git', ['show', `${salvageRef}:after-preflight.txt`], { cwd: repo, encoding: 'utf-8' }),
+        'late worker edit\n',
+      );
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(repo, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
     }
   });
 
@@ -2145,6 +2532,9 @@ describe('scaleDown teardown hardening', () => {
         `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
+if [ "\${1:-}" = "show-option" ]; then
+  echo "team:exclusions"
+fi
 exit 0
 `,
       );

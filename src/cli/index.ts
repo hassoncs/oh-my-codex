@@ -67,7 +67,6 @@ import {
 } from "./constants.js";
 import {
   getBaseStateDir,
-  getStateDir,
   listModeStateFilesWithScopePreference,
   type ModeStateFileRef,
 } from "../mcp/state-paths.js";
@@ -4832,6 +4831,7 @@ async function cleanupPostLaunchModeStateFilesLocked(
   sessionId: string,
   dependencies: PostLaunchModeCleanupDependencies = {},
   scopedFiles?: ReadonlyMap<string, readonly string[]>,
+  baseStateDir: string = getBaseStateDir(cwd),
 ): Promise<void> {
   const readdir =
     dependencies.readdir ?? (await import("fs/promises")).readdir;
@@ -4839,17 +4839,16 @@ async function cleanupPostLaunchModeStateFilesLocked(
     dependencies.writeFile ?? (await import("fs/promises")).writeFile;
   const writeWarn = dependencies.writeWarn ?? console.warn;
   const now = dependencies.now ?? (() => new Date());
-  const scopedDirs = sessionId
-    ? [getStateDir(cwd, sessionId)]
-    : [getBaseStateDir(cwd)];
-  const rootStateDir = getBaseStateDir(cwd);
+  const sessionStateDir = sessionId ? join(baseStateDir, 'sessions', sessionId) : null;
+  const scopedDirs = sessionStateDir ? [sessionStateDir] : [baseStateDir];
+  const rootStateDir = baseStateDir;
   const rootSkillActiveStateBeforeCleanup = sessionId
     ? await readSkillActiveState(getSkillActiveStatePathsForStateDir(rootStateDir).rootPath)
     : null;
   let preserveSkillActiveForReviewPendingAutopilot = false;
 
   for (const stateDir of scopedDirs) {
-    const targetSessionId = stateDir === getStateDir(cwd, sessionId)
+    const targetSessionId = stateDir === sessionStateDir
       ? sessionId
       : undefined;
     const files = scopedFiles?.get(stateDir) ?? await readdir(stateDir).catch(() => [] as string[]);
@@ -4885,6 +4884,7 @@ async function cleanupPostLaunchModeStateFilesLocked(
                 buildRecoveredPostLaunchModeState(mode, completedAt),
                 cwd,
                 targetSessionId,
+                stateDir,
               );
             }
             if (isTrackedWorkflowMode(mode)) {
@@ -4941,7 +4941,7 @@ async function cleanupPostLaunchModeStateFilesLocked(
           }
         }
         if (mode !== SKILL_ACTIVE_STATE_MODE) {
-          await syncRunStateFromModeState(result.state, cwd, targetSessionId);
+          await syncRunStateFromModeState(result.state, cwd, targetSessionId, stateDir);
         }
         continue;
       }
@@ -4971,7 +4971,7 @@ async function cleanupPostLaunchModeStateFilesLocked(
           result.state.stop_reason = cleanPostLaunchString(result.state.stop_reason) || "session_exit";
         }
         await writeFile(path, JSON.stringify(result.state, null, 2));
-        await syncRunStateFromModeState(result.state, cwd, targetSessionId);
+        await syncRunStateFromModeState(result.state, cwd, targetSessionId, stateDir);
         if (isTrackedWorkflowMode(mode)) {
           await syncCanonicalSkillStateForMode({
             cwd,
@@ -5026,7 +5026,10 @@ export async function cleanupPostLaunchModeStateFiles(
       sessionId || undefined,
       async (transactionLease) => {
         const readdir = dependencies.readdir ?? (await import("fs/promises")).readdir;
-        const stateDirs = sessionId ? [getStateDir(cwd, sessionId)] : [baseStateDir];
+        const canonicalBaseStateDir = transactionLease.baseStateDir;
+        const stateDirs = sessionId
+          ? [join(canonicalBaseStateDir, 'sessions', sessionId)]
+          : [canonicalBaseStateDir];
         const scopedFiles = new Map<string, string[]>();
         for (const stateDir of stateDirs) {
           const files = await readdir(stateDir).catch(() => [] as string[]);
@@ -5035,7 +5038,13 @@ export async function cleanupPostLaunchModeStateFiles(
             .filter((file) => file.endsWith("-state.json") && file !== "session.json")
             .map((file) => transactionLease.capturePath(join(stateDir, file))));
         }
-        await cleanupPostLaunchModeStateFilesLocked(cwd, sessionId, dependencies, scopedFiles);
+        await cleanupPostLaunchModeStateFilesLocked(
+          cwd,
+          sessionId,
+          dependencies,
+          scopedFiles,
+          canonicalBaseStateDir,
+        );
       },
       [],
       { lockLease },

@@ -341,7 +341,7 @@ const AUTOPILOT_CONTEXT_RECOVERY_REASON_MESSAGES: Record<AutopilotContextRecover
 
 async function ensureSafeAutopilotContextDir(sourceCwd: string): Promise<string> {
   const rootRealPath = await realpath(sourceCwd);
-  const omxDir = join(sourceCwd, '.omx');
+  const omxDir = join(rootRealPath, '.omx');
   await mkdir(omxDir, { recursive: true });
   if ((await lstat(omxDir)).isSymbolicLink()) {
     throw new Error('Unsafe Autopilot context directory: .omx is a symbolic link');
@@ -358,7 +358,7 @@ async function ensureSafeAutopilotContextDir(sourceCwd: string): Promise<string>
   if (relativeToRoot === '' || relativeToRoot.startsWith('..') || isAbsolute(relativeToRoot)) {
     throw new Error('Unsafe Autopilot context directory: resolved path escapes repository root');
   }
-  return contextDir;
+  return contextRealPath;
 }
 
 async function writeUniqueAutopilotContextSnapshot(
@@ -368,7 +368,12 @@ async function writeUniqueAutopilotContextSnapshot(
   body: string,
   transactionLease?: WorkflowStateTransactionLease,
 ): Promise<string> {
-  const contextDir = await ensureSafeAutopilotContextDir(sourceCwd);
+  const contextDir = await ensureSafeAutopilotContextDir(
+    transactionLease ? dirname(dirname(transactionLease.contextRoot)) : sourceCwd,
+  );
+  if (transactionLease && contextDir !== transactionLease.contextRoot) {
+    throw new Error(`workflow_state_transaction_context_root_changed:${sourceCwd}`);
+  }
   const timestamp = utcCompactTimestamp(nowIso);
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const suffix = attempt === 0 ? '' : `-${attempt + 1}`;
@@ -1435,7 +1440,7 @@ export async function recordSkillActivation(
           sourceCwd,
           input.sessionId,
           (transactionLease) => recordSkillActivationLocked(
-            input,
+            { ...input, stateDir: transactionLease.baseStateDir },
             sourceCwd,
             { lockLease, transactionLease, dependencies },
           ),

@@ -1,7 +1,7 @@
 import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -858,6 +858,7 @@ describe('keyword detector skill-active-state lifecycle', () => {
         nowIso: '2026-07-26T00:00:00.000Z',
       });
       const autopilotPath = join(stateDir, 'sessions', sessionId, 'autopilot-state.json');
+      const canonicalAutopilotPath = join(await realpath(stateDir), 'sessions', sessionId, 'autopilot-state.json');
       const before = await readFile(autopilotPath, 'utf-8');
 
       await assert.rejects(
@@ -869,7 +870,7 @@ describe('keyword detector skill-active-state lifecycle', () => {
           nowIso: '2026-07-26T00:01:00.000Z',
         }, {
           writeSkillActiveFile: (async (path: unknown, data: unknown, options?: unknown) => {
-            if (String(path) === autopilotPath) throw new Error('supervised_detail_write_failed');
+            if (String(path) === canonicalAutopilotPath) throw new Error('supervised_detail_write_failed');
             await writeFile(String(path), data as string, options as BufferEncoding);
           }) as typeof writeFile,
         }),
@@ -3442,6 +3443,53 @@ deepMaxRounds = 21
     }
   });
 
+  it('rejects Autopilot context writes after the project alias retargets', {
+    skip: process.platform === 'win32',
+  }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-keyword-context-retarget-'));
+    const projectA = join(root, 'project-a');
+    const projectB = join(root, 'project-b');
+    const sourceCwd = join(root, 'current');
+    const stateDir = join(root, 'state');
+    let retargeted = false;
+    try {
+      await mkdir(projectA, { recursive: true });
+      await mkdir(projectB, { recursive: true });
+      await mkdir(stateDir, { recursive: true });
+      await symlink(projectA, sourceCwd, 'dir');
+
+      await assert.rejects(
+        () => recordSkillActivation({
+          stateDir,
+          sourceCwd,
+          text: '$autopilot execute alias-safe context',
+          nowIso: '2026-07-27T00:00:00.000Z',
+        }, {
+          transaction: {
+            hook: async (stage, path) => {
+              if (retargeted || stage !== 'before-file-sync' || !path.endsWith('.workflow-state-transaction.json')) return;
+              retargeted = true;
+              await rm(sourceCwd);
+              await symlink(projectB, sourceCwd, 'dir');
+            },
+          },
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof SkillActivationPersistenceError);
+          assert.match(error.message, /workflow_state_transaction_context_root_changed/);
+          return true;
+        },
+      );
+
+      assert.equal(retargeted, true);
+      assert.deepEqual(await readdir(join(projectA, '.omx', 'context')).catch(() => []), []);
+      assert.deepEqual(await readdir(join(projectB, '.omx', 'context')).catch(() => []), []);
+      assert.deepEqual(await readdir(stateDir), []);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('fails loud with a typed error when skill-active-state persistence fails', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-state-persist-fail-'));
 
@@ -3475,6 +3523,7 @@ deepMaxRounds = 21
     const canonicalBefore = '{"version":1,"active":false,"skill":"","active_skills":[],"stable":"before"}';
     try {
       await mkdir(stateDir, { recursive: true });
+      const canonicalSkillActivePath = join(await realpath(stateDir), SKILL_ACTIVE_STATE_FILE);
       await writeFile(modePath, modeBefore);
       await writeFile(canonicalPath, canonicalBefore);
       await assert.rejects(
@@ -3485,7 +3534,7 @@ deepMaxRounds = 21
           nowIso: '2026-07-26T00:00:00.000Z',
         }, {
           writeSkillActiveFile: (async (path: unknown, data: unknown, options?: unknown) => {
-            if (String(path) === canonicalPath) throw new Error('skill_active_write_failed');
+            if (String(path) === canonicalSkillActivePath) throw new Error('skill_active_write_failed');
             await writeFile(String(path), data as string, options as BufferEncoding);
           }) as typeof writeFile,
         }),
@@ -3511,7 +3560,8 @@ deepMaxRounds = 21
   it('serializes concurrent skill activation persistence', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-state-lock-'));
     const stateDir = join(cwd, '.omx', 'state');
-    const canonicalPath = join(stateDir, SKILL_ACTIVE_STATE_FILE);
+    await mkdir(stateDir, { recursive: true });
+    const canonicalPath = join(await realpath(stateDir), SKILL_ACTIVE_STATE_FILE);
     let releaseFirst!: () => void;
     let blocked = false;
     const writeSkillActiveFile = (async (path: unknown, data: unknown, options?: unknown) => {

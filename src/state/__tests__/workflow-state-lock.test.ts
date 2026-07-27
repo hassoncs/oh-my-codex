@@ -2,8 +2,8 @@ import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
+import { existsSync, realpathSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -119,7 +119,9 @@ function persistedTransactionV5(
   return {
     ...persistedTransaction(entries),
     version: 5,
-    context_root_sha256: createHash('sha256').update(resolve(contextRoot)).digest('hex'),
+    context_root_sha256: createHash('sha256')
+      .update(join(realpathSync(dirname(dirname(resolve(contextRoot)))), '.omx', 'context'))
+      .digest('hex'),
   };
 }
 
@@ -134,6 +136,10 @@ function persistedRecoveryOwner(
     lock_token: owner.token,
     lock_generation: owner.generation,
   };
+}
+
+function canonicalStatePath(baseStateDir: string, name: string): string {
+  return join(realpathSync(baseStateDir), name);
 }
 
 describe('workflow state lock', () => {
@@ -566,10 +572,11 @@ describe('workflow state lock', () => {
       const journalPath = join(baseStateDir, '.workflow-state-transaction.json');
       await mkdir(baseStateDir, { recursive: true });
       await writeFile(teamPath, 'before');
+      const canonicalBaseStateDir = realpathSync(baseStateDir);
       let mutated = false;
       configureWorkflowStateTransactionFaults({
         hook: (stage, path) => {
-          if (mutated && stage === 'before-directory-sync' && path === baseStateDir) {
+          if (mutated && stage === 'before-directory-sync' && path === canonicalBaseStateDir) {
             throw new Error('directory_sync_failed');
           }
         },
@@ -604,6 +611,498 @@ describe('workflow state lock', () => {
         existsSync(join(baseStateDir, '.workflow-state-recovery-owner.json')),
         false,
       );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers every concurrently captured path after a forced stale-write order', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-workflow-concurrent-capture-'));
+    try {
+      const baseStateDir = join(cwd, '.omx', 'state');
+      const journalPath = join(baseStateDir, '.workflow-state-transaction.json');
+      const firstPath = join(baseStateDir, 'first.json');
+      const secondPath = join(baseStateDir, 'second.json');
+      await mkdir(baseStateDir, { recursive: true });
+      await writeFile(firstPath, 'first-before');
+      await writeFile(secondPath, 'second-before');
+      const canonicalJournalPath = canonicalStatePath(baseStateDir, '.workflow-state-transaction.json');
+      const canonicalFirstPath = canonicalStatePath(baseStateDir, 'first.json');
+
+      let journalWrites = 0;
+      let failRollback = false;
+      let firstCaptureStarted!: () => void;
+      const firstCaptureReady = new Promise<void>((resolve) => {
+        firstCaptureStarted = resolve;
+      });
+      let secondCaptureFinished!: () => void;
+      const secondCaptureDone = new Promise<void>((resolve) => {
+        secondCaptureFinished = resolve;
+      });
+      configureWorkflowStateTransactionFaults({
+        hook: async (stage, path) => {
+          if (stage === 'before-file-sync' && path === canonicalJournalPath && journalWrites++ === 1) {
+            firstCaptureStarted();
+            await Promise.race([
+              secondCaptureDone,
+              new Promise<void>((resolve) => setTimeout(resolve, 50)),
+            ]);
+          }
+          if (failRollback && stage === 'before-file-sync' && path === canonicalFirstPath) {
+            throw new Error('rollback_sync_failed');
+          }
+        },
+      });
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, (lockLease) =>
+          withWorkflowStateTransaction(
+            baseStateDir,
+            cwd,
+            undefined,
+            async (transactionLease) => {
+              const firstCapture = transactionLease.capturePath(firstPath);
+              await firstCaptureReady;
+              const secondCapture = transactionLease.capturePath(secondPath)
+                .finally(secondCaptureFinished);
+              await Promise.all([firstCapture, secondCapture]);
+              await writeFile(firstPath, 'first-after');
+              await writeFile(secondPath, 'second-after');
+              failRollback = true;
+              throw new Error('simulated_crash');
+            },
+            [],
+            { lockLease },
+          )),
+        /workflow_state_transaction_rollback_failed/,
+      );
+      assert.equal(existsSync(journalPath), true);
+
+      configureWorkflowStateTransactionFaults();
+      await withWorkflowStateLock(baseStateDir, async () => {});
+      assert.equal(await readFile(firstPath, 'utf-8'), 'first-before');
+      assert.equal(await readFile(secondPath, 'utf-8'), 'second-before');
+      assert.equal(existsSync(journalPath), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('waits for an unawaited capture before committing the transaction', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-workflow-detached-capture-'));
+    let releaseCapture: (() => void) | undefined;
+    try {
+      const baseStateDir = join(cwd, '.omx', 'state');
+      const journalPath = join(baseStateDir, '.workflow-state-transaction.json');
+      const capturedPath = join(baseStateDir, 'captured.json');
+      await mkdir(baseStateDir, { recursive: true });
+      await writeFile(capturedPath, 'before');
+      const canonicalJournalPath = canonicalStatePath(baseStateDir, '.workflow-state-transaction.json');
+      const captureBlocked = new Promise<void>((resolve) => {
+        releaseCapture = resolve;
+      });
+      let captureStarted!: () => void;
+      const captureReady = new Promise<void>((resolve) => {
+        captureStarted = resolve;
+      });
+      let journalWrites = 0;
+      configureWorkflowStateTransactionFaults({
+        hook: async (stage, path) => {
+          if (stage !== 'before-file-sync' || path !== canonicalJournalPath || journalWrites++ !== 1) return;
+          captureStarted();
+          await captureBlocked;
+        },
+      });
+
+      let capture!: Promise<void>;
+      let settled = false;
+      const transaction = withWorkflowStateLock(baseStateDir, (lockLease) =>
+        withWorkflowStateTransaction(
+          baseStateDir,
+          cwd,
+          undefined,
+          async (transactionLease) => {
+            capture = transactionLease.capturePath(capturedPath);
+            await captureReady;
+          },
+          [],
+          { lockLease },
+        ));
+      void transaction.then(
+        () => { settled = true; },
+        () => { settled = true; },
+      );
+      await captureReady;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(settled, false);
+      assert.equal(existsSync(journalPath), true);
+
+      if (!releaseCapture) throw new Error('capture release callback missing');
+      releaseCapture();
+      await Promise.all([transaction, capture]);
+      assert.equal(existsSync(journalPath), false);
+    } finally {
+      releaseCapture?.();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects context recovery after a project symlink retarget', {
+    skip: process.platform === 'win32',
+  }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-workflow-context-retarget-'));
+    try {
+      const projectA = join(root, 'project-a');
+      const projectB = join(root, 'project-b');
+      const linkedCwd = join(root, 'current');
+      const baseStateDir = join(root, 'shared-state');
+      const contextName = 'task-20260727T000000Z.md';
+      const contextA = join(projectA, '.omx', 'context', contextName);
+      const contextB = join(projectB, '.omx', 'context', contextName);
+      const journalPath = join(baseStateDir, '.workflow-state-transaction.json');
+      await mkdir(dirname(contextA), { recursive: true });
+      await mkdir(dirname(contextB), { recursive: true });
+      await mkdir(baseStateDir, { recursive: true });
+      await writeFile(contextA, 'mutated-a');
+      await writeFile(contextB, 'mutated-b');
+      await symlink(projectA, linkedCwd, 'dir');
+      let failRollback = false;
+      configureWorkflowStateTransactionFaults({
+        hook: (stage, path) => {
+          if (failRollback && stage === 'before-file-sync' && path.endsWith(contextName)) {
+            throw new Error('rollback_sync_failed');
+          }
+        },
+      });
+
+      await assert.rejects(
+        () => withProductionWorkflowStateLock(
+          baseStateDir,
+          linkedCwd,
+          (lockLease) => withWorkflowStateTransaction(
+            baseStateDir,
+            linkedCwd,
+            undefined,
+            async (transactionLease) => {
+              await transactionLease.capturePath(join(linkedCwd, '.omx', 'context', contextName));
+              failRollback = true;
+              throw new Error('simulated_crash');
+            },
+            [],
+            { lockLease },
+          ),
+          undefined,
+          { ...lockDependencies, transaction: transactionDependencies },
+        ),
+        /workflow_state_transaction_rollback_failed/,
+      );
+      assert.equal(existsSync(journalPath), true);
+
+      await rm(linkedCwd);
+      await symlink(projectB, linkedCwd, 'dir');
+      configureWorkflowStateTransactionFaults();
+      await assert.rejects(
+        () => withProductionWorkflowStateLock(
+          baseStateDir,
+          linkedCwd,
+          async () => {},
+          undefined,
+          { ...lockDependencies, transaction: transactionDependencies },
+        ),
+        /workflow_state_transaction_invalid:context_provenance/,
+      );
+      assert.equal(await readFile(contextA, 'utf-8'), 'mutated-a');
+      assert.equal(await readFile(contextB, 'utf-8'), 'mutated-b');
+      assert.equal(existsSync(journalPath), true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('binds state paths and journal identity to each canonical root across symlink retargets', {
+    skip: process.platform === 'win32',
+  }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-workflow-state-root-retarget-'));
+    try {
+      const projectA = join(root, 'project-a');
+      const projectB = join(root, 'project-b');
+      const linkedCwd = join(root, 'current');
+      const stateA = join(projectA, '.omx', 'state');
+      const stateB = join(projectB, '.omx', 'state');
+      const teamA = join(stateA, 'team-state.json');
+      const teamB = join(stateB, 'team-state.json');
+      const baseStateDir = join(linkedCwd, '.omx', 'state');
+      await mkdir(stateA, { recursive: true });
+      await mkdir(stateB, { recursive: true });
+      await writeFile(teamA, 'before-a');
+      await writeFile(teamB, 'before-b');
+      await symlink(projectA, linkedCwd, 'dir');
+
+      let journalA = '';
+      await withProductionWorkflowStateLock(
+        baseStateDir,
+        linkedCwd,
+        (lockLease) => withWorkflowStateTransaction(
+          baseStateDir,
+          linkedCwd,
+          undefined,
+          async (transactionLease) => {
+            journalA = transactionLease.journalPath;
+            await transactionLease.capturePath(join(baseStateDir, 'team-state.json'));
+            await writeFile(join(baseStateDir, 'team-state.json'), 'committed-a');
+          },
+          [],
+          { lockLease },
+        ),
+        undefined,
+        { ...lockDependencies, transaction: transactionDependencies },
+      );
+      assert.equal(journalA, join(realpathSync(stateA), '.workflow-state-transaction.json'));
+
+      await rm(linkedCwd);
+      await symlink(projectB, linkedCwd, 'dir');
+      let journalB = '';
+      await withProductionWorkflowStateLock(
+        baseStateDir,
+        linkedCwd,
+        (lockLease) => withWorkflowStateTransaction(
+          baseStateDir,
+          linkedCwd,
+          undefined,
+          async (transactionLease) => {
+            journalB = transactionLease.journalPath;
+            await transactionLease.capturePath(join(baseStateDir, 'team-state.json'));
+            await writeFile(join(baseStateDir, 'team-state.json'), 'committed-b');
+          },
+          [],
+          { lockLease },
+        ),
+        undefined,
+        { ...lockDependencies, transaction: transactionDependencies },
+      );
+
+      assert.equal(journalB, join(realpathSync(stateB), '.workflow-state-transaction.json'));
+      assert.notEqual(journalA, journalB);
+      assert.equal(await readFile(teamA, 'utf-8'), 'committed-a');
+      assert.equal(await readFile(teamB, 'utf-8'), 'committed-b');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps lock, journal, and recovery on one canonical root during in-flight alias retarget', {
+    skip: process.platform === 'win32',
+  }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-workflow-inflight-root-retarget-'));
+    try {
+      const projectA = join(root, 'project-a');
+      const projectB = join(root, 'project-b');
+      const linkedCwd = join(root, 'current');
+      const stateA = join(projectA, '.omx', 'state');
+      const stateB = join(projectB, '.omx', 'state');
+      const teamA = join(stateA, 'team-state.json');
+      const teamB = join(stateB, 'team-state.json');
+      const baseStateDir = join(linkedCwd, '.omx', 'state');
+      await mkdir(stateA, { recursive: true });
+      await mkdir(stateB, { recursive: true });
+      await writeFile(teamA, 'before-a');
+      await writeFile(teamB, 'before-b');
+      await symlink(projectA, linkedCwd, 'dir');
+
+      await assert.rejects(
+        () => withProductionWorkflowStateLock(
+          baseStateDir,
+          linkedCwd,
+          (lockLease) => withWorkflowStateTransaction(
+            baseStateDir,
+            linkedCwd,
+            undefined,
+            async (transactionLease) => {
+              const canonicalTeamPath = join(transactionLease.baseStateDir, 'team-state.json');
+              await transactionLease.capturePath(canonicalTeamPath);
+              await writeFile(canonicalTeamPath, 'mutated-a-before-retarget');
+              await rm(linkedCwd);
+              await symlink(projectB, linkedCwd, 'dir');
+              await transactionLease.capturePath(join(baseStateDir, 'team-state.json'));
+              await writeFile(canonicalTeamPath, 'mutated-a-after-retarget');
+            },
+            [],
+            { lockLease },
+          ),
+          undefined,
+          { ...lockDependencies, transaction: transactionDependencies },
+        ),
+        /workflow_state_transaction_root_changed/,
+      );
+
+      assert.equal(await readFile(teamA, 'utf-8'), 'before-a');
+      assert.equal(await readFile(teamB, 'utf-8'), 'before-b');
+      for (const stateRoot of [stateA, stateB]) {
+        assert.equal(existsSync(join(stateRoot, '.workflow-state.lock')), false);
+        assert.equal(existsSync(join(stateRoot, '.workflow-state-transaction.json')), false);
+        assert.equal(existsSync(join(stateRoot, '.workflow-state-recovery-owner.json')), false);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects context capture after the project alias retargets', {
+    skip: process.platform === 'win32',
+  }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-workflow-context-inflight-retarget-'));
+    try {
+      const projectA = join(root, 'project-a');
+      const projectB = join(root, 'project-b');
+      const linkedCwd = join(root, 'current');
+      const baseStateDir = join(root, 'state');
+      const contextName = 'autopilot-task-20260727T000000Z.md';
+      await mkdir(projectA, { recursive: true });
+      await mkdir(projectB, { recursive: true });
+      await mkdir(baseStateDir, { recursive: true });
+      await symlink(projectA, linkedCwd, 'dir');
+
+      await assert.rejects(
+        () => withProductionWorkflowStateLock(
+          baseStateDir,
+          linkedCwd,
+          (lockLease) => withWorkflowStateTransaction(
+            baseStateDir,
+            linkedCwd,
+            undefined,
+            async (transactionLease) => {
+              await rm(linkedCwd);
+              await symlink(projectB, linkedCwd, 'dir');
+              const contextPath = join(transactionLease.contextRoot, contextName);
+              await transactionLease.capturePath(contextPath);
+              await writeFile(contextPath, 'escaped');
+            },
+            [],
+            { lockLease },
+          ),
+          undefined,
+          { ...lockDependencies, transaction: transactionDependencies },
+        ),
+        /workflow_state_transaction_context_root_changed/,
+      );
+
+      assert.equal(existsSync(join(projectA, '.omx', 'context', contextName)), false);
+      assert.equal(existsSync(join(projectB, '.omx', 'context', contextName)), false);
+      assert.equal(existsSync(join(baseStateDir, '.workflow-state.lock')), false);
+      assert.equal(existsSync(join(baseStateDir, '.workflow-state-transaction.json')), false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects recovery through a symlinked sessions directory', {
+    skip: process.platform === 'win32',
+  }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-workflow-symlinked-sessions-'));
+    try {
+      const cwd = join(root, 'project');
+      const baseStateDir = join(cwd, '.omx', 'state');
+      const outsideSessionDir = join(root, 'outside', 'session-a');
+      const outsidePath = join(outsideSessionDir, 'team-state.json');
+      const journalPath = join(baseStateDir, '.workflow-state-transaction.json');
+      await mkdir(baseStateDir, { recursive: true });
+      await mkdir(outsideSessionDir, { recursive: true });
+      await symlink(join(root, 'outside'), join(baseStateDir, 'sessions'), 'dir');
+      await writeFile(outsidePath, 'outside-mutated');
+      await writeFile(
+        journalPath,
+        JSON.stringify(persistedTransaction([
+          persistedEntry('sessions/session-a/team-state.json', Buffer.from('before')),
+        ])),
+      );
+      await writeFile(
+        join(baseStateDir, '.workflow-state-recovery-owner.json'),
+        JSON.stringify(persistedRecoveryOwner()),
+      );
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, async () => {}),
+        /workflow_state_transaction_invalid:state_path/,
+      );
+      assert.equal(await readFile(outsidePath, 'utf-8'), 'outside-mutated');
+      assert.equal(existsSync(journalPath), true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects recovery through a symlinked session subdirectory', {
+    skip: process.platform === 'win32',
+  }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-workflow-symlinked-session-'));
+    try {
+      const cwd = join(root, 'project');
+      const baseStateDir = join(cwd, '.omx', 'state');
+      const sessionsDir = join(baseStateDir, 'sessions');
+      const outsideDir = join(root, 'outside');
+      const outsidePath = join(outsideDir, 'team-state.json');
+      const journalPath = join(baseStateDir, '.workflow-state-transaction.json');
+      await mkdir(sessionsDir, { recursive: true });
+      await mkdir(outsideDir, { recursive: true });
+      await symlink(outsideDir, join(sessionsDir, 'session-a'), 'dir');
+      await writeFile(outsidePath, 'outside-mutated');
+      await writeFile(
+        journalPath,
+        JSON.stringify(persistedTransaction([
+          persistedEntry('sessions/session-a/team-state.json', Buffer.from('before')),
+        ])),
+      );
+      await writeFile(
+        join(baseStateDir, '.workflow-state-recovery-owner.json'),
+        JSON.stringify(persistedRecoveryOwner()),
+      );
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, async () => {}),
+        /workflow_state_transaction_invalid:state_path/,
+      );
+      assert.equal(await readFile(outsidePath, 'utf-8'), 'outside-mutated');
+      assert.equal(existsSync(journalPath), true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('propagates a journal deletion failure after rolling state back', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-workflow-journal-delete-failure-'));
+    try {
+      const baseStateDir = join(cwd, '.omx', 'state');
+      const teamPath = join(baseStateDir, 'team-state.json');
+      const journalPath = join(baseStateDir, '.workflow-state-transaction.json');
+      await mkdir(baseStateDir, { recursive: true });
+      await writeFile(teamPath, 'before');
+      const canonicalJournalPath = canonicalStatePath(baseStateDir, '.workflow-state-transaction.json');
+      let failDelete = true;
+      configureWorkflowStateTransactionFaults({
+        hook: (stage, path) => {
+          if (failDelete && stage === 'before-journal-delete' && path === canonicalJournalPath) {
+            failDelete = false;
+            throw new Error('journal_delete_failed');
+          }
+        },
+      });
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, (lockLease) =>
+          withWorkflowStateTransaction(
+            baseStateDir,
+            cwd,
+            undefined,
+            async () => {
+              await writeFile(teamPath, 'after');
+            },
+            [],
+            { lockLease },
+          )),
+        /journal_delete_failed/,
+      );
+      assert.equal(await readFile(teamPath, 'utf-8'), 'before');
+      assert.equal(existsSync(journalPath), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -651,12 +1150,14 @@ describe('workflow state lock', () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-workflow-transaction-init-failure-'));
     try {
       const baseStateDir = join(cwd, '.omx', 'state');
+      await mkdir(baseStateDir, { recursive: true });
+      const canonicalBaseStateDir = realpathSync(baseStateDir);
       let failInitialDirectorySync = true;
       let secondEntered = false;
       await withWorkflowStateLock(baseStateDir, async (lockLease) => {
         configureWorkflowStateTransactionFaults({
           hook: (stage, path) => {
-            if (!failInitialDirectorySync || stage !== 'before-directory-sync' || path !== baseStateDir) return;
+            if (!failInitialDirectorySync || stage !== 'before-directory-sync' || path !== canonicalBaseStateDir) return;
             failInitialDirectorySync = false;
             throw new Error('initialization_sync_failed');
           },
@@ -701,6 +1202,8 @@ describe('workflow state lock', () => {
       const journalPath = join(baseStateDir, '.workflow-state-transaction.json');
       const recoveryOwnerPath = join(baseStateDir, '.workflow-state-recovery-owner.json');
       const lockPath = join(baseStateDir, '.workflow-state.lock');
+      await mkdir(baseStateDir, { recursive: true });
+      const canonicalJournalPath = canonicalStatePath(baseStateDir, '.workflow-state-transaction.json');
       const journalWriteBlocked = new Promise<void>((resolve) => {
         releaseJournalWrite = resolve;
       });
@@ -711,7 +1214,7 @@ describe('workflow state lock', () => {
       let journalWrites = 0;
       configureWorkflowStateTransactionFaults({
         hook: async (stage, path) => {
-          if (stage !== 'before-file-sync' || path !== journalPath || journalWrites++ > 0) return;
+          if (stage !== 'before-file-sync' || path !== canonicalJournalPath || journalWrites++ > 0) return;
           journalWriteEntered();
           await journalWriteBlocked;
         },
@@ -961,11 +1464,12 @@ describe('workflow state lock', () => {
       const teamPath = join(baseStateDir, 'team-state.json');
       await mkdir(baseStateDir, { recursive: true });
       await writeFile(teamPath, 'before');
+      const canonicalTeamPath = canonicalStatePath(baseStateDir, 'team-state.json');
       let failRollbackSync = false;
       let failRecoveryOwnerWrite = false;
       configureWorkflowStateTransactionFaults({
         hook: (stage, path) => {
-          if (failRollbackSync && stage === 'before-file-sync' && path === teamPath) {
+          if (failRollbackSync && stage === 'before-file-sync' && path === canonicalTeamPath) {
             failRollbackSync = false;
             throw new Error('rollback_sync_failed');
           }

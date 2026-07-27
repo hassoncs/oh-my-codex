@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, readFile, rename, rm } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, realpath, rename, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
 import { getBaseStateDir } from '../mcp/state-paths.js';
@@ -10,7 +10,12 @@ const WORKFLOW_STATE_TRANSACTION_FILE = '.workflow-state-transaction.json';
 export const WORKFLOW_STATE_RECOVERY_OWNER_FILE = '.workflow-state-recovery-owner.json';
 
 export interface WorkflowStateSnapshot {
-  files: Array<{ path: string; content: Buffer | null }>;
+  files: Array<{
+    scope: 'state' | 'context';
+    root: string;
+    path: string;
+    content: Buffer | null;
+  }>;
 }
 
 interface PersistedWorkflowStateTransactionEntry {
@@ -44,6 +49,8 @@ export interface WorkflowStateTransactionDependencies {
 }
 
 export interface WorkflowStateTransactionLease {
+  readonly baseStateDir: string;
+  readonly contextRoot: string;
   readonly journalPath: string;
   readonly transactionId: string;
   capturePath(path: string): Promise<void>;
@@ -56,12 +63,16 @@ export interface WorkflowStateMutationAuthority {
 
 const activeLeases = new WeakSet<object>();
 const activeTransactions = new Map<string, WorkflowStateTransactionLease | symbol>();
+const OUTSIDE_STATE_TRANSACTION_ROOT = Symbol('outside-state-transaction-root');
 
 export async function captureWorkflowStateSnapshot(
   cwd: string,
   sessionId?: string,
   extraPaths: string[] = [],
   baseStateDir: string = getBaseStateDir(cwd),
+  stateRootAlias: string = baseStateDir,
+  contextRoot: string = contextRootForCwd(cwd),
+  contextRootAlias: string = contextRoot,
 ): Promise<WorkflowStateSnapshot> {
   const normalizedBaseStateDir = resolve(baseStateDir);
   const paths = [
@@ -76,14 +87,34 @@ export async function captureWorkflowStateSnapshot(
     ...extraPaths,
   ];
   return {
-    files: await Promise.all([...new Set(paths)].map(async (path) => ({
-      path,
-      content: await readFile(path).catch((error: NodeJS.ErrnoException) => {
-        if (error.code === 'ENOENT') return null;
-        throw error;
-      }),
-    }))),
+    files: await Promise.all([...new Set(paths)].map(async (path) => {
+      const captured = await persistedEntryPath(
+        normalizedBaseStateDir,
+        contextRoot,
+        resolve(path),
+        stateRootAlias,
+        contextRootAlias,
+      );
+      return {
+        scope: captured.scope,
+        root: captured.scope === 'state' ? normalizedBaseStateDir : dirname(captured.absolutePath),
+        path: captured.absolutePath,
+        content: await readFile(captured.absolutePath).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return null;
+          throw error;
+        }),
+      };
+    })),
   };
+}
+
+async function safeSnapshotPath(
+  file: WorkflowStateSnapshot['files'][number],
+): Promise<string> {
+  if (file.scope === 'state') {
+    return (await safeStateTransactionPath(file.root, file.path)).absolutePath;
+  }
+  return safeContextTransactionPath(file.root, file.path);
 }
 
 export async function restoreWorkflowStateSnapshot(
@@ -91,12 +122,13 @@ export async function restoreWorkflowStateSnapshot(
   dependencies: WorkflowStateTransactionDependencies = {},
 ): Promise<void> {
   for (const file of snapshot.files) {
+    const path = await safeSnapshotPath(file);
     if (file.content === null) {
-      await rm(file.path, { force: true });
-      await syncDirectory(dirname(file.path));
+      await rm(path, { force: true });
+      await syncDirectory(dirname(path));
       continue;
     }
-    await writeDurableFile(file.path, file.content, dependencies);
+    await writeDurableFile(path, file.content, dependencies, () => safeSnapshotPath(file));
   }
 }
 
@@ -109,19 +141,85 @@ function recoveryOwnerPath(baseStateDir: string): string {
 }
 
 function relativeStateTransactionPath(baseStateDir: string, path: string): string {
-  const resolvedPath = resolve(path);
-  const normalized = relative(resolve(baseStateDir), resolvedPath);
+  const normalized = relative(resolve(baseStateDir), resolve(path));
   if (
     normalized
     && !isAbsolute(normalized)
     && normalized !== '..'
     && !normalized.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)
   ) return normalized;
-  throw new Error(`workflow_state_transaction_invalid:path:${path}`);
+  throw OUTSIDE_STATE_TRANSACTION_ROOT;
+}
+
+async function canonicalStateTransactionRoot(baseStateDir: string): Promise<string> {
+  const normalizedRoot = resolve(baseStateDir);
+  const rootStat = await lstat(normalizedRoot).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (!rootStat?.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new Error(`workflow_state_transaction_invalid:state_root:${baseStateDir}`);
+  }
+  return realpath(normalizedRoot);
+}
+
+async function assertRequestedStateTransactionRoot(
+  requestedRoot: string,
+  canonicalRoot: string,
+): Promise<void> {
+  const currentRoot = await realpath(resolve(requestedRoot)).catch(() => null);
+  if (currentRoot !== canonicalRoot) {
+    throw new Error(`workflow_state_transaction_root_changed:${requestedRoot}`);
+  }
+}
+
+async function safeStateTransactionPath(
+  baseStateDir: string,
+  path: string,
+): Promise<{ absolutePath: string; relativePath: string }> {
+  const normalizedRoot = resolve(baseStateDir);
+  const canonicalRoot = await canonicalStateTransactionRoot(normalizedRoot);
+  let relativePath: string;
+  try {
+    relativePath = relativeStateTransactionPath(normalizedRoot, path);
+  } catch (error) {
+    if (error !== OUTSIDE_STATE_TRANSACTION_ROOT) throw error;
+    relativePath = relativeStateTransactionPath(canonicalRoot, path);
+  }
+
+  let currentPath = canonicalRoot;
+  const parts = relativePath.split(/[\\/]/);
+  for (const [index, part] of parts.entries()) {
+    currentPath = join(currentPath, part);
+    const pathStat = await lstat(currentPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (!pathStat) break;
+    if (pathStat.isSymbolicLink() || (index < parts.length - 1 && !pathStat.isDirectory())) {
+      throw new Error(`workflow_state_transaction_invalid:state_path:${path}`);
+    }
+  }
+  return { absolutePath: resolve(canonicalRoot, relativePath), relativePath };
 }
 
 function contextRootForCwd(cwd: string): string {
   return join(resolve(cwd), '.omx', 'context');
+}
+
+async function canonicalContextRoot(contextRoot: string): Promise<string> {
+  const cwd = dirname(dirname(resolve(contextRoot)));
+  return join(await realpath(cwd), '.omx', 'context');
+}
+
+async function assertRequestedContextTransactionRoot(
+  requestedCwd: string,
+  canonicalRoot: string,
+): Promise<void> {
+  const currentRoot = await canonicalContextRoot(contextRootForCwd(requestedCwd)).catch(() => null);
+  if (currentRoot !== canonicalRoot) {
+    throw new Error(`workflow_state_transaction_context_root_changed:${requestedCwd}`);
+  }
 }
 
 async function assertSafeContextRoot(contextRoot: string): Promise<void> {
@@ -142,36 +240,87 @@ async function assertSafeContextRoot(contextRoot: string): Promise<void> {
   }
 }
 
+function isValidContextTransactionRelativePath(path: string): boolean {
+  return Boolean(
+    path
+    && !isAbsolute(path)
+    && path !== '..'
+    && !path.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)
+    && !path.includes('/')
+    && !path.includes('\\')
+    && /^[a-z0-9-]+-\d{8}T\d{6}Z(?:-\d+)?\.md$/.test(path)
+  );
+}
+
 function validateContextTransactionRelativePath(path: string): string {
-  const normalized = path;
-  if (
-    !normalized
-    || isAbsolute(normalized)
-    || normalized === '..'
-    || normalized.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)
-    || normalized.includes('/')
-    || normalized.includes('\\')
-    || !/^[a-z0-9-]+-\d{8}T\d{6}Z(?:-\d+)?\.md$/.test(normalized)
-  ) {
+  if (!isValidContextTransactionRelativePath(path)) {
     throw new Error(`workflow_state_transaction_invalid:context_path:${path}`);
   }
-  return normalized;
+  return path;
 }
 
 function relativeContextTransactionPath(contextRoot: string, path: string): string {
   return validateContextTransactionRelativePath(relative(resolve(contextRoot), resolve(path)));
 }
 
+async function safeContextTransactionPath(contextRoot: string, path: string): Promise<string> {
+  const canonicalRoot = await canonicalContextRoot(contextRoot);
+  await assertSafeContextRoot(canonicalRoot);
+  const resolvedPath = resolve(path);
+  const lexicalRelative = relative(resolve(contextRoot), resolvedPath);
+  const canonicalRelative = relative(canonicalRoot, resolvedPath);
+  const relativePath = [lexicalRelative, canonicalRelative]
+    .find(isValidContextTransactionRelativePath);
+  if (!relativePath) {
+    throw new Error(`workflow_state_transaction_invalid:context_path:${path}`);
+  }
+  const absolutePath = resolve(canonicalRoot, relativePath);
+  const pathStat = await lstat(absolutePath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (pathStat?.isSymbolicLink()) {
+    throw new Error(`workflow_state_transaction_invalid:context_path:${path}`);
+  }
+  return absolutePath;
+}
+
 async function persistedEntryPath(
   baseStateDir: string,
   contextRoot: string,
   path: string,
-): Promise<Pick<PersistedWorkflowStateTransactionEntry, 'scope' | 'path'>> {
+  stateRootAlias: string = baseStateDir,
+  contextRootAlias: string = contextRoot,
+): Promise<{
+  scope: 'state' | 'context';
+  path: string;
+  absolutePath: string;
+}> {
   try {
-    return { scope: 'state', path: relativeStateTransactionPath(baseStateDir, path) };
-  } catch {
-    await assertSafeContextRoot(contextRoot);
-    return { scope: 'context', path: relativeContextTransactionPath(contextRoot, path) };
+    let stateCandidate = path;
+    try {
+      const relativePath = relativeStateTransactionPath(stateRootAlias, path);
+      stateCandidate = resolve(baseStateDir, relativePath);
+    } catch (error) {
+      if (error !== OUTSIDE_STATE_TRANSACTION_ROOT) throw error;
+    }
+    const statePath = await safeStateTransactionPath(baseStateDir, stateCandidate);
+    return { scope: 'state', path: statePath.relativePath, absolutePath: statePath.absolutePath };
+  } catch (error) {
+    if (error !== OUTSIDE_STATE_TRANSACTION_ROOT) throw error;
+    let contextCandidate = path;
+    try {
+      const relativePath = relativeContextTransactionPath(contextRootAlias, path);
+      contextCandidate = resolve(contextRoot, relativePath);
+    } catch {
+      // Canonical context paths bypass alias translation.
+    }
+    const absolutePath = await safeContextTransactionPath(contextRoot, contextCandidate);
+    return {
+      scope: 'context',
+      path: relativeContextTransactionPath(await canonicalContextRoot(contextRoot), absolutePath),
+      absolutePath,
+    };
   }
 }
 
@@ -207,7 +356,7 @@ async function snapshotFromPersisted(
     && hasContextEntries
     && (
       typeof record.context_root_sha256 !== 'string'
-      || record.context_root_sha256 !== sha256(Buffer.from(resolve(contextRoot), 'utf-8'))
+      || record.context_root_sha256 !== sha256(Buffer.from(await canonicalContextRoot(contextRoot), 'utf-8'))
     )
   ) {
     throw new Error('workflow_state_transaction_invalid:context_provenance');
@@ -229,19 +378,30 @@ async function snapshotFromPersisted(
       if (isAbsolute(file.path)) {
         throw new Error('workflow_state_transaction_invalid:absolute_path');
       }
+      let scope: 'state' | 'context';
+      let root: string;
       let path: string;
       if (record.version === 5 && file.scope === 'context') {
-        await assertSafeContextRoot(contextRoot);
-        path = resolve(contextRoot, validateContextTransactionRelativePath(file.path));
+        scope = 'context';
+        path = await safeContextTransactionPath(contextRoot, resolve(contextRoot, file.path));
+        root = dirname(path);
       } else {
-        path = resolve(baseStateDir, file.path);
-        relativeStateTransactionPath(baseStateDir, path);
+        scope = 'state';
+        root = resolve(baseStateDir);
+        try {
+          path = (await safeStateTransactionPath(baseStateDir, resolve(baseStateDir, file.path))).absolutePath;
+        } catch (error) {
+          if (error === OUTSIDE_STATE_TRANSACTION_ROOT) {
+            throw new Error(`workflow_state_transaction_invalid:path:${file.path}`);
+          }
+          throw error;
+        }
       }
       if (file.content_base64 === null) {
         if (file.byte_length !== null || file.sha256 !== null) {
           throw new Error('workflow_state_transaction_invalid:null_entry');
         }
-        return { path, content: null };
+        return { scope, root, path, content: null };
       }
       if (
         typeof file.content_base64 !== 'string'
@@ -260,6 +420,8 @@ async function snapshotFromPersisted(
         throw new Error('workflow_state_transaction_invalid:digest');
       }
       return {
+        scope,
+        root,
         path,
         content,
       };
@@ -287,7 +449,7 @@ function decodeCanonicalBase64(value: string): Buffer {
 
 async function writeWorkflowStateTransaction(
   baseStateDir: string,
-  cwd: string,
+  contextRoot: string,
   snapshot: WorkflowStateSnapshot,
   transactionId: string,
   lockToken: string,
@@ -295,36 +457,47 @@ async function writeWorkflowStateTransaction(
   dependencies: WorkflowStateTransactionDependencies,
 ): Promise<void> {
   const path = transactionPath(baseStateDir);
-  const contextRoot = contextRootForCwd(cwd);
-  const files = await Promise.all(snapshot.files.map(async (file) => ({
-    ...await persistedEntryPath(baseStateDir, contextRoot, file.path),
-    content_base64: file.content?.toString('base64') ?? null,
-    byte_length: file.content?.length ?? null,
-    sha256: file.content ? sha256(file.content) : null,
-  })));
+  const files = await Promise.all(snapshot.files.map(async (file) => {
+    const entry = await persistedEntryPath(baseStateDir, contextRoot, file.path);
+    return {
+      scope: entry.scope,
+      path: entry.path,
+      content_base64: file.content?.toString('base64') ?? null,
+      byte_length: file.content?.length ?? null,
+      sha256: file.content ? sha256(file.content) : null,
+    };
+  }));
   const persisted: PersistedWorkflowStateTransaction = {
     version: 5,
     transaction_id: transactionId,
     lock_token: lockToken,
     lock_generation: lockGeneration,
     context_root_sha256: files.some((file) => file.scope === 'context')
-      ? sha256(Buffer.from(resolve(contextRoot), 'utf-8'))
+      ? sha256(Buffer.from(await canonicalContextRoot(contextRoot), 'utf-8'))
       : undefined,
     files,
   };
-  await writeDurableFile(path, Buffer.from(JSON.stringify(persisted), 'utf-8'), dependencies);
+  await writeDurableFile(
+    path,
+    Buffer.from(JSON.stringify(persisted), 'utf-8'),
+    dependencies,
+    async () => (await safeStateTransactionPath(baseStateDir, path)).absolutePath,
+  );
 }
 
 async function writeDurableFile(
   path: string,
   content: Buffer,
   dependencies: WorkflowStateTransactionDependencies = {},
+  validatePath?: () => Promise<string>,
 ): Promise<void> {
-  const parentDir = dirname(path);
-  const tempPath = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+  const safePath = await validatePath?.() ?? path;
+  const parentDir = dirname(safePath);
+  const tempPath = `${safePath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
   await mkdir(parentDir, { recursive: true });
-  const handle = await open(tempPath, 'w');
+  await validatePath?.();
   try {
+    const handle = await open(tempPath, 'w');
     try {
       await handle.writeFile(content);
       await dependencies.hook?.('before-file-sync', path);
@@ -332,12 +505,13 @@ async function writeDurableFile(
     } finally {
       await handle.close();
     }
+    await validatePath?.();
+    await rename(tempPath, safePath);
+    await syncDirectory(parentDir, dependencies);
   } catch (error) {
     await rm(tempPath, { force: true }).catch(() => {});
     throw error;
   }
-  await rename(tempPath, path);
-  await syncDirectory(parentDir, dependencies);
 }
 
 async function syncDirectory(
@@ -367,9 +541,11 @@ async function removeWorkflowStateTransaction(
   dependencies: WorkflowStateTransactionDependencies = {},
 ): Promise<void> {
   const path = transactionPath(baseStateDir);
+  const safePath = (await safeStateTransactionPath(baseStateDir, path)).absolutePath;
   await dependencies.hook?.('before-journal-delete', path);
-  await rm(path, { force: true });
-  await syncDirectory(baseStateDir, dependencies);
+  await safeStateTransactionPath(baseStateDir, path);
+  await rm(safePath, { force: true });
+  await syncDirectory(dirname(safePath), dependencies);
 }
 
 async function assertWorkflowStateTransactionOwned(
@@ -381,7 +557,8 @@ async function assertWorkflowStateTransactionOwned(
   const path = transactionPath(baseStateDir);
   let parsed: unknown;
   try {
-    parsed = JSON.parse(await readFile(path, 'utf-8'));
+    const safePath = (await safeStateTransactionPath(baseStateDir, path)).absolutePath;
+    parsed = JSON.parse(await readFile(safePath, 'utf-8'));
   } catch (error) {
     throw new Error(`workflow_state_transaction_displaced:${String(error)}`);
   }
@@ -402,10 +579,11 @@ async function syncWorkflowStatePaths(
   dependencies: WorkflowStateTransactionDependencies = {},
 ): Promise<void> {
   for (const file of snapshot.files) {
+    const path = await safeSnapshotPath(file);
     try {
-      const handle = await open(file.path, 'r');
+      const handle = await open(path, 'r');
       try {
-        await dependencies.hook?.('before-file-sync', file.path);
+        await dependencies.hook?.('before-file-sync', path);
         await handle.sync();
       } finally {
         await handle.close();
@@ -413,7 +591,7 @@ async function syncWorkflowStatePaths(
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
-    await syncDirectory(dirname(file.path), dependencies);
+    await syncDirectory(dirname(path), dependencies);
   }
 }
 
@@ -464,8 +642,10 @@ async function quarantineWorkflowStateTransaction(
 ): Promise<string> {
   const path = transactionPath(baseStateDir);
   const quarantinePath = `${path}.${reason}.${Date.now()}.${randomUUID()}.rejected`;
-  await rename(path, quarantinePath);
-  await syncDirectory(baseStateDir, dependencies);
+  const safePath = (await safeStateTransactionPath(baseStateDir, path)).absolutePath;
+  const safeQuarantinePath = (await safeStateTransactionPath(baseStateDir, quarantinePath)).absolutePath;
+  await rename(safePath, safeQuarantinePath);
+  await syncDirectory(dirname(safePath), dependencies);
   return quarantinePath;
 }
 
@@ -477,13 +657,16 @@ export async function recoverWorkflowStateTransactionUnderLock(
 ): Promise<boolean> {
   await lockLease.assertOwned();
   const path = transactionPath(baseStateDir);
+  const safePath = (await safeStateTransactionPath(baseStateDir, path)).absolutePath;
+  const ownerPath = recoveryOwnerPath(baseStateDir);
+  const safeOwnerPath = (await safeStateTransactionPath(baseStateDir, ownerPath)).absolutePath;
   let raw: string;
   try {
-    raw = await readFile(path, 'utf-8');
+    raw = await readFile(safePath, 'utf-8');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      await rm(recoveryOwnerPath(baseStateDir), { force: true });
-      await syncDirectory(baseStateDir, dependencies);
+      await rm(safeOwnerPath, { force: true });
+      await syncDirectory(dirname(safeOwnerPath), dependencies);
       return false;
     }
     throw error;
@@ -500,7 +683,7 @@ export async function recoverWorkflowStateTransactionUnderLock(
     const quarantinePath = await quarantineWorkflowStateTransaction(baseStateDir, 'ownerless', dependencies);
     throw new Error(`workflow_state_transaction_recovery_rejected:ownerless:${quarantinePath}`);
   }
-  const recoveryOwnerRaw = await readFile(recoveryOwnerPath(baseStateDir), 'utf-8').catch(
+  const recoveryOwnerRaw = await readFile(safeOwnerPath, 'utf-8').catch(
     (error: NodeJS.ErrnoException) => {
       if (error.code === 'ENOENT') return null;
       throw error;
@@ -521,13 +704,14 @@ export async function recoverWorkflowStateTransactionUnderLock(
   await restoreWorkflowStateSnapshot(snapshot, dependencies);
   await lockLease.assertOwned();
   await removeWorkflowStateTransaction(baseStateDir, dependencies);
-  await rm(recoveryOwnerPath(baseStateDir), { force: true });
-  await syncDirectory(baseStateDir, dependencies);
+  await safeStateTransactionPath(baseStateDir, ownerPath);
+  await rm(safeOwnerPath, { force: true });
+  await syncDirectory(dirname(safeOwnerPath), dependencies);
   return true;
 }
 
 export async function withWorkflowStateTransaction<T>(
-  baseStateDir: string,
+  baseStateDirInput: string,
   cwd: string,
   sessionId: string | undefined,
   fn: (lease: WorkflowStateTransactionLease) => Promise<T>,
@@ -538,33 +722,51 @@ export async function withWorkflowStateTransaction<T>(
     dependencies?: WorkflowStateTransactionDependencies;
   } = {},
 ): Promise<T> {
-  const path = transactionPath(baseStateDir);
+  const requestedBaseStateDir = await canonicalStateTransactionRoot(baseStateDirInput);
+  const transactionContextRootAlias = contextRootForCwd(cwd);
+  const transactionContextRoot = await canonicalContextRoot(transactionContextRootAlias);
+  if (options.lockLease && options.lockLease.baseStateDir !== requestedBaseStateDir) {
+    throw new Error(`workflow_state_transaction_lock_root_mismatch:${baseStateDirInput}`);
+  }
+  const transactionBaseStateDir = options.lockLease?.baseStateDir ?? requestedBaseStateDir;
+  const path = transactionPath(transactionBaseStateDir);
   if (options.transactionLease) {
     if (
       !activeLeases.has(options.transactionLease)
       || activeTransactions.get(path) !== options.transactionLease
       || options.transactionLease.journalPath !== path
+      || options.transactionLease.contextRoot !== transactionContextRoot
     ) {
-      throw new Error(`workflow_state_transaction_invalid_lease:${baseStateDir}`);
+      throw new Error(`workflow_state_transaction_invalid_lease:${transactionBaseStateDir}`);
     }
     return fn(options.transactionLease);
   }
-  if (!options.lockLease) throw new Error(`workflow_state_transaction_lock_required:${baseStateDir}`);
+  if (!options.lockLease) throw new Error(`workflow_state_transaction_lock_required:${transactionBaseStateDir}`);
   if (activeTransactions.has(path)) {
-    throw new Error(`workflow_state_transaction_contended:${baseStateDir}`);
+    throw new Error(`workflow_state_transaction_contended:${transactionBaseStateDir}`);
   }
   const reservation = Symbol(path);
   activeTransactions.set(path, reservation);
 
   try {
     await options.lockLease.assertOwned();
+    await assertRequestedStateTransactionRoot(baseStateDirInput, transactionBaseStateDir);
+    await assertRequestedContextTransactionRoot(cwd, transactionContextRoot);
 
-    const snapshot = await captureWorkflowStateSnapshot(cwd, sessionId, extraPaths, baseStateDir);
+    const snapshot = await captureWorkflowStateSnapshot(
+      cwd,
+      sessionId,
+      extraPaths,
+      transactionBaseStateDir,
+      baseStateDirInput,
+      transactionContextRoot,
+      transactionContextRootAlias,
+    );
     const transactionId = randomUUID();
     try {
       await writeWorkflowStateTransaction(
-        baseStateDir,
-        cwd,
+        transactionBaseStateDir,
+        transactionContextRoot,
         snapshot,
         transactionId,
         options.lockLease.token,
@@ -573,7 +775,7 @@ export async function withWorkflowStateTransaction<T>(
       );
     } catch (error) {
       try {
-        await removeWorkflowStateTransaction(baseStateDir, options.dependencies);
+        await removeWorkflowStateTransaction(transactionBaseStateDir, options.dependencies);
       } catch (cleanupError) {
         try {
           await options.lockLease.markRecoveryRequired();
@@ -590,40 +792,93 @@ export async function withWorkflowStateTransaction<T>(
       }
       throw error;
     }
+    let captureTail = Promise.resolve();
+    let capturesOpen = true;
     const acquiredLease: WorkflowStateTransactionLease = Object.freeze({
+      baseStateDir: transactionBaseStateDir,
+      contextRoot: transactionContextRoot,
       journalPath: path,
       transactionId,
-      capturePath: async (capturedPath: string) => {
-        await options.lockLease!.assertOwned();
-        const normalizedPath = resolve(capturedPath);
-        await persistedEntryPath(baseStateDir, contextRootForCwd(cwd), normalizedPath);
-        if (snapshot.files.some((file) => resolve(file.path) === normalizedPath)) return;
-        snapshot.files.push({
-          path: normalizedPath,
-          content: await readFile(normalizedPath).catch((error: NodeJS.ErrnoException) => {
-            if (error.code === 'ENOENT') return null;
-            throw error;
-          }),
+      capturePath: (capturedPath: string) => {
+        if (!capturesOpen) {
+          return Promise.reject(new Error(`workflow_state_transaction_closed_lease:${transactionBaseStateDir}`));
+        }
+        const capture = captureTail.then(async () => {
+          await options.lockLease!.assertOwned();
+          await assertRequestedStateTransactionRoot(baseStateDirInput, transactionBaseStateDir);
+          await assertRequestedContextTransactionRoot(cwd, transactionContextRoot);
+          const captured = await persistedEntryPath(
+            transactionBaseStateDir,
+            transactionContextRoot,
+            resolve(capturedPath),
+            baseStateDirInput,
+            transactionContextRootAlias,
+          );
+          if (snapshot.files.some((file) => resolve(file.path) === captured.absolutePath)) return;
+          snapshot.files.push({
+            scope: captured.scope,
+            root: captured.scope === 'state' ? resolve(transactionBaseStateDir) : dirname(captured.absolutePath),
+            path: captured.absolutePath,
+            content: await readFile(captured.absolutePath).catch((error: NodeJS.ErrnoException) => {
+              if (error.code === 'ENOENT') return null;
+              throw error;
+            }),
+          });
+          await writeWorkflowStateTransaction(
+            transactionBaseStateDir,
+            transactionContextRoot,
+            snapshot,
+            transactionId,
+            options.lockLease!.token,
+            options.lockLease!.generation,
+            options.dependencies ?? {},
+          );
         });
-        await writeWorkflowStateTransaction(
-          baseStateDir,
-          cwd,
-          snapshot,
-          transactionId,
-          options.lockLease!.token,
-          options.lockLease!.generation,
-          options.dependencies ?? {},
-        );
+        captureTail = capture;
+        return capture;
       },
     });
     activeLeases.add(acquiredLease);
     activeTransactions.set(path, acquiredLease);
 
     try {
-      const result = await fn(acquiredLease);
+      let callbackError: unknown;
+      let callbackFailed = false;
+      let result!: T;
+      try {
+        result = await fn(acquiredLease);
+      } catch (error) {
+        callbackError = error;
+        callbackFailed = true;
+      }
+      capturesOpen = false;
+      try {
+        await captureTail;
+      } catch (captureError) {
+        if (callbackFailed) {
+          throw new AggregateError(
+            [callbackError, captureError],
+            `workflow_state_transaction_capture_failed:${String(callbackError)}`,
+          );
+        }
+        throw captureError;
+      }
+      try {
+        await assertRequestedStateTransactionRoot(baseStateDirInput, transactionBaseStateDir);
+        await assertRequestedContextTransactionRoot(cwd, transactionContextRoot);
+      } catch (rootError) {
+        if (callbackFailed) {
+          throw new AggregateError(
+            [callbackError, rootError],
+            `workflow_state_transaction_root_changed:${baseStateDirInput}`,
+          );
+        }
+        throw rootError;
+      }
+      if (callbackFailed) throw callbackError;
       await options.lockLease.assertOwned();
       await assertWorkflowStateTransactionOwned(
-        baseStateDir,
+        transactionBaseStateDir,
         transactionId,
         options.lockLease.token,
         options.lockLease.generation,
@@ -631,18 +886,18 @@ export async function withWorkflowStateTransaction<T>(
       await syncWorkflowStatePaths(snapshot, options.dependencies);
       await options.lockLease.assertOwned();
       await assertWorkflowStateTransactionOwned(
-        baseStateDir,
+        transactionBaseStateDir,
         transactionId,
         options.lockLease.token,
         options.lockLease.generation,
       );
-      await removeWorkflowStateTransaction(baseStateDir, options.dependencies);
+      await removeWorkflowStateTransaction(transactionBaseStateDir, options.dependencies);
       return result;
     } catch (error) {
       try {
         await options.lockLease.assertOwned();
         await assertWorkflowStateTransactionOwned(
-          baseStateDir,
+          transactionBaseStateDir,
           transactionId,
           options.lockLease.token,
           options.lockLease.generation,
@@ -650,12 +905,12 @@ export async function withWorkflowStateTransaction<T>(
         await restoreWorkflowStateSnapshot(snapshot, options.dependencies);
         await options.lockLease.assertOwned();
         await assertWorkflowStateTransactionOwned(
-          baseStateDir,
+          transactionBaseStateDir,
           transactionId,
           options.lockLease.token,
           options.lockLease.generation,
         );
-        await removeWorkflowStateTransaction(baseStateDir, options.dependencies);
+        await removeWorkflowStateTransaction(transactionBaseStateDir, options.dependencies);
       } catch (rollbackError) {
         try {
           await options.lockLease.markRecoveryRequired();

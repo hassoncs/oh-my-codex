@@ -45,6 +45,26 @@ Read precedence is:
 
 If root and session disagree for the same mode, session wins for the active execution context, but stale root survivors should be terminalized during reconciliation when they would otherwise resurrect old state.
 
+### 4. Lock and transaction root binding
+
+Workflow mutation authority pins filesystem identity, not only lexical paths:
+
+- lock acquisition creates the state directory when needed, resolves its
+  canonical real path, and stores that path in the lock lease
+- transaction acquisition binds both canonical `.omx/state` and canonical
+  `.omx/context` roots for the project
+- every nested mutation must reuse the active transaction lease and write via
+  `transactionLease.baseStateDir` / `transactionLease.contextRoot`
+- replacing a project or state-path alias during a transaction fails loud;
+  writes and rollback cannot follow the retargeted alias
+- equivalent macOS `/var` and `/private/var` spellings remain compatible because
+  lexical paths are translated to the pinned canonical roots
+- transaction journals distinguish state and context entries and bind context
+  recovery to the canonical context-root hash
+
+This prevents a symlink or project-alias retarget from redirecting state,
+Autopilot context snapshots, or rollback after authority was acquired.
+
 ## Terminal lifecycle outcome compatibility
 
 For the explicit terminal stop model, treat workflow `current_phase` and user-facing terminal lifecycle outcome as related but separate concepts.
@@ -76,6 +96,8 @@ Recommended read precedence for terminal lifecycle interpretation:
 
 - `src/state/workflow-transition.ts` — transition policy and decision model
 - `src/state/workflow-transition-reconcile.ts` — shared transition reconciliation helper
+- `src/state/workflow-state-lock.ts` — canonical state-root lock authority
+- `src/state/workflow-state-transaction.ts` — state/context snapshot, journal, and rollback authority
 - `src/modes/base.ts` — mode start/update lifecycle
 - `src/mcp/state-server.ts` — MCP state writes/reads/clears
 - `src/hooks/keyword-detector.ts` — prompt keyword activation + state seeding

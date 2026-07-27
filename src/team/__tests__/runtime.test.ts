@@ -28,6 +28,7 @@ import {
   readWorkerStatus,
   writeWorkerStatus,
   readTeamManifestV2,
+  readTeamPhase,
   writeTeamManifestV2,
 } from '../state.js';
 import {
@@ -2386,12 +2387,14 @@ esac
   it('startTeam saves interactive pane ids before concurrent readiness attempts', async () => {
     const source = await readFile(join(process.cwd(), 'src', 'team', 'runtime.ts'), 'utf-8');
     const applyMatch = source.match(
-      /applyCreatedInteractiveSessionToConfig\(\s*config,\s*createdSession,\s*workerPaneIds\s*\);/m,
+      /applyCreatedInteractiveSessionToConfig\(\s*([A-Za-z_$][\w$]*),\s*createdSession,\s*workerPaneIds\s*\);/m,
     );
-    const saveMatch = source.match(/await saveTeamConfig\(config, leaderCwd\);/m);
-    const readyMatch = source.match(/waitForWorkerReadyAsync\(/m);
-
     const applyIndex = applyMatch?.index ?? -1;
+    const appliedConfig = applyMatch?.[1];
+    const saveMatch = appliedConfig
+      ? source.match(new RegExp(`await saveTeamConfig\\(${appliedConfig}, leaderCwd\\);`))
+      : null;
+    const readyMatch = source.match(/waitForWorkerReadyAsync\(/m);
     const saveIndex = saveMatch?.index ?? -1;
     const readyIndex = readyMatch?.index ?? -1;
 
@@ -3592,8 +3595,10 @@ process.on('SIGTERM', () => process.exit(0));
 
           assert.equal(
             existsSync(join(cwd, '.omx', 'state', 'team', runtimeTeamName)),
-            false,
+            true,
           );
+          assert.equal((await readTeamPhase(runtimeTeamName, cwd))?.current_phase, 'failed');
+          assert.equal((await readModeState('team', cwd))?.current_phase, 'failed');
         },
       );
     } finally {
@@ -3657,6 +3662,47 @@ process.on('SIGTERM', () => process.exit(0));
     } finally {
       if (typeof prevLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = prevLaunchMode;
       else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('rolls back earlier worktrees when later provisioning fails', async () => {
+    const repo = await initRepo();
+    const conflictingPath = await addWorktree(
+      repo,
+      'partial-start/worker-2',
+      'omx-runtime-partial-conflict-',
+    );
+    try {
+      await assert.rejects(
+        withoutTeamWorkerEnv(() => startTeam(
+          'team-partial-provision',
+          'second worktree collision must roll back first worktree',
+          'executor',
+          2,
+          [
+            { subject: 'w1', description: 'worker one', owner: 'worker-1' },
+            { subject: 'w2', description: 'worker two', owner: 'worker-2' },
+          ],
+          repo,
+          { worktreeMode: { enabled: true, detached: false, name: 'partial-start' } },
+        )),
+        /branch_in_use:partial-start\/worker-2/,
+      );
+
+      assert.throws(() => execFileSync(
+        'git',
+        ['show-ref', '--verify', '--quiet', 'refs/heads/partial-start/worker-1'],
+        { cwd: repo, stdio: 'ignore' },
+      ));
+      const worktrees = execFileSync('git', ['worktree', 'list', '--porcelain'], {
+        cwd: repo,
+        encoding: 'utf-8',
+      });
+      assert.doesNotMatch(worktrees, /partial-start\/worker-1/);
+    } finally {
+      execFileSync('git', ['worktree', 'remove', '--force', conflictingPath], { cwd: repo, stdio: 'ignore' });
+      await rm(conflictingPath, { recursive: true, force: true });
       await rm(repo, { recursive: true, force: true });
     }
   });
@@ -3737,14 +3783,16 @@ setTimeout(() => {}, 5000);`,
     }
   });
 
-  it('startTeam rolls back prompt workers and team state when mode-state commit fails', async () => {
+  it('startTeam commits mode admission before spawning prompt workers', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-mode-commit-rollback-'));
     const binDir = join(cwd, 'bin');
     const fakeCodexPath = join(binDir, 'codex');
+    const spawnCapturePath = join(cwd, 'worker-spawned');
     await mkdir(binDir, { recursive: true });
     await writeFakePromptWorkerBinary(
       fakeCodexPath,
       `
+require('fs').writeFileSync(process.env.OMX_ADMISSION_SPAWN_CAPTURE, 'spawned');
 process.stdin.resume();
 setInterval(() => {}, 1000);
 process.on('SIGTERM', () => process.exit(0));
@@ -3757,31 +3805,34 @@ process.on('SIGTERM', () => process.exit(0));
       [join(stateDir, 'run-state.json'), '{"version":1,"mode":"prior","active":false,"outcome":"finish","updated_at":"prior"}'],
       [join(stateDir, 'skill-active-state.json'), '{"version":1,"active":false,"skill":"prior","active_skills":[]}'],
     ]);
-    for (const [path, content] of priorFiles) {
-      await writeFile(path, content);
-    }
+    for (const [path, content] of priorFiles) await writeFile(path, content);
 
     let runtimeTeamName = '';
-    let workerPid = 0;
+    let cleanupCalled = false;
     try {
       await assert.rejects(
-        withPromptModeCodexEnv(binDir, {}, () =>
+        withPromptModeCodexEnv(binDir, { OMX_ADMISSION_SPAWN_CAPTURE: spawnCapturePath }, () =>
           withoutTeamWorkerEnv(() =>
             startTeam(
               'team-mode-commit-rollback',
-              'mode-state commit failure must tear down runtime',
+              'mode-state admission failure must have zero worker effect',
               'executor',
               1,
               [{ subject: 's', description: 'd', owner: 'worker-1' }],
               cwd,
               {
-                commitModeState: async (runtime, authority) => {
-                  runtimeTeamName = runtime.teamName;
-                  workerPid = runtime.config.workers[0]?.pid ?? 0;
-                  assert.ok(workerPid > 0, 'prompt worker must exist before mode-state commit');
+                cleanupLaunchOrphanedMcpProcesses: async () => {
+                  cleanupCalled = true;
+                  return { dryRun: false, candidates: [], terminatedCount: 0, forceKilledCount: 0, failedPids: [] };
+                },
+                commitModeState: async (admission, authority) => {
+                  runtimeTeamName = admission.teamName;
+                  assert.equal(admission.config.workers[0]?.pid, undefined);
+                  assert.equal(existsSync(spawnCapturePath), false);
+                  assert.equal(cleanupCalled, false);
                   assert.equal(
-                    existsSync(join(cwd, '.omx', 'state', 'team', runtime.teamName)),
-                    true,
+                    existsSync(join(cwd, '.omx', 'state', 'team', admission.teamName)),
+                    false,
                   );
                   await startMode('team', 'partial mode-state commit', 5, cwd, {
                     workflowLockLease: authority.lockLease,
@@ -3795,21 +3846,149 @@ process.on('SIGTERM', () => process.exit(0));
       );
 
       assert.ok(runtimeTeamName);
-      assert.equal(
-        existsSync(join(cwd, '.omx', 'state', 'team', runtimeTeamName)),
-        false,
-      );
+      assert.equal(existsSync(spawnCapturePath), false);
+      assert.equal(cleanupCalled, false);
+      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', runtimeTeamName)), false);
       for (const [path, content] of priorFiles) {
         assert.equal(await readFile(path, 'utf-8'), content);
       }
-      assert.throws(() => process.kill(workerPid, 0));
     } finally {
-      if (workerPid > 0) {
-        try {
-          process.kill(workerPid, 'SIGKILL');
-        } catch {}
-      }
       await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam never launches Gemini before mode admission commits', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-gemini-admission-'));
+    const binDir = join(cwd, 'bin');
+    const fakeGeminiPath = join(binDir, 'gemini');
+    const capturePath = join(cwd, 'gemini-started');
+    await mkdir(binDir, { recursive: true });
+    await writeFile(
+      fakeGeminiPath,
+      `#!/bin/sh
+printf started > "$OMX_GEMINI_ADMISSION_CAPTURE"
+sleep 30
+`,
+      { mode: 0o755 },
+    );
+
+    try {
+      await assert.rejects(
+        withPromptModeCodexEnv(binDir, {
+          OMX_TEAM_WORKER_CLI: 'gemini',
+          OMX_GEMINI_ADMISSION_CAPTURE: capturePath,
+        }, () => withoutTeamWorkerEnv(() => startTeam(
+          'team-gemini-admission',
+          'Gemini prompt must wait for admission',
+          'executor',
+          1,
+          [{ subject: 's', description: 'd', owner: 'worker-1' }],
+          cwd,
+          {
+            commitModeState: async () => {
+              assert.equal(existsSync(capturePath), false);
+              throw new Error('simulated_gemini_admission_failure');
+            },
+          },
+        ))),
+        /simulated_gemini_admission_failure/,
+      );
+      assert.equal(existsSync(capturePath), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves admitted worker edits and state when startup fails', async () => {
+    const repo = await initRepo();
+    const binDir = await mkdtemp(join(tmpdir(), 'omx-runtime-worker-bin-'));
+    const fakeCodexPath = join(binDir, 'codex');
+    await mkdir(binDir, { recursive: true });
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      `
+const fs = require('fs');
+const path = require('path');
+const worker = String(process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER || '');
+const [teamName, workerName] = worker.split('/');
+if (workerName === 'worker-1') {
+  fs.writeFileSync(path.join(process.cwd(), 'README.md'), 'worker tracked output\\n');
+  fs.writeFileSync(path.join(process.cwd(), 'worker-output.txt'), 'worker untracked output\\n');
+  const workerDir = path.join(process.env.OMX_TEAM_STATE_ROOT, 'team', teamName, 'workers', workerName);
+  fs.mkdirSync(workerDir, { recursive: true });
+  fs.writeFileSync(path.join(workerDir, 'status.json'), JSON.stringify({
+    state: 'working',
+    current_task_id: '1',
+    updated_at: new Date().toISOString(),
+  }));
+}
+process.stdin.resume();
+setInterval(() => {}, 1000);
+process.on('SIGTERM', () => process.exit(0));
+`,
+      { emitStartupEvidence: false },
+    );
+
+    let internalTeamName = '';
+    try {
+      await assert.rejects(
+        withPromptModeCodexEnv(binDir, {
+          OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS: '1000',
+          OMX_TEAM_STARTUP_DISPATCH_RETRIES: '1',
+          OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS: '10',
+        }, () => withoutTeamWorkerEnv(() => startTeam(
+          'team-admitted-preserve',
+          'preserve worker one when worker two startup fails',
+          'executor',
+          2,
+          [
+            { subject: 'w1', description: 'worker one', owner: 'worker-1' },
+            { subject: 'w2', description: 'worker two', owner: 'worker-2' },
+          ],
+          repo,
+          {
+            worktreeMode: { enabled: true, detached: false, name: 'startup-preserve' },
+            commitModeState: async (admission, authority) => {
+              internalTeamName = admission.teamName;
+              await startMode('team', 'admitted team startup', 5, repo, {
+                workflowLockLease: authority.lockLease,
+                workflowTransactionLease: authority.transactionLease,
+              });
+            },
+          },
+        ))),
+        /worker_notify_failed:worker-2:codex_startup_no_evidence_after_fallback:prompt_stdin_sent/,
+      );
+
+      assert.ok(internalTeamName);
+      const workerOnePath = join(repo, '.omx', 'team', internalTeamName, 'worktrees', 'worker-1');
+      assert.equal(existsSync(workerOnePath), true);
+      assert.equal(await readFile(join(workerOnePath, 'worker-output.txt'), 'utf-8'), 'worker untracked output\n');
+      const phase = await readTeamPhase(internalTeamName, repo);
+      assert.equal(phase?.current_phase, 'failed');
+      const mode = await readModeState('team', repo);
+      assert.equal(mode?.active, false);
+      assert.equal(mode?.current_phase, 'failed');
+
+      const salvageRefs = execFileSync(
+        'git',
+        ['for-each-ref', '--format=%(refname)', 'refs/heads/salvage/'],
+        { cwd: repo, encoding: 'utf-8' },
+      ).trim().split(/\r?\n/).filter(Boolean);
+      assert.ok(salvageRefs.length > 0);
+      assert.ok(salvageRefs.some((ref) => {
+        try {
+          return execFileSync('git', ['show', `${ref}:worker-output.txt`], {
+            cwd: repo,
+            encoding: 'utf-8',
+          }) === 'worker untracked output\n';
+        } catch {
+          return false;
+        }
+      }));
+    } finally {
+      await rm(binDir, { recursive: true, force: true });
+      await rm(repo, { recursive: true, force: true });
     }
   });
 
@@ -4517,6 +4696,14 @@ fs.writeFileSync(path.join(logDir, 'env.json'), JSON.stringify({
   teamStateRoot: process.env.OMX_TEAM_STATE_ROOT || '',
   worker: process.env.OMX_TEAM_WORKER || '',
 }));
+const [teamName, workerName] = String(process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER || '').split('/');
+const workerDir = path.join(process.env.OMX_TEAM_STATE_ROOT, 'team', teamName, 'workers', workerName);
+fs.mkdirSync(workerDir, { recursive: true });
+fs.writeFileSync(path.join(workerDir, 'status.json'), JSON.stringify({
+  state: 'working',
+  current_task_id: '1',
+  updated_at: new Date().toISOString(),
+}));
 process.stdin.on('data', (chunk) => {
   fs.appendFileSync(path.join(logDir, 'stdin.log'), chunk.toString());
 });
@@ -4694,15 +4881,9 @@ process.on('SIGTERM', () => process.exit(0));
     const fakeCodexPath = join(binDir, 'codex');
     const logDir = await mkdtemp(join(tmpdir(), 'omx-runtime-prompt-logs-'));
     const envLogPath = join(logDir, 'env.json');
-    await writeFile(
+    await writeFakePromptWorkerBinary(
       fakeCodexPath,
-      `#!/usr/bin/env node
-if (process.argv[2] === '--version') {
-  console.log('codex 0.0.0-test');
-  process.exit(0);
-}
-const fs = require('fs');
-const path = require('path');
+      `
 const logDir = process.env.OMX_TEST_LOG_DIR;
 fs.mkdirSync(logDir, { recursive: true });
 fs.writeFileSync(path.join(logDir, 'env.json'), JSON.stringify({
@@ -4714,7 +4895,6 @@ process.stdin.resume();
 setInterval(() => {}, 1000);
 process.on('SIGTERM', () => process.exit(0));
 `,
-      { mode: 0o755 },
     );
 
     const prevPath = process.env.PATH;

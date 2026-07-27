@@ -39,6 +39,7 @@ export interface WorkerInfo {
   worktree_repo_root?: string;
   worktree_path?: string;
   worktree_branch?: string;
+  worktree_base_ref?: string;
   worktree_detached?: boolean;
   worktree_created?: boolean;
   team_state_root?: string;

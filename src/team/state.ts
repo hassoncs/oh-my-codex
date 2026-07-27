@@ -1,5 +1,5 @@
 import { appendFile, readFile, writeFile, mkdir, rm, rename, readdir } from 'fs/promises';
-import { join, dirname, resolve, sep } from 'path';
+import { basename, join, dirname, resolve, sep } from 'path';
 import { existsSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { readUsableSessionState } from '../hooks/session.js';
@@ -69,7 +69,7 @@ import type { TeamReminderIntent } from './reminder-intents.js';
 import type { WorktreeMode } from './worktree.js';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
 import { normalizeTeamTaskCoordinationPlanForStorage } from './coordination-protocol.js';
-import { readModeState, startMode, updateModeState } from '../modes/base.js';
+import { startMode, updateModeState } from '../modes/base.js';
 import { reconcilePhaseStateForMonitor } from './phase-controller.js';
 import { getBaseStateDir, resolveStateScope } from '../mcp/state-paths.js';
 import { preflightWorkflowTransition } from '../state/workflow-transition-reconcile.js';
@@ -131,6 +131,7 @@ export interface WorkerInfo {
   worktree_repo_root?: string;
   worktree_path?: string;
   worktree_branch?: string;
+  worktree_base_ref?: string;
   worktree_detached?: boolean;
   worktree_created?: boolean;
   team_state_root?: string;
@@ -662,9 +663,60 @@ function assertSafeTeamName(teamName: string): void {
   }
 }
 
-function teamDir(teamName: string, cwd: string): string {
+function teamDirForStateRoot(teamName: string, stateRoot: string): string {
   assertSafeTeamName(teamName);
-  return join(resolveTeamStateRoot(cwd), 'team', teamName);
+  return join(stateRoot, 'team', teamName);
+}
+
+function teamDir(teamName: string, cwd: string): string {
+  return teamDirForStateRoot(teamName, resolveTeamStateRoot(cwd));
+}
+
+function taskFilePathForStateRoot(teamName: string, taskId: string, stateRoot: string): string {
+  validateTaskId(taskId);
+  return join(teamDirForStateRoot(teamName, stateRoot), 'tasks', `task-${taskId}.json`);
+}
+
+function retryIntentPathForStateRoot(teamName: string, taskId: string, stateRoot: string): string {
+  validateTaskId(taskId);
+  return join(teamDirForStateRoot(teamName, stateRoot), 'retry-intents', `task-${taskId}.json`);
+}
+
+function teamPhasePathForStateRoot(teamName: string, stateRoot: string): string {
+  return join(teamDirForStateRoot(teamName, stateRoot), 'phase.json');
+}
+
+function teamEventLogPathForStateRoot(teamName: string, stateRoot: string): string {
+  return join(teamDirForStateRoot(teamName, stateRoot), 'events', 'events.ndjson');
+}
+
+async function readTaskForStateRoot(
+  teamName: string,
+  taskId: string,
+  stateRoot: string,
+): Promise<TeamTask | null> {
+  try {
+    const path = taskFilePathForStateRoot(teamName, taskId, stateRoot);
+    if (!existsSync(path)) return null;
+    const parsed = JSON.parse(await readFile(path, 'utf8')) as unknown;
+    return isTeamTask(parsed) ? normalizeTask(parsed) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function withTaskClaimLockForStateRoot<T>(
+  teamName: string,
+  taskId: string,
+  cwd: string,
+  stateRoot: string,
+  fn: () => Promise<T>,
+): Promise<{ ok: true; value: T } | { ok: false }> {
+  return withTaskClaimLockImpl(teamName, taskId, cwd, LOCK_STALE_MS, {
+    teamDir: (name) => teamDirForStateRoot(name, stateRoot),
+    taskClaimLockDir: (name, id) => join(teamDirForStateRoot(name, stateRoot), 'claims', `task-${id}.lock`),
+    mailboxLockDir: (name, workerName) => join(teamDirForStateRoot(name, stateRoot), 'mailbox', `.lock-${workerName}`),
+  }, fn);
 }
 
 function workerDir(teamName: string, workerName: string, cwd: string): string {
@@ -1524,8 +1576,7 @@ interface FailedTaskRetryIntent {
 }
 
 function retryIntentPath(teamName: string, taskId: string, cwd: string): string {
-  validateTaskId(taskId);
-  return join(teamDir(teamName, cwd), 'retry-intents', `task-${taskId}.json`);
+  return retryIntentPathForStateRoot(teamName, taskId, resolveTeamStateRoot(cwd));
 }
 
 async function writeRetryIntent(
@@ -1533,8 +1584,11 @@ async function writeRetryIntent(
   previous: TeamTaskV2,
   next: TeamTaskV2,
   cwd: string,
+  stateRoot?: string,
 ): Promise<{ path: string; intent: FailedTaskRetryIntent }> {
-  const path = retryIntentPath(teamName, previous.id, cwd);
+  const path = stateRoot
+    ? retryIntentPathForStateRoot(teamName, previous.id, stateRoot)
+    : retryIntentPath(teamName, previous.id, cwd);
   const intent: FailedTaskRetryIntent = {
     version: 1,
     task_id: previous.id,
@@ -1552,10 +1606,22 @@ async function reactivateTeamWorkflowForRetry(
   taskId: string,
   cwd: string,
   authority: WorkflowStateMutationAuthority,
+  sessionId?: string,
 ): Promise<void> {
-  const scope = await resolveStateScope(cwd);
-  const baseStateDir = getBaseStateDir(cwd);
-  const modeState = await readModeState('team', cwd);
+  const baseStateDir = authority.transactionLease.baseStateDir;
+  const modeStatePaths = [
+    ...(sessionId ? [join(baseStateDir, 'sessions', sessionId, 'team-state.json')] : []),
+    join(baseStateDir, 'team-state.json'),
+  ];
+  let modeState: Record<string, unknown> | null = null;
+  for (const path of modeStatePaths) {
+    try {
+      modeState = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
   const stateTeamName = typeof modeState?.team_name === 'string' ? modeState.team_name.trim() : '';
   if (stateTeamName && stateTeamName !== teamName) {
     throw new Error(`team_retry_mode_state_mismatch:${stateTeamName}:${teamName}`);
@@ -1564,13 +1630,19 @@ async function reactivateTeamWorkflowForRetry(
   if (modeState?.active !== true) {
     const transition = await preflightWorkflowTransition(cwd, 'team', {
       action: 'start',
-      sessionId: scope.sessionId,
+      sessionId,
       baseStateDir,
       allowNestedAutopilotTeam: true,
       workflowLockLease: authority.lockLease,
     });
-    const config = await readTeamConfig(teamName, cwd);
-    await startMode('team', config?.task ?? `Retry failed task ${taskId}`, 50, cwd, {
+    const configPath = join(teamDirForStateRoot(teamName, baseStateDir), 'config.json');
+    const config = await readFile(configPath, 'utf8')
+      .then((raw) => JSON.parse(raw) as { task?: unknown })
+      .catch(() => null);
+    const taskDescription = typeof config?.task === 'string' && config.task.trim()
+      ? config.task
+      : `Retry failed task ${taskId}`;
+    await startMode('team', taskDescription, 50, cwd, {
       allowNestedAutopilotTeam: true,
       preflightTransition: transition,
       workflowLockLease: authority.lockLease,
@@ -1580,21 +1652,32 @@ async function reactivateTeamWorkflowForRetry(
   await updateModeState('team', {
     current_phase: 'team-exec',
     team_name: teamName,
-  }, cwd, scope.sessionId, {
+  }, cwd, sessionId, {
     allowNestedAutopilotTeam: true,
     workflowLockLease: authority.lockLease,
     workflowTransactionLease: authority.transactionLease,
   });
-  const phase = await readTeamPhase(teamName, cwd);
-  await writeTeamPhase(teamName, reconcilePhaseStateForMonitor(phase, 'team-exec'), cwd);
+  const phasePath = () => teamPhasePathForStateRoot(teamName, baseStateDir);
+  const phase = await readTeamPhaseImpl(teamName, cwd, phasePath) as TeamPhaseState | null;
+  await writeTeamPhaseImpl(
+    teamName,
+    reconcilePhaseStateForMonitor(phase, 'team-exec'),
+    cwd,
+    phasePath,
+    writeAtomic,
+  );
 }
 
 async function hasRetryEvent(
   teamName: string,
   intent: FailedTaskRetryIntent,
   cwd: string,
+  stateRoot?: string,
 ): Promise<boolean> {
-  const raw = await readFile(teamEventLogPath(teamName, cwd), 'utf-8').catch(() => '');
+  const path = stateRoot
+    ? teamEventLogPathForStateRoot(teamName, stateRoot)
+    : teamEventLogPath(teamName, cwd);
+  const raw = await readFile(path, 'utf-8').catch(() => '');
   return raw.split('\n').some((line) => {
     if (!line.trim()) return false;
     try {
@@ -1612,10 +1695,11 @@ async function recordRetryEvent(
   teamName: string,
   intent: FailedTaskRetryIntent,
   cwd: string,
+  stateRoot?: string,
 ): Promise<void> {
-  if (await hasRetryEvent(teamName, intent, cwd)) return;
-  await appendTeamEvent(teamName, {
-    type: 'task_retried',
+  if (await hasRetryEvent(teamName, intent, cwd, stateRoot)) return;
+  const event = {
+    type: 'task_retried' as const,
     worker: 'leader-fixed',
     task_id: intent.task_id,
     reason: 'failed_task_requeued',
@@ -1623,7 +1707,20 @@ async function recordRetryEvent(
       previous_version: intent.expected_version,
       retry_version: intent.retry_version,
     },
-  }, cwd);
+  };
+  if (!stateRoot) {
+    await appendTeamEvent(teamName, event, cwd);
+    return;
+  }
+  const full = {
+    ...event,
+    event_id: randomUUID(),
+    team: teamName,
+    created_at: new Date().toISOString(),
+  } satisfies TeamEvent;
+  const path = teamEventLogPathForStateRoot(teamName, stateRoot);
+  await mkdir(dirname(path), { recursive: true });
+  await appendFile(path, `${JSON.stringify(full)}\n`, 'utf8');
 }
 
 function parseRetryIntent(raw: string): FailedTaskRetryIntent | null {
@@ -1660,16 +1757,19 @@ async function reconcileFailedTaskRetryIntentsUnlocked(
   cwd: string,
   intentPaths: string[],
   authority: WorkflowStateMutationAuthority,
+  sessionId?: string,
 ): Promise<void> {
-  for (const path of intentPaths) {
+  const stateRoot = authority.transactionLease.baseStateDir;
+  for (const lexicalPath of intentPaths) {
+    const path = join(teamDirForStateRoot(teamName, stateRoot), 'retry-intents', basename(lexicalPath));
     const intent = parseRetryIntent(await readFile(path, 'utf-8'));
     if (!intent) throw new Error(`retry_intent_invalid:${path}`);
-    const task = await readTask(teamName, intent.task_id, cwd);
+    const task = await readTaskForStateRoot(teamName, intent.task_id, stateRoot);
     if (!task) throw new Error(`retry_intent_task_missing:${teamName}:${intent.task_id}`);
     const current = normalizeTask(task);
     if (current.version === intent.expected_version && current.status === 'failed') {
       await writeAtomic(
-        taskFilePath(teamName, intent.task_id, cwd),
+        taskFilePathForStateRoot(teamName, intent.task_id, stateRoot),
         JSON.stringify(intent.retry_task, null, 2),
       );
     } else if (current.version < intent.retry_version) {
@@ -1692,15 +1792,22 @@ async function reconcileFailedTaskRetryIntentsUnlocked(
       reconciledTask.version >= intent.retry_version
       && ['pending', 'blocked', 'in_progress'].includes(reconciledTask.status)
     ) {
-      await reactivateTeamWorkflowForRetry(teamName, intent.task_id, cwd, authority);
+      await reactivateTeamWorkflowForRetry(teamName, intent.task_id, cwd, authority, sessionId);
     }
-    await recordRetryEvent(teamName, intent, cwd);
+    await recordRetryEvent(teamName, intent, cwd, stateRoot);
     await rm(path, { force: true });
   }
 }
 
-async function listRetryIntentPaths(teamName: string, cwd: string): Promise<string[]> {
-  const dir = join(teamDir(teamName, cwd), 'retry-intents');
+async function listRetryIntentPaths(
+  teamName: string,
+  cwd: string,
+  stateRoot?: string,
+): Promise<string[]> {
+  const dir = join(
+    stateRoot ? teamDirForStateRoot(teamName, stateRoot) : teamDir(teamName, cwd),
+    'retry-intents',
+  );
   const entries = await readdir(dir).catch((error: NodeJS.ErrnoException) => {
     if (error.code === 'ENOENT') return [];
     throw error;
@@ -1716,29 +1823,35 @@ async function withRetryWorkflowTransaction<T>(
   cwd: string,
   lockLease: WorkflowStateLockLease,
   intentPaths: string[],
-  fn: (authority: WorkflowStateMutationAuthority) => Promise<T>,
+  fn: (authority: WorkflowStateMutationAuthority, sessionId?: string) => Promise<T>,
   additionalPaths: string[] = [],
   dependencies: WorkflowStateTransactionDependencies = {},
 ): Promise<T> {
   const scope = await resolveStateScope(cwd);
-  const parsedIntents = await Promise.all(intentPaths.map(async (path) => ({
+  const stateRoot = lockLease.baseStateDir;
+  const canonicalIntentPaths = intentPaths.map((path) => join(
+    teamDirForStateRoot(teamName, stateRoot),
+    'retry-intents',
+    basename(path),
+  ));
+  const parsedIntents = await Promise.all(canonicalIntentPaths.map(async (path) => ({
     path,
     intent: parseRetryIntent(await readFile(path, 'utf-8')),
   })));
   const invalidIntent = parsedIntents.find(({ intent }) => !intent);
   if (invalidIntent) throw new Error(`retry_intent_invalid:${invalidIntent.path}`);
   const extraPaths = [
-    ...intentPaths,
-    ...parsedIntents.map(({ intent }) => taskFilePath(teamName, intent!.task_id, cwd)),
-    teamPhasePath(teamName, cwd),
-    teamEventLogPath(teamName, cwd),
+    ...canonicalIntentPaths,
+    ...parsedIntents.map(({ intent }) => taskFilePathForStateRoot(teamName, intent!.task_id, stateRoot)),
+    teamPhasePathForStateRoot(teamName, stateRoot),
+    teamEventLogPathForStateRoot(teamName, stateRoot),
     ...additionalPaths,
   ];
   return withWorkflowStateTransaction(
     getBaseStateDir(cwd),
     cwd,
     scope.sessionId,
-    (transactionLease) => fn({ lockLease, transactionLease }),
+    (transactionLease) => fn({ lockLease, transactionLease }, scope.sessionId),
     extraPaths,
     { lockLease, dependencies },
   );
@@ -1750,18 +1863,19 @@ async function reconcileFailedTaskRetryIntentsUnderTeamLock(
 ): Promise<void> {
   const baseStateDir = getBaseStateDir(cwd);
   await withWorkflowStateLock(baseStateDir, cwd, async (lockLease) => {
-    const intentPaths = await listRetryIntentPaths(teamName, cwd);
+    const intentPaths = await listRetryIntentPaths(teamName, cwd, lockLease.baseStateDir);
     if (intentPaths.length === 0) return;
     await withRetryWorkflowTransaction(
       teamName,
       cwd,
       lockLease,
       intentPaths,
-      (authority) => reconcileFailedTaskRetryIntentsUnlocked(
+      (authority, sessionId) => reconcileFailedTaskRetryIntentsUnlocked(
         teamName,
         cwd,
         intentPaths,
         authority,
+        sessionId,
       ),
     );
   });
@@ -1788,31 +1902,35 @@ export async function retryFailedTask(
   return withReconciledTaskMutation(teamName, cwd, async () => {
     const baseStateDir = getBaseStateDir(cwd);
     return withWorkflowStateLock(baseStateDir, cwd, async (lockLease) => {
-      const intentPath = retryIntentPath(teamName, taskId, cwd);
-      return withRetryWorkflowTransaction(teamName, cwd, lockLease, [], async (authority) => {
+      const stateRoot = lockLease.baseStateDir;
+      const intentPath = retryIntentPathForStateRoot(teamName, taskId, stateRoot);
+      const canonicalTaskPath = taskFilePathForStateRoot(teamName, taskId, stateRoot);
+      return withRetryWorkflowTransaction(teamName, cwd, lockLease, [], async (authority, sessionId) => {
         let retryIntent!: Awaited<ReturnType<typeof writeRetryIntent>>;
         return retryFailedTaskImpl(taskId, expectedVersion, {
           teamName,
           cwd,
-          readTask,
+          readTask: (name, id) => readTaskForStateRoot(name, id, stateRoot),
           readTeamConfig,
-          withTaskClaimLock,
+          withTaskClaimLock: (name, id, _cwd, fn) => (
+            withTaskClaimLockForStateRoot(name, id, cwd, stateRoot, fn)
+          ),
           normalizeTask,
           isTerminalTaskStatus,
-          taskFilePath,
+          taskFilePath: (name, id) => taskFilePathForStateRoot(name, id, stateRoot),
           writeAtomic,
           beforeRetry: async (previous, next) => {
-            retryIntent = await writeRetryIntent(teamName, previous, next, cwd);
+            retryIntent = await writeRetryIntent(teamName, previous, next, cwd, stateRoot);
           },
           afterRetry: async () => {
-            await reactivateTeamWorkflowForRetry(teamName, taskId, cwd, authority);
-            await recordRetryEvent(teamName, retryIntent.intent, cwd);
+            await reactivateTeamWorkflowForRetry(teamName, taskId, cwd, authority, sessionId);
+            await recordRetryEvent(teamName, retryIntent.intent, cwd, stateRoot);
             await rm(retryIntent.path, { force: true });
           },
         });
       }, [
         intentPath,
-        taskFilePath(teamName, taskId, cwd),
+        canonicalTaskPath,
       ], dependencies.transaction);
     }, undefined, {
       ...dependencies.workflowLock,

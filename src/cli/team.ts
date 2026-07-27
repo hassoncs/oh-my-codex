@@ -96,14 +96,16 @@ async function persistExactTeamModeState(
   cwd: string,
   updates: Record<string, unknown>,
   sessionId?: string,
+  baseStateDir: string = getBaseStateDir(cwd),
 ): Promise<boolean> {
-  const statePath = getStatePath('team', cwd, sessionId);
+  const stateDir = sessionId ? join(baseStateDir, 'sessions', sessionId) : baseStateDir;
+  const statePath = join(stateDir, 'team-state.json');
   if (!existsSync(statePath)) return false;
 
   const current = JSON.parse(readFileSync(statePath, 'utf-8')) as Record<string, unknown>;
   const next = { ...current, ...updates };
   writeFileSync(statePath, JSON.stringify(next, null, 2));
-  await syncRunStateFromModeState(next, cwd, sessionId);
+  await syncRunStateFromModeState(next, cwd, sessionId, stateDir);
   return true;
 }
 
@@ -1282,11 +1284,18 @@ async function ensureTeamModeState(
   const scope = await resolveStateScope(cwd);
   const baseStateDir = getBaseStateDir(cwd);
   const mutate = async (mutationAuthority: WorkflowStateMutationAuthority): Promise<void> => {
+      const effectivePreflight = await preflightWorkflowTransition(cwd, 'team', {
+        action: 'start',
+        sessionId: scope.sessionId,
+        baseStateDir: mutationAuthority.lockLease.baseStateDir,
+        allowNestedAutopilotTeam: preflight?.allowNestedAutopilotTeam,
+        workflowLockLease: mutationAuthority.lockLease,
+      });
       const existing = await readModeState('team', cwd);
       if (!existing?.active) {
         await startMode('team', parsed.task, 50, cwd, {
           allowNestedAutopilotTeam: preflight?.allowNestedAutopilotTeam,
-          preflightTransition: preflight?.workflowTransition,
+          preflightTransition: effectivePreflight,
           workflowLockLease: mutationAuthority.lockLease,
           workflowTransactionLease: mutationAuthority.transactionLease,
         });
@@ -1377,21 +1386,22 @@ async function persistTeamShutdownModeState(
   const baseStateDir = getBaseStateDir(cwd);
   await withWorkflowStateLock(baseStateDir, cwd, (lockLease) =>
     withWorkflowStateTransaction(baseStateDir, cwd, scopedSessionId, async (transactionLease) => {
-      const authority = { lockLease, transactionLease };
-      const rootStatePath = getStatePath('team', cwd);
+      const canonicalBaseStateDir = transactionLease.baseStateDir;
+      const rootStatePath = join(canonicalBaseStateDir, 'team-state.json');
+      const scopedStatePath = scopedSessionId
+        ? join(canonicalBaseStateDir, 'sessions', scopedSessionId, 'team-state.json')
+        : null;
       const hasRootState = existsSync(rootStatePath);
-      const hasScopedState = scopedSessionId
-        ? existsSync(getStatePath('team', cwd, scopedSessionId))
-        : false;
+      const hasScopedState = Boolean(scopedStatePath && existsSync(scopedStatePath));
       if (hasRootState || hasScopedState) {
         if (hasRootState) {
-          await persistExactTeamModeState(cwd, shutdownState);
+          await persistExactTeamModeState(cwd, shutdownState, undefined, canonicalBaseStateDir);
         }
         if (scopedSessionId && hasScopedState) {
-          await persistExactTeamModeState(cwd, shutdownState, scopedSessionId);
+          await persistExactTeamModeState(cwd, shutdownState, scopedSessionId, canonicalBaseStateDir);
           await syncCanonicalSkillStateForMode({
             cwd,
-            baseStateDir,
+            baseStateDir: canonicalBaseStateDir,
             mode: 'team',
             active: false,
             currentPhase: 'cancelled',
@@ -1401,7 +1411,7 @@ async function persistTeamShutdownModeState(
         }
         await syncCanonicalSkillStateForMode({
           cwd,
-          baseStateDir,
+          baseStateDir: canonicalBaseStateDir,
           mode: 'team',
           active: false,
           currentPhase: 'cancelled',
@@ -1410,24 +1420,23 @@ async function persistTeamShutdownModeState(
         return;
       }
 
-      const existing = await readModeState('team', cwd);
+      const existingPath = scopedStatePath && existsSync(scopedStatePath)
+        ? scopedStatePath
+        : rootStatePath;
+      const existing = existsSync(existingPath)
+        ? JSON.parse(readFileSync(existingPath, 'utf-8')) as Record<string, unknown>
+        : null;
       if (!existing) {
-        if (configSnapshot) {
-          await ensureTeamModeState({
-            task: configSnapshot.task,
-            workerCount: configSnapshot.workerCount,
-            agentType: configSnapshot.agentType,
-            explicitAgentType: false,
-            explicitWorkerCount: false,
-            teamName,
-            allowRepoAwareDagHandoff: false,
-          }, undefined, undefined, authority);
-        } else {
-          await startMode('team', `shutdown team ${teamName}`, 50, cwd, {
+        await startMode(
+          'team',
+          configSnapshot?.task ?? `shutdown team ${teamName}`,
+          50,
+          cwd,
+          {
             workflowLockLease: lockLease,
             workflowTransactionLease: transactionLease,
-          });
-        }
+          },
+        );
       }
 
       await updateModeState('team', shutdownState, cwd, scopedSessionId, {

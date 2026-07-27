@@ -1,8 +1,9 @@
 import type { TeamTask, TeamTaskCoordinationMechanism } from "./state.js";
 import { existsSync } from "fs";
 import { mkdir, readFile, rm, stat, writeFile } from "fs/promises";
-import { dirname, join } from "path";
+import { dirname, isAbsolute, join, resolve } from "path";
 import { execFileSync } from "child_process";
+import { randomUUID } from "node:crypto";
 import {
   getFixLoopInstructions,
   getVerificationInstructions,
@@ -46,6 +47,8 @@ interface WorkerRootAgentsBackup {
   tracked: boolean;
   previousContent?: string;
   skipWorktreeApplied?: boolean;
+  ownershipToken: string;
+  generatedContent: string;
 }
 
 function buildWorkerRootAgentsBackupPath(
@@ -60,7 +63,7 @@ function buildWorkerRootAgentsBackupPath(
     "omx/root-agents-backup.json",
   ]);
   return gitPath
-    ? gitPath
+    ? isAbsolute(gitPath) ? gitPath : resolve(worktreePath, gitPath)
     : join(
         teamStateRoot,
         "team",
@@ -177,14 +180,17 @@ async function ensureGitInfoExcludePattern(
     "info/exclude",
   ]);
   if (!excludePath) return;
-  const existing = existsSync(excludePath)
-    ? await readFile(excludePath, "utf-8")
+  const resolvedExcludePath = isAbsolute(excludePath)
+    ? excludePath
+    : resolve(worktreePath, excludePath);
+  const existing = existsSync(resolvedExcludePath)
+    ? await readFile(resolvedExcludePath, "utf-8")
     : "";
   const lines = new Set(existing.split(/\r?\n/).filter(Boolean));
   if (lines.has(pattern)) return;
   const next = `${existing}${existing.endsWith("\n") || existing.length === 0 ? "" : "\n"}${pattern}\n`;
-  await mkdir(dirname(excludePath), { recursive: true });
-  await writeFile(excludePath, next, "utf-8");
+  await mkdir(dirname(resolvedExcludePath), { recursive: true });
+  await writeFile(resolvedExcludePath, next, "utf-8");
 }
 async function buildWorkerRootAgentsContent(
   options: WorkerRootAgentsOptions,
@@ -250,11 +256,15 @@ export async function writeWorkerWorktreeRootAgentsFile(
     await ensureGitInfoExcludePattern(options.worktreePath, "AGENTS.md");
   }
 
+  const ownershipToken = randomUUID();
+  const generatedContent = `${await buildWorkerRootAgentsContent(options, previousContent)}<!-- OMX:TEAM:ROOT-AGENTS:${ownershipToken} -->\n`;
   const backup: WorkerRootAgentsBackup = {
     existed,
     tracked,
     previousContent,
     skipWorktreeApplied,
+    ownershipToken,
+    generatedContent,
   };
   const backupPath = buildWorkerRootAgentsBackupPath(
     options.teamStateRoot,
@@ -264,11 +274,7 @@ export async function writeWorkerWorktreeRootAgentsFile(
   );
   await mkdir(dirname(backupPath), { recursive: true });
   await writeFile(backupPath, JSON.stringify(backup, null, 2), "utf-8");
-  await writeFile(
-    agentsPath,
-    await buildWorkerRootAgentsContent(options, previousContent),
-    "utf-8",
-  );
+  await writeFile(agentsPath, generatedContent, "utf-8");
   return agentsPath;
 }
 
@@ -299,6 +305,15 @@ export async function removeWorkerWorktreeRootAgentsFile(
     return;
   }
 
+  const currentContent = await readFile(agentsPath, "utf-8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  const ownsCurrentFile = typeof backup.generatedContent === "string"
+    && typeof backup.ownershipToken === "string"
+    && backup.ownershipToken.length > 0
+    && currentContent === backup.generatedContent;
+
   if (backup.tracked && backup.skipWorktreeApplied) {
     try {
       execFileSync("git", ["update-index", "--no-skip-worktree", "AGENTS.md"], {
@@ -310,6 +325,10 @@ export async function removeWorkerWorktreeRootAgentsFile(
     } catch {
       // Best-effort cleanup only.
     }
+  }
+
+  if (!ownsCurrentFile) {
+    throw new Error(`worker_root_agents_modified:${worktreePath}`);
   }
 
   if (backup.existed) {

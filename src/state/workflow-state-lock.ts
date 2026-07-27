@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, readdir, rename, rm, stat } from 'node:fs/promises';
+import { mkdir, open, readFile, readdir, realpath, rename, rm, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
 import {
@@ -370,14 +370,17 @@ export async function withWorkflowStateLock<T>(
   lease?: WorkflowStateLockLease,
   dependencies: WorkflowStateLockDependencies = {},
 ): Promise<T> {
-  const normalizedBaseStateDir = resolve(baseStateDir);
+  const requestedBaseStateDir = resolve(baseStateDir);
   if (lease) {
-    if (!activeLeases.has(lease) || lease.baseStateDir !== normalizedBaseStateDir) {
+    const canonicalBaseStateDir = await realpath(requestedBaseStateDir).catch(() => null);
+    if (!activeLeases.has(lease) || lease.baseStateDir !== canonicalBaseStateDir) {
       throw new Error(`workflow_state_lock_invalid_lease:${baseStateDir}`);
     }
     return fn(lease);
   }
 
+  await mkdir(requestedBaseStateDir, { recursive: true });
+  const normalizedBaseStateDir = await realpath(requestedBaseStateDir);
   const lockDir = join(normalizedBaseStateDir, '.workflow-state.lock');
   const ownerPath = join(lockDir, 'owner');
   const token = ownerToken();
@@ -386,7 +389,6 @@ export async function withWorkflowStateLock<T>(
   const retryMs = dependencies.retryMs ?? DEFAULT_LOCK_RETRY_MS;
   const heartbeatMs = dependencies.heartbeatMs ?? DEFAULT_LOCK_HEARTBEAT_MS;
   const deadline = Date.now() + timeoutMs;
-  await mkdir(normalizedBaseStateDir, { recursive: true });
   await recoverOrphanedPendingLocks(normalizedBaseStateDir, lockDir, dependencies);
   let recoveryOwner = await recoverOrphanedTakeoverProvenance(
     normalizedBaseStateDir,

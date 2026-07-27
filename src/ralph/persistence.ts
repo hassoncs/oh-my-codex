@@ -324,10 +324,14 @@ export async function recordRalphVisualFeedback(
 export async function ensureCanonicalRalphArtifacts(
   cwd: string,
   sessionId?: string,
+  baseStateDir?: string,
 ): Promise<RalphCanonicalArtifacts> {
-  const canonicalProgressPath = join(getStateDir(cwd, sessionId), 'ralph-progress.json');
+  const canonicalStateDir = baseStateDir
+    ? sessionId ? join(baseStateDir, 'sessions', sessionId) : baseStateDir
+    : getStateDir(cwd, sessionId);
+  const canonicalProgressPath = join(canonicalStateDir, 'ralph-progress.json');
   await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
-  await mkdir(getStateDir(cwd, sessionId), { recursive: true });
+  await mkdir(canonicalStateDir, { recursive: true });
 
   const canonicalPrdFiles = await listCanonicalPrdFiles(cwd);
   const migratedPrdResult = await migrateLegacyPrdIfNeeded(cwd, canonicalPrdFiles.at(-1));

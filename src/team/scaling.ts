@@ -10,8 +10,8 @@
  * - 'draining' worker status for graceful transitions during scale_down
  */
 
-import { join, resolve } from 'path';
-import { mkdir, rm } from 'fs/promises';
+import { isAbsolute, join, resolve } from 'path';
+import { mkdir, readFile, rm } from 'fs/promises';
 import {
   sanitizeTeamName,
   isTmuxAvailable,
@@ -26,6 +26,7 @@ import {
   writeWorkerStartupScriptCommand,
   resolveTeamWorkerCliForResolvedLaunchArgs,
   tagPaneTeamOwner,
+  readPaneTeamOwnerTagResult,
 } from './tmux-session.js';
 import { execFileSync, spawnSync } from 'child_process';
 import {
@@ -546,6 +547,7 @@ export async function scaleUp(
         worktree_repo_root: workerWorkspace ? workerWorkspace.repoRoot : undefined,
         worktree_path: workerWorkspace ? workerWorkspace.worktreePath : undefined,
         worktree_branch: workerWorkspace ? (workerWorkspace.branchName ?? undefined) : undefined,
+        worktree_base_ref: workerWorkspace?.baseRef,
         worktree_detached: workerWorkspace ? workerWorkspace.detached : undefined,
         worktree_created: workerWorkspace ? workerWorkspace.created : undefined,
         team_state_root: teamStateRoot,
@@ -737,6 +739,91 @@ export interface ScaleDownOptions {
   drainTimeoutMs?: number;
 }
 
+function exposeWorkerRootAgentsChanges(worktrees: EnsureWorktreeResult[]): string[] {
+  const exposed: string[] = [];
+  for (const worktree of worktrees) {
+    const tracked = execFileSync('git', ['ls-files', '-v', '--', 'AGENTS.md'], {
+      cwd: worktree.worktreePath,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (!tracked.split(/\r?\n/).some((line) => /^[Ss] /.test(line))) continue;
+    execFileSync('git', ['update-index', '--no-skip-worktree', 'AGENTS.md'], {
+      cwd: worktree.worktreePath,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    exposed.push(worktree.worktreePath);
+  }
+  return exposed;
+}
+
+function restoreWorkerRootAgentsSkipWorktree(worktreePaths: string[]): string[] {
+  const errors: string[] = [];
+  for (const worktreePath of worktreePaths) {
+    try {
+      execFileSync('git', ['update-index', '--skip-worktree', 'AGENTS.md'], {
+        cwd: worktreePath,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      errors.push(`${worktreePath}:${String(error)}`);
+    }
+  }
+  return errors;
+}
+
+function isMissingTmuxPaneError(error: string): boolean {
+  return /(?:can't find|no such) pane\b/i.test(error);
+}
+
+async function ownsGeneratedRootAgents(worktreePath: string): Promise<boolean> {
+  try {
+    const rawBackupPath = execFileSync(
+      'git',
+      ['rev-parse', '--git-path', 'omx/root-agents-backup.json'],
+      { cwd: worktreePath, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
+    ).trim();
+    const backupPath = isAbsolute(rawBackupPath) ? rawBackupPath : resolve(worktreePath, rawBackupPath);
+    const backup = JSON.parse(await readFile(backupPath, 'utf-8')) as {
+      generatedContent?: unknown;
+      ownershipToken?: unknown;
+    };
+    if (typeof backup.generatedContent !== 'string' || typeof backup.ownershipToken !== 'string') {
+      return false;
+    }
+    return await readFile(join(worktreePath, 'AGENTS.md'), 'utf-8') === backup.generatedContent;
+  } catch {
+    return false;
+  }
+}
+
+async function worktreeHasChanges(worktree: EnsureWorktreeResult): Promise<boolean> {
+  const status = execFileSync(
+    'git',
+    ['status', '--porcelain', '--untracked-files=all', '--ignored=matching'],
+    { cwd: worktree.worktreePath, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  const statusLines = status.split(/\r?\n/).filter(Boolean);
+  const ownsRootAgents = await ownsGeneratedRootAgents(worktree.worktreePath);
+  if (statusLines.some((line) => !ownsRootAgents || line.slice(3) !== 'AGENTS.md')) return true;
+  const head = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: worktree.worktreePath,
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+  return worktree.baseRef
+    ? head !== worktree.baseRef
+    : worktree.detached || Boolean(worktree.branchName);
+}
+
+async function changedWorktrees(worktrees: EnsureWorktreeResult[]): Promise<EnsureWorktreeResult[]> {
+  const changed = await Promise.all(worktrees.map(async (worktree) => ({
+    worktree,
+    changed: await worktreeHasChanges(worktree),
+  })));
+  return changed.filter((entry) => entry.changed).map((entry) => entry.worktree);
+}
+
 /**
  * Remove workers from a running team.
  *
@@ -811,11 +898,82 @@ export async function scaleDown(
       return { ok: false, error: 'Cannot remove all workers — at least 1 must remain' };
     }
 
+    const missingWorktreeBaselines = targetWorkers
+      .filter((worker) => worker.worktree_created === true && worker.worktree_detached === true)
+      .filter((worker) => !worker.worktree_base_ref)
+      .map((worker) => worker.name);
+    if (missingWorktreeBaselines.length > 0) {
+      return {
+        ok: false,
+        error: `scale_down_worktree_baseline_missing:${missingWorktreeBaselines.join(',')}`,
+      };
+    }
+
+    const expectedPaneOwner = config.tmux_pane_owner_id?.trim() ?? '';
+    const paneWorkers = targetWorkers.filter((worker): worker is WorkerInfo & { pane_id: string } => (
+      typeof worker.pane_id === 'string' && worker.pane_id.trim().length > 0
+    ));
+    if (paneWorkers.length > 0 && expectedPaneOwner === '') {
+      return { ok: false, error: 'scale_down_pane_owner_authority_missing' };
+    }
+    const livePaneWorkers: Array<WorkerInfo & { pane_id: string }> = [];
+    let alreadyTerminated = false;
+    for (const worker of paneWorkers) {
+      const paneId = worker.pane_id.trim();
+      const owner = readPaneTeamOwnerTagResult(paneId);
+      if (owner.status === 'error') {
+        if (isMissingTmuxPaneError(owner.error)) {
+          alreadyTerminated = true;
+          continue;
+        }
+        return {
+          ok: false,
+          error: `scale_down_pane_owner_read_failed:${worker.name}:${paneId}:${owner.error}`,
+        };
+      }
+      if (owner.status === 'missing') {
+        return { ok: false, error: `scale_down_pane_owner_missing:${worker.name}:${paneId}` };
+      }
+      if (owner.value !== expectedPaneOwner) {
+        return { ok: false, error: `scale_down_pane_owner_mismatch:${worker.name}:${paneId}` };
+      }
+      livePaneWorkers.push(worker);
+    }
+
     const sessionName = config.tmux_session;
-    const removedNames: string[] = [];
+    const previousStatuses = new Map<string, WorkerStatus>();
+    const restorePreviousStatuses = async (): Promise<string[]> => {
+      const errors: string[] = [];
+      for (const worker of targetWorkers) {
+        const previous = previousStatuses.get(worker.name);
+        if (!previous) continue;
+        try {
+          await writeWorkerStatus(sanitized, worker.name, previous, leaderCwd);
+        } catch (error) {
+          errors.push(`${worker.name}:${String(error)}`);
+        }
+      }
+      return errors;
+    };
+    const markFailedStatuses = async (reason: string): Promise<string[]> => {
+      const errors: string[] = [];
+      for (const worker of targetWorkers) {
+        try {
+          await writeWorkerStatus(sanitized, worker.name, {
+            state: 'failed',
+            reason,
+            updated_at: new Date().toISOString(),
+          }, leaderCwd);
+        } catch (error) {
+          errors.push(`${worker.name}:${String(error)}`);
+        }
+      }
+      return errors;
+    };
 
     // Phase 1: Set workers to 'draining' status
     for (const w of targetWorkers) {
+      previousStatuses.set(w.name, await readWorkerStatus(sanitized, w.name, leaderCwd));
       const drainingStatus: WorkerStatus = {
         state: 'draining',
         reason: 'scale_down requested by leader',
@@ -832,7 +990,7 @@ export async function scaleDown(
           targetWorkers.map(async (w) => {
             const status = await readWorkerStatus(sanitized, w.name, leaderCwd);
             return status.state === 'idle' || status.state === 'done' ||
-                   status.state === 'draining' || !isWorkerAlive(sessionName, w.index, w.pane_id);
+                   !isWorkerAlive(sessionName, w.index, w.pane_id);
           }),
         );
         if (allDrained.every(Boolean)) break;
@@ -840,21 +998,9 @@ export async function scaleDown(
       }
     }
 
-    // Phase 3: Kill tmux panes and remove from config
-    const leaderPaneId = config.leader_pane_id;
-    const hudPaneId = config.hud_pane_id;
-    const targetPaneIds = targetWorkers
-      .map((w) => w.pane_id)
-      .filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().length > 0);
-    await teardownWorkerPanes(targetPaneIds, {
-      leaderPaneId,
-      hudPaneId,
-    });
-    const detachedWorktreesToRollback: EnsureWorktreeResult[] = targetWorkers
+    const worktreesToPreserve: EnsureWorktreeResult[] = targetWorkers
       .filter((worker) =>
-        worker.worktree_created === true
-        && worker.worktree_detached === true
-        && typeof worker.worktree_repo_root === 'string'
+        typeof worker.worktree_repo_root === 'string'
         && worker.worktree_repo_root.length > 0
         && typeof worker.worktree_path === 'string'
         && worker.worktree_path.length > 0,
@@ -863,32 +1009,163 @@ export async function scaleDown(
         enabled: true,
         repoRoot: worker.worktree_repo_root as string,
         worktreePath: resolve(worker.worktree_path as string),
-        detached: true,
-        branchName: null,
+        baseRef: worker.worktree_base_ref,
+        detached: worker.worktree_detached === true,
+        branchName: worker.worktree_branch ?? null,
         created: true,
         reused: false,
         createdBranch: false,
       }));
+
+    let exposedRootAgentsWorktrees: string[] = [];
+    if (worktreesToPreserve.length > 0) {
+      try {
+        exposedRootAgentsWorktrees = exposeWorkerRootAgentsChanges(worktreesToPreserve);
+        const changed = await changedWorktrees(worktreesToPreserve);
+        if (changed.length > 0) {
+          await rollbackProvisionedWorktrees(changed, {
+            preserveWorktrees: true,
+            salvageContext: `team-scale-down-${sanitized}`,
+          });
+          const restoreErrors = [
+            ...restoreWorkerRootAgentsSkipWorktree(exposedRootAgentsWorktrees),
+            ...await restorePreviousStatuses(),
+          ];
+          return {
+            ok: false,
+            error: `scale_down_worktree_preserved:${changed.map((worktree) => worktree.worktreePath).join(',')}`
+              + (restoreErrors.length > 0 ? `;scale_down_restore_failed:${restoreErrors.join('|')}` : ''),
+          };
+        }
+      } catch (error) {
+        const restoreErrors = [
+          ...restoreWorkerRootAgentsSkipWorktree(exposedRootAgentsWorktrees),
+          ...await restorePreviousStatuses(),
+        ];
+        return {
+          ok: false,
+          error: `scale_down_worktree_preservation_failed:${String(error)}`
+            + (restoreErrors.length > 0 ? `;scale_down_restore_failed:${restoreErrors.join('|')}` : ''),
+        };
+      }
+    }
+
+    const paneTeardown = await teardownWorkerPanes(
+      livePaneWorkers.map((worker) => worker.pane_id.trim()),
+      { leaderPaneId: config.leader_pane_id, hudPaneId: config.hud_pane_id },
+    );
+    const quiesced = alreadyTerminated || paneTeardown.kill.succeeded > 0;
+    if (paneTeardown.kill.failed > 0) {
+      const statusErrors = await markFailedStatuses('scale_down_worker_quiesce_failed');
+      return {
+        ok: false,
+        error: `scale_down_worker_quiesce_failed:${paneTeardown.kill.failed}`
+          + (statusErrors.length > 0 ? `;scale_down_status_failed:${statusErrors.join('|')}` : ''),
+      };
+    }
+
+    if (worktreesToPreserve.length > 0) {
+      try {
+        const changed = await changedWorktrees(worktreesToPreserve);
+        if (changed.length > 0) {
+          await rollbackProvisionedWorktrees(changed, {
+            preserveWorktrees: true,
+            salvageContext: `team-scale-down-${sanitized}`,
+          });
+          const restoreErrors = restoreWorkerRootAgentsSkipWorktree(exposedRootAgentsWorktrees);
+          const statusErrors = quiesced
+            ? await markFailedStatuses('scale_down_worktree_preserved_after_quiesce')
+            : await restorePreviousStatuses();
+          return {
+            ok: false,
+            error: `scale_down_worktree_preserved_after_quiesce:${changed.map((worktree) => worktree.worktreePath).join(',')}`
+              + ([...restoreErrors, ...statusErrors].length > 0
+                ? `;scale_down_restore_failed:${[...restoreErrors, ...statusErrors].join('|')}`
+                : ''),
+          };
+        }
+      } catch (error) {
+        const statusErrors = quiesced
+          ? await markFailedStatuses('scale_down_final_preservation_failed')
+          : await restorePreviousStatuses();
+        return {
+          ok: false,
+          error: `scale_down_final_preservation_failed:${String(error)}`
+            + (statusErrors.length > 0 ? `;scale_down_status_failed:${statusErrors.join('|')}` : ''),
+        };
+      }
+    }
+
+    for (const worker of targetWorkers) {
+      if (!worker.worktree_path) continue;
+      try {
+        await removeWorkerWorktreeRootAgentsFile(
+          sanitized,
+          worker.name,
+          worker.team_state_root ?? config.team_state_root ?? resolveCanonicalTeamStateRoot(leaderCwd),
+          worker.worktree_path,
+        );
+      } catch (error) {
+        const statusErrors = await markFailedStatuses('scale_down_worktree_instruction_cleanup_failed');
+        return {
+          ok: false,
+          error: `scale_down_worktree_instruction_cleanup_failed:${worker.name}:${String(error)}`
+            + (statusErrors.length > 0 ? `;scale_down_status_failed:${statusErrors.join('|')}` : ''),
+        };
+      }
+    }
+
+    const detachedPaths = new Set(
+      targetWorkers
+        .filter((worker) =>
+          worker.worktree_created === true
+          && worker.worktree_detached === true
+          && typeof worker.worktree_path === 'string'
+          && worker.worktree_path.length > 0,
+        )
+        .map((worker) => resolve(worker.worktree_path as string)),
+    );
+    const detachedWorktreesToRollback = worktreesToPreserve.filter((worktree) => (
+      detachedPaths.has(worktree.worktreePath)
+    ));
     if (detachedWorktreesToRollback.length > 0) {
       try {
-        await rollbackProvisionedWorktrees(detachedWorktreesToRollback);
+        const outcomes = await rollbackProvisionedWorktrees(detachedWorktreesToRollback, {
+          salvageContext: `team-scale-down-${sanitized}`,
+        });
+        const preserved = outcomes.filter((outcome) => !outcome.removed);
+        if (preserved.length > 0) {
+          const statusErrors = await markFailedStatuses('scale_down_worktree_preserved_after_quiesce');
+          return {
+            ok: false,
+            error: `scale_down_worktree_preserved_after_quiesce:${preserved.map((outcome) => outcome.worktreePath).join(',')}`
+              + (statusErrors.length > 0 ? `;scale_down_status_failed:${statusErrors.join('|')}` : ''),
+          };
+        }
       } catch (error) {
-        return { ok: false, error: `scale_down_worktree_cleanup_failed:${String(error)}` };
+        const statusErrors = await markFailedStatuses('scale_down_worktree_cleanup_failed');
+        return {
+          ok: false,
+          error: `scale_down_worktree_cleanup_failed:${String(error)}`
+            + (statusErrors.length > 0 ? `;scale_down_status_failed:${statusErrors.join('|')}` : ''),
+        };
       }
     }
 
-    for (const w of targetWorkers) {
-      if (w.worktree_path) {
-        await removeWorkerWorktreeRootAgentsFile(sanitized, w.name, w.team_state_root ?? config.team_state_root ?? resolveCanonicalTeamStateRoot(leaderCwd), w.worktree_path).catch(() => {});
-      }
-      removedNames.push(w.name);
-    }
-
-    // Phase 4: Update config
+    const removedNames = targetWorkers.map((worker) => worker.name);
     const removedSet = new Set(removedNames);
     config.workers = config.workers.filter(w => !removedSet.has(w.name));
     config.worker_count = config.workers.length;
-    await saveTeamConfig(config, leaderCwd);
+    try {
+      await saveTeamConfig(config, leaderCwd);
+    } catch (error) {
+      const statusErrors = await markFailedStatuses('scale_down_state_transition_failed');
+      return {
+        ok: false,
+        error: `scale_down_state_transition_failed:${String(error)}`
+          + (statusErrors.length > 0 ? `;scale_down_status_failed:${statusErrors.join('|')}` : ''),
+      };
+    }
 
     await appendTeamEvent(sanitized, {
       type: 'team_leader_nudge',

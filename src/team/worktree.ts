@@ -1,5 +1,6 @@
 import { execFile as execFileCb, execFileSync, spawnSync } from 'child_process';
-import { existsSync, mkdirSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import { basename, dirname, join, resolve } from 'path';
 import { promisify } from 'util';
 import {
@@ -42,6 +43,7 @@ export interface EnsureWorktreeResult {
   enabled: true;
   repoRoot: string;
   worktreePath: string;
+  baseRef?: string;
   detached: boolean;
   branchName: string | null;
   created: boolean;
@@ -409,6 +411,7 @@ export function ensureWorktree(
       enabled: true,
       repoRoot: plan.repoRoot,
       worktreePath: resolve(plan.worktreePath),
+      baseRef: plan.baseRef,
       detached: plan.detached,
       branchName: plan.branchName,
       created: false,
@@ -471,6 +474,7 @@ export function ensureWorktree(
     enabled: true,
     repoRoot: plan.repoRoot,
     worktreePath: resolve(plan.worktreePath),
+    baseRef: plan.baseRef,
     detached: plan.detached,
     branchName: plan.branchName,
     created: true,
@@ -491,57 +495,231 @@ export function ensureWorktree(
 }
 
 export interface RollbackWorktreeOptions {
-  /** When true, skip `git branch -D` for branches created during provisioning (ralph policy). */
+  /** When true, keep created branches after removing their worktrees. */
   skipBranchDeletion?: boolean;
+  /** When true, capture recovery refs without removing worktrees. */
+  preserveWorktrees?: boolean;
+  salvageContext?: string;
+}
+
+export interface RollbackWorktreeOutcome {
+  worktreePath: string;
+  removed: boolean;
+  preservedRef: string | null;
+  checkpointCommit: string | null;
+  branchDeleted: boolean;
+}
+
+function gitFailure(error: unknown): string {
+  const details = error as Record<string, unknown>;
+  return String(details.stderr ?? details.message ?? `exit_${String(details.code ?? 'unknown')}`).trim();
+}
+
+function buildSalvageRef(
+  result: EnsureWorktreeResult,
+  context: string,
+): string {
+  const prefix = `salvage/${sanitizePathToken(context)}-${sanitizePathToken(basename(result.worktreePath))}`;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const branchName = `${prefix}-${Date.now()}${attempt === 0 ? '' : `-${attempt + 1}`}`;
+    if (!branchExists(result.repoRoot, branchName)) return `refs/heads/${branchName}`;
+  }
+  throw new Error(`worktree_salvage_ref_exhausted:${result.worktreePath}`);
+}
+
+async function createSalvageRef(
+  result: EnsureWorktreeResult,
+  context: string,
+  commit: string,
+): Promise<string> {
+  const ref = buildSalvageRef(result, context);
+  await execFilePromise('git', ['update-ref', ref, commit, ''], {
+    cwd: result.repoRoot,
+    encoding: 'utf-8',
+  });
+  return ref;
+}
+
+async function captureDirtyWorktree(
+  result: EnsureWorktreeResult,
+  context: string,
+  head: string,
+): Promise<{ preservedRef: string; checkpointCommit: string }> {
+  const tempDir = mkdtempSync(join(tmpdir(), 'omx-salvage-index-'));
+  const indexPath = join(tempDir, 'index');
+  const env = { ...process.env, GIT_INDEX_FILE: indexPath };
+  try {
+    await execFilePromise('git', ['read-tree', head], {
+      cwd: result.worktreePath,
+      encoding: 'utf-8',
+      env,
+    });
+    await execFilePromise('git', ['add', '-A'], {
+      cwd: result.worktreePath,
+      encoding: 'utf-8',
+      env,
+    });
+    const tree = await execFilePromise('git', ['write-tree'], {
+      cwd: result.worktreePath,
+      encoding: 'utf-8',
+      env,
+    });
+    const commit = await execFilePromise(
+      'git',
+      ['commit-tree', tree.stdout.trim(), '-p', head, '-m', `chore(team): salvage ${context} changes`],
+      {
+        cwd: result.worktreePath,
+        encoding: 'utf-8',
+        env: {
+          ...env,
+          GIT_AUTHOR_NAME: 'OMX Salvage',
+          GIT_AUTHOR_EMAIL: 'omx-salvage@localhost',
+          GIT_COMMITTER_NAME: 'OMX Salvage',
+          GIT_COMMITTER_EMAIL: 'omx-salvage@localhost',
+        },
+      },
+    );
+    const checkpointCommit = commit.stdout.trim();
+    const preservedRef = await createSalvageRef(result, context, checkpointCommit);
+    return { preservedRef, checkpointCommit };
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
 }
 
 export async function rollbackProvisionedWorktrees(
   results: Array<EnsureWorktreeResult | { enabled: false }>,
   options: RollbackWorktreeOptions = {},
-): Promise<void> {
+): Promise<RollbackWorktreeOutcome[]> {
   const created = results
     .filter((result): result is EnsureWorktreeResult => result.enabled === true && result.created)
     .reverse();
 
   const errors: string[] = [];
+  const outcomes: RollbackWorktreeOutcome[] = [];
 
   for (const result of created) {
+    let preservedRef: string | null = null;
+    let checkpointCommit: string | null = null;
+    let changed = false;
+    try {
+      const status = await execFilePromise(
+        'git',
+        ['status', '--porcelain', '--untracked-files=all', '--ignored=matching'],
+        { cwd: result.worktreePath, encoding: 'utf-8' },
+      );
+      const statusLines = status.stdout.split(/\r?\n/).filter(Boolean);
+      const dirty = statusLines.some((line) => !line.startsWith('!!'));
+      const ignored = statusLines.some((line) => line.startsWith('!!'));
+      const head = readGit(result.worktreePath, ['rev-parse', 'HEAD']);
+      const advanced = result.baseRef
+        ? head !== result.baseRef
+        : result.detached || Boolean(result.branchName);
+      changed = dirty || ignored || advanced;
+      if (dirty) {
+        const captured = await captureDirtyWorktree(
+          result,
+          options.salvageContext ?? 'worktree-rollback',
+          head,
+        );
+        preservedRef = captured.preservedRef;
+        checkpointCommit = captured.checkpointCommit;
+      } else if (advanced && result.detached) {
+        preservedRef = await createSalvageRef(
+          result,
+          options.salvageContext ?? 'worktree-rollback',
+          head,
+        );
+      } else if (advanced && result.branchName) {
+        preservedRef = `refs/heads/${result.branchName}`;
+      }
+    } catch (error) {
+      errors.push(`preserve:${result.worktreePath}:${gitFailure(error)}`);
+      outcomes.push({
+        worktreePath: result.worktreePath,
+        removed: false,
+        preservedRef,
+        checkpointCommit,
+        branchDeleted: false,
+      });
+      continue;
+    }
+
+    if (options.preserveWorktrees || changed) {
+      outcomes.push({
+        worktreePath: result.worktreePath,
+        removed: false,
+        preservedRef,
+        checkpointCommit,
+        branchDeleted: false,
+      });
+      continue;
+    }
+
     try {
       await execFilePromise('git', ['worktree', 'remove', '--force', result.worktreePath], {
         cwd: result.repoRoot,
         encoding: 'utf-8',
       });
     } catch (err: unknown) {
-      const stderr = ((err as Record<string, unknown>).stderr as string ?? '').trim();
-      const exitCode = (err as Record<string, unknown>).code;
-      errors.push(`remove:${result.worktreePath}:${stderr || `exit_${exitCode}`}`);
+      errors.push(`remove:${result.worktreePath}:${gitFailure(err)}`);
+      outcomes.push({
+        worktreePath: result.worktreePath,
+        removed: false,
+        preservedRef,
+        checkpointCommit,
+        branchDeleted: false,
+      });
       continue;
     }
 
-    if (options.skipBranchDeletion) continue;
-    if (!result.createdBranch || !result.branchName) continue;
+    if (options.skipBranchDeletion || !result.createdBranch || !result.branchName) {
+      outcomes.push({
+        worktreePath: result.worktreePath,
+        removed: true,
+        preservedRef,
+        checkpointCommit,
+        branchDeleted: false,
+      });
+      continue;
+    }
 
     const entriesAfterRemove = listWorktrees(result.repoRoot);
     const stillCheckedOut = hasBranchInUse(entriesAfterRemove, result.branchName, result.worktreePath);
-    if (stillCheckedOut) continue;
+    if (stillCheckedOut) {
+      outcomes.push({
+        worktreePath: result.worktreePath,
+        removed: true,
+        preservedRef,
+        checkpointCommit,
+        branchDeleted: false,
+      });
+      continue;
+    }
 
     try {
-      await execFilePromise('git', ['branch', '-D', result.branchName], {
+      await execFilePromise('git', ['branch', '-d', result.branchName], {
         cwd: result.repoRoot,
         encoding: 'utf-8',
       });
     } catch (err: unknown) {
       if (branchExists(result.repoRoot, result.branchName)) {
-        const stderr = ((err as Record<string, unknown>).stderr as string ?? '').trim();
-        const exitCode = (err as Record<string, unknown>).code;
-        errors.push(`delete_branch:${result.branchName}:${stderr || `exit_${exitCode}`}`);
+        errors.push(`delete_branch:${result.branchName}:${gitFailure(err)}`);
       }
     }
+    outcomes.push({
+      worktreePath: result.worktreePath,
+      removed: true,
+      preservedRef,
+      checkpointCommit,
+      branchDeleted: !branchExists(result.repoRoot, result.branchName),
+    });
   }
 
   if (errors.length > 0) {
     throw new Error(`worktree_rollback_failed:${errors.join(' | ')}`);
   }
+  return outcomes;
 }
 
 export async function removeWorktreeForce(repoRoot: string, worktreePath: string): Promise<void> {

@@ -1,6 +1,6 @@
 import { join, resolve, dirname } from 'path';
 import { existsSync, appendFileSync, mkdirSync } from 'fs';
-import { mkdir, readdir, readFile, writeFile } from 'fs/promises';
+import { mkdir, readdir, readFile, rm, writeFile } from 'fs/promises';
 import { performance } from 'perf_hooks';
 import { spawn, spawnSync, type ChildProcessByStdio } from 'child_process';
 import type { Writable } from 'stream';
@@ -137,8 +137,9 @@ import { inferPhaseTargetFromTaskCounts, reconcilePhaseStateForMonitor } from '.
 import { getTeamTmuxSessions } from '../notifications/tmux.js';
 import { hasStructuredVerificationEvidence } from '../verification/verifier.js';
 import { buildRebalanceDecisions } from './rebalance-policy.js';
-import { getBaseStateDir, getStatePath, resolveStateScope } from '../mcp/state-paths.js';
+import { getBaseStateDir, resolveStateScope } from '../mcp/state-paths.js';
 import { syncCanonicalSkillStateForMode } from '../state/skill-active.js';
+import { startMode, updateModeState } from '../modes/base.js';
 import { withWorkflowStateLock } from '../state/workflow-state-lock.js';
 import {
   withWorkflowStateTransaction,
@@ -238,12 +239,14 @@ async function syncRootTeamModeStateOnTerminalPhase(
   const normalizedSessionId = leaderSessionId?.trim() || undefined;
   const baseStateDir = getBaseStateDir(cwd);
   await withWorkflowStateLock(baseStateDir, cwd, (lockLease) =>
-    withWorkflowStateTransaction(baseStateDir, cwd, normalizedSessionId, async () => {
+    withWorkflowStateTransaction(baseStateDir, cwd, normalizedSessionId, async (transactionLease) => {
+      const canonicalBaseStateDir = transactionLease.baseStateDir;
       const completedAt = new Date().toISOString();
       let matched = false;
       for (const sessionId of [undefined, normalizedSessionId]) {
         if (sessionId === undefined && normalizedSessionId === undefined && matched) continue;
-        const path = getStatePath('team', cwd, sessionId);
+        const stateDir = sessionId ? join(canonicalBaseStateDir, 'sessions', sessionId) : canonicalBaseStateDir;
+        const path = join(stateDir, 'team-state.json');
         if (!existsSync(path)) continue;
         const state = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
         if (!matchesTeamModeStateForShutdown(state, teamName)) continue;
@@ -258,14 +261,14 @@ async function syncRootTeamModeStateOnTerminalPhase(
           team_name: teamName,
         };
         await writeFile(path, JSON.stringify(next, null, 2), 'utf-8');
-        await syncRunStateFromModeState(next, cwd, sessionId);
+        await syncRunStateFromModeState(next, cwd, sessionId, stateDir);
         matched = true;
       }
       if (!matched) return;
       if (normalizedSessionId) {
         await syncCanonicalSkillStateForMode({
           cwd,
-          baseStateDir,
+          baseStateDir: canonicalBaseStateDir,
           mode: 'team',
           active: false,
           currentPhase: phase,
@@ -276,7 +279,7 @@ async function syncRootTeamModeStateOnTerminalPhase(
       }
       await syncCanonicalSkillStateForMode({
         cwd,
-        baseStateDir,
+        baseStateDir: canonicalBaseStateDir,
         mode: 'team',
         active: false,
         currentPhase: phase,
@@ -299,8 +302,10 @@ async function syncExactTeamModeStateOnShutdown(
   teamName: string,
   cwd: string,
   sessionId?: string,
+  baseStateDir: string = getBaseStateDir(cwd),
 ): Promise<boolean> {
-  const path = getStatePath('team', cwd, sessionId);
+  const stateDir = sessionId ? join(baseStateDir, 'sessions', sessionId) : baseStateDir;
+  const path = join(stateDir, 'team-state.json');
   if (!existsSync(path)) return false;
 
   const parsed = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
@@ -317,7 +322,7 @@ async function syncExactTeamModeStateOnShutdown(
     team_name: teamName,
   };
   await writeFile(path, JSON.stringify(next, null, 2));
-  await syncRunStateFromModeState(next, cwd, sessionId);
+  await syncRunStateFromModeState(next, cwd, sessionId, stateDir);
   return true;
 }
 
@@ -329,22 +334,23 @@ async function syncTeamModeStateOnShutdown(
   const normalizedLeaderSessionId = typeof leaderSessionId === 'string' ? leaderSessionId.trim() : '';
   const baseStateDir = getBaseStateDir(cwd);
   await withWorkflowStateLock(baseStateDir, cwd, (lockLease) =>
-    withWorkflowStateTransaction(baseStateDir, cwd, normalizedLeaderSessionId || undefined, async () => {
-      const rootPath = getStatePath('team', cwd);
+    withWorkflowStateTransaction(baseStateDir, cwd, normalizedLeaderSessionId || undefined, async (transactionLease) => {
+      const canonicalBaseStateDir = transactionLease.baseStateDir;
+      const rootPath = join(canonicalBaseStateDir, 'team-state.json');
       const sessionPath = normalizedLeaderSessionId
-        ? getStatePath('team', cwd, normalizedLeaderSessionId)
+        ? join(canonicalBaseStateDir, 'sessions', normalizedLeaderSessionId, 'team-state.json')
         : null;
       const hasDetailState = existsSync(rootPath) || Boolean(sessionPath && existsSync(sessionPath));
-      const rootMatched = await syncExactTeamModeStateOnShutdown(teamName, cwd);
+      const rootMatched = await syncExactTeamModeStateOnShutdown(teamName, cwd, undefined, canonicalBaseStateDir);
       const sessionMatched = normalizedLeaderSessionId
-        ? await syncExactTeamModeStateOnShutdown(teamName, cwd, normalizedLeaderSessionId)
+        ? await syncExactTeamModeStateOnShutdown(teamName, cwd, normalizedLeaderSessionId, canonicalBaseStateDir)
         : false;
       if (hasDetailState && !rootMatched && !sessionMatched) return;
 
       if (normalizedLeaderSessionId) {
         await syncCanonicalSkillStateForMode({
           cwd,
-          baseStateDir,
+          baseStateDir: canonicalBaseStateDir,
           mode: 'team',
           active: false,
           currentPhase: 'cancelled',
@@ -354,7 +360,7 @@ async function syncTeamModeStateOnShutdown(
       }
       await syncCanonicalSkillStateForMode({
         cwd,
-        baseStateDir,
+        baseStateDir: canonicalBaseStateDir,
         mode: 'team',
         active: false,
         currentPhase: 'cancelled',
@@ -616,7 +622,10 @@ async function logStartupTiming(params: {
   });
 }
 
-function collectProvisionedShutdownWorktrees(config: TeamConfig): EnsureWorktreeResult[] {
+function collectProvisionedShutdownWorktrees(
+  config: TeamConfig,
+  reports: WorkerShutdownMergeReport[] = [],
+): EnsureWorktreeResult[] {
   const seenWorktreePaths = new Set<string>();
   const worktrees: EnsureWorktreeResult[] = [];
 
@@ -630,10 +639,14 @@ function collectProvisionedShutdownWorktrees(config: TeamConfig): EnsureWorktree
     if (seenWorktreePaths.has(worktreePath)) continue;
     seenWorktreePaths.add(worktreePath);
 
+    const report = reports.find((entry) => entry.workerName === worker.name);
     worktrees.push({
       enabled: true,
       repoRoot: worker.worktree_repo_root,
       worktreePath,
+      baseRef: report?.mergeOutcome === 'merged' || report?.mergeOutcome === 'noop'
+        ? report.sourceRef ?? worker.worktree_base_ref
+        : worker.worktree_base_ref,
       detached: true,
       branchName: null,
       created: true,
@@ -1423,7 +1436,12 @@ export interface TeamStartOptions {
   writeCleanupWarning?: (message: string) => void;
   approvedExecution?: ApprovedTeamExecutionBinding | null;
   commitModeState?: (
-    runtime: TeamRuntime,
+    admission: {
+      teamName: string;
+      sanitizedName: string;
+      cwd: string;
+      config: Pick<TeamConfig, 'worker_count' | 'workers' | 'display_name'>;
+    },
     authority: WorkflowStateMutationAuthority,
   ) => Promise<void>;
 }
@@ -2626,40 +2644,13 @@ export async function startTeam(
     worktreeRepoRoot?: string;
     worktreePath?: string;
     worktreeBranch?: string;
+    worktreeBaseRef?: string;
     worktreeDetached?: boolean;
     worktreeCreated?: boolean;
   }>();
   const provisionedWorktrees: Array<EnsureWorktreeResult | { enabled: false }> = [];
   for (let i = 1; i <= workerCount; i++) {
     workerWorkspaceByName.set(`worker-${i}`, { cwd: leaderCwd });
-  }
-
-  await detectAndCleanStaleTeam(sanitized, leaderCwd, workerCount, options.confirmStaleCleanup);
-
-  if (activeWorktreeMode) {
-    assertCleanLeaderWorkspaceForWorkerWorktrees(leaderCwd);
-    for (let i = 1; i <= workerCount; i++) {
-      const workerName = `worker-${i}`;
-      const planned = planWorktreeTarget({
-        cwd: leaderCwd,
-        scope: 'team',
-        mode: effectiveWorktreeMode,
-        teamName: sanitized,
-        workerName,
-      });
-      const ensured = ensureWorktree(planned);
-      provisionedWorktrees.push(ensured);
-      if (ensured.enabled) {
-        workerWorkspaceByName.set(workerName, {
-          cwd: ensured.worktreePath,
-          worktreeRepoRoot: ensured.repoRoot,
-          worktreePath: ensured.worktreePath,
-          worktreeBranch: ensured.branchName ?? undefined,
-          worktreeDetached: ensured.detached,
-          worktreeCreated: ensured.created,
-        });
-      }
-    }
   }
 
   // 2. Team name is already sanitized above.
@@ -2682,8 +2673,91 @@ export async function startTeam(
   const startupDispatchRetries = resolveStartupDispatchRetries(launchEnv);
   const startupRetryDelayS = resolveStartupDispatchRetryDelayS(launchEnv);
   const skipWorkerReadyWait = shouldSkipWorkerReadyWait(launchEnv);
+  let admissionCommitted = false;
 
   try {
+    if (activeWorktreeMode) {
+      assertCleanLeaderWorkspaceForWorkerWorktrees(leaderCwd);
+      for (let i = 1; i <= workerCount; i++) {
+        const workerName = `worker-${i}`;
+        const planned = planWorktreeTarget({
+          cwd: leaderCwd,
+          scope: 'team',
+          mode: effectiveWorktreeMode,
+          teamName: sanitized,
+          workerName,
+        });
+        const ensured = ensureWorktree(planned);
+        provisionedWorktrees.push(ensured);
+        if (ensured.enabled) {
+          workerWorkspaceByName.set(workerName, {
+            cwd: ensured.worktreePath,
+            worktreeRepoRoot: ensured.repoRoot,
+            worktreePath: ensured.worktreePath,
+            worktreeBranch: ensured.branchName ?? undefined,
+            worktreeBaseRef: ensured.baseRef,
+            worktreeDetached: ensured.detached,
+            worktreeCreated: ensured.created,
+          });
+        }
+      }
+    }
+
+    const scope = await resolveStateScope(leaderCwd);
+    const baseStateDir = getBaseStateDir(leaderCwd);
+    const commitModeState = options.commitModeState ?? (async (
+      admission: {
+        teamName: string;
+        sanitizedName: string;
+        cwd: string;
+        config: Pick<TeamConfig, 'worker_count' | 'workers' | 'display_name'>;
+      },
+      authority: WorkflowStateMutationAuthority,
+    ): Promise<void> => {
+      await startMode('team', task, 50, leaderCwd, {
+        allowNestedAutopilotTeam: true,
+        workflowLockLease: authority.lockLease,
+        workflowTransactionLease: authority.transactionLease,
+      });
+      await updateModeState('team', {
+        current_phase: 'team-exec',
+        team_name: admission.teamName,
+        display_name: admission.config.display_name,
+        agent_count: admission.config.worker_count,
+      }, leaderCwd, scope.sessionId, {
+        allowNestedAutopilotTeam: true,
+        workflowLockLease: authority.lockLease,
+        workflowTransactionLease: authority.transactionLease,
+      });
+    });
+    await withWorkflowStateLock(baseStateDir, leaderCwd, (lockLease) =>
+      withWorkflowStateTransaction(
+        baseStateDir,
+        leaderCwd,
+        scope.sessionId,
+        (transactionLease) => commitModeState({
+          teamName: sanitized,
+          sanitizedName: sanitized,
+          config: {
+            worker_count: workerCount,
+            workers: Array.from({ length: workerCount }, (_, index) => ({
+              name: `worker-${index + 1}`,
+              index: index + 1,
+              role: agentType,
+              assigned_tasks: [],
+            })),
+            display_name: displayName,
+          },
+          cwd: leaderCwd,
+        }, { lockLease, transactionLease }),
+        [],
+        { lockLease },
+      ),
+    );
+    admissionCommitted = true;
+
+    await detectAndCleanStaleTeam(sanitized, leaderCwd, workerCount, options.confirmStaleCleanup);
+
     // 3. Init state directory + config
     config = await initTeamState(
       sanitized,
@@ -2800,6 +2874,7 @@ export async function startTeam(
         worktreeRepoRoot?: string;
         worktreePath?: string;
         worktreeBranch?: string;
+        worktreeBaseRef?: string;
         worktreeDetached?: boolean;
         worktreeCreated?: boolean;
       };
@@ -2955,6 +3030,7 @@ export async function startTeam(
         worktree_repo_root: workerWorkspace.worktreeRepoRoot,
         worktree_path: workerWorkspace.worktreePath,
         worktree_branch: workerWorkspace.worktreeBranch,
+        worktree_base_ref: workerWorkspace.worktreeBaseRef,
         worktree_detached: workerWorkspace.worktreeDetached,
         worktree_created: workerWorkspace.worktreeCreated,
         team_state_root: teamStateRoot,
@@ -2979,6 +3055,7 @@ export async function startTeam(
         config.workers[workerIndex - 1].worktree_repo_root = workerWorkspace.worktreeRepoRoot;
         config.workers[workerIndex - 1].worktree_path = workerWorkspace.worktreePath;
         config.workers[workerIndex - 1].worktree_branch = workerWorkspace.worktreeBranch;
+        config.workers[workerIndex - 1].worktree_base_ref = workerWorkspace.worktreeBaseRef;
         config.workers[workerIndex - 1].worktree_detached = workerWorkspace.worktreeDetached;
         config.workers[workerIndex - 1].worktree_created = workerWorkspace.worktreeCreated;
         config.workers[workerIndex - 1].team_state_root = teamStateRoot;
@@ -3000,12 +3077,15 @@ export async function startTeam(
       approvedExecution,
       ultragoalOutcome,
     });
-    await cleanupTeamWorkerLaunchOrphanedMcpProcesses({
-      cleanup: options.cleanupLaunchOrphanedMcpProcesses,
-      writeWarning: options.writeCleanupWarning,
-    });
     const startupTiming = createStartupTimingRecorder(sanitized, leaderCwd);
 
+    const runWorkerStartup = async (): Promise<TeamRuntime> => {
+      const activeConfig = config;
+      if (!activeConfig) throw new Error('team_startup_config_missing_after_admission');
+      await cleanupTeamWorkerLaunchOrphanedMcpProcesses({
+        cleanup: options.cleanupLaunchOrphanedMcpProcesses,
+        writeWarning: options.writeCleanupWarning,
+      });
     if (workerLaunchMode === 'interactive') {
       const createdSession = createTeamSession(
         sanitized,
@@ -3013,22 +3093,22 @@ export async function startTeam(
         leaderCwd,
         sharedWorkerLaunchArgs,
         workerStartups,
-        { ownerSessionId: leaderSessionId, teamPaneOwnerId: config.tmux_pane_owner_id },
+        { ownerSessionId: leaderSessionId, teamPaneOwnerId: activeConfig.tmux_pane_owner_id },
       );
       sessionName = createdSession.name;
       sessionCreated = true;
       createdWorkerPaneIds.push(...createdSession.workerPaneIds);
       createdLeaderPaneId = createdSession.leaderPaneId;
-      applyCreatedInteractiveSessionToConfig(config, createdSession, workerPaneIds);
+      applyCreatedInteractiveSessionToConfig(activeConfig, createdSession, workerPaneIds);
       for (const [index, paneId] of createdSession.workerPaneIds.entries()) {
         startupTiming.mark('split_returned', { worker: `worker-${index + 1}`, pane_id: paneId });
       }
     } else {
-      config.tmux_session = `prompt-${sanitized}`;
-      config.leader_pane_id = null;
-      config.hud_pane_id = null;
-      config.resize_hook_name = null;
-      config.resize_hook_target = null;
+      activeConfig.tmux_session = `prompt-${sanitized}`;
+      activeConfig.leader_pane_id = null;
+      activeConfig.hud_pane_id = null;
+      activeConfig.resize_hook_name = null;
+      activeConfig.resize_hook_target = null;
       for (let i = 1; i <= workerCount; i++) {
         const startup = workerStartups[i - 1] || {};
         const workerName = `worker-${i}`;
@@ -3043,8 +3123,8 @@ export async function startTeam(
           startup.initialPrompt,
           startup.workerRole,
         );
-        if (config.workers[i - 1]) {
-          config.workers[i - 1].pid = child.pid;
+        if (activeConfig.workers[i - 1]) {
+          activeConfig.workers[i - 1].pid = child.pid;
         }
       }
     }
@@ -3059,7 +3139,7 @@ export async function startTeam(
       await materializeWorkerStartupState(bootstrapPlan, i, workerPaneIds[i - 1]);
       startupTiming.mark('identity_inbox_written', { worker: bootstrapPlan.workerName, pane_id: workerPaneIds[i - 1] });
     }
-    await saveTeamConfig(config, leaderCwd);
+    await saveTeamConfig(activeConfig, leaderCwd);
 
     // 7. Start all safe per-worker readiness/dispatch attempts concurrently.
     // Pane creation and worktree provisioning above remain dependency-bound and
@@ -3099,7 +3179,7 @@ export async function startTeam(
       const startupDirectOutcome = workerLaunchMode === 'interactive' && !initialPrompt
         ? await attemptStartupDirectTrigger({
           teamName: sanitized,
-          config: config!,
+          config: activeConfig,
           workerName,
           workerIndex,
           paneId,
@@ -3148,7 +3228,7 @@ export async function startTeam(
         for (let attempt = 1; attempt <= startupDispatchRetries; attempt++) {
           dispatchOutcome = await dispatchCriticalInboxInstruction({
             teamName: sanitized,
-            config: config!,
+            config: activeConfig,
             workerName,
             workerIndex,
             paneId,
@@ -3196,7 +3276,7 @@ export async function startTeam(
 
       if (!dispatchOutcome.ok) {
         const workerAlive = workerLaunchMode === 'prompt'
-          ? isPromptWorkerAlive(config!, config!.workers[workerIndex - 1]!)
+          ? isPromptWorkerAlive(activeConfig!, activeConfig!.workers[workerIndex - 1]!)
           : isWorkerPaneOpen(sessionName, workerIndex, paneId);
         if (workerLaunchMode === 'prompt' && !workerAlive) {
           await recordPromptStartupWorkerStopped({
@@ -3237,36 +3317,45 @@ export async function startTeam(
     if (firstStartupError) {
       throw firstStartupError.error;
     }
-    await saveTeamConfig(config, leaderCwd);
+    await saveTeamConfig(activeConfig, leaderCwd);
     const runtime = {
       teamName: sanitized,
       sanitizedName: sanitized,
       sessionName,
-      config,
+      config: activeConfig,
       cwd: leaderCwd,
     };
-    if (options.commitModeState) {
-      const scope = await resolveStateScope(leaderCwd);
-      const baseStateDir = getBaseStateDir(leaderCwd);
-      await withWorkflowStateLock(baseStateDir, leaderCwd, (lockLease) =>
-        withWorkflowStateTransaction(
-          baseStateDir,
-          leaderCwd,
-          scope.sessionId,
-          (transactionLease) => options.commitModeState!(runtime, {
-            lockLease,
-            transactionLease,
-          }),
-          [],
-          { lockLease },
-        ),
-      );
-    }
     await startupTiming.flush();
 
     return runtime;
+    };
+
+    return await runWorkerStartup();
   } catch (error) {
     const rollbackErrors: string[] = [];
+    if (!admissionCommitted) {
+      if (provisionedWorktrees.length > 0) {
+        try {
+          const outcomes = await rollbackProvisionedWorktrees(provisionedWorktrees, {
+            skipBranchDeletion: false,
+            salvageContext: `team-startup-${sanitized}`,
+          });
+          for (const outcome of outcomes) {
+            if (!outcome.preservedRef) continue;
+            process.stderr.write(
+              `[omx:team] pre-admission rollback preserved ${outcome.worktreePath} at ${outcome.preservedRef}\n`,
+            );
+          }
+        } catch (cleanupError) {
+          rollbackErrors.push(`rollbackProvisionedWorktrees: ${String(cleanupError)}`);
+        }
+      }
+      if (rollbackErrors.length > 0) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`${message}; rollback encountered errors: ${rollbackErrors.join(' | ')}`);
+      }
+      throw error;
+    }
 
     if (sessionCreated) {
       if (config?.resize_hook_name && config.resize_hook_target) {
@@ -3337,6 +3426,56 @@ export async function startTeam(
       }
     }
 
+    if (admissionCommitted) {
+      const failureMessage = error instanceof Error ? error.message : String(error);
+      const failedAt = new Date().toISOString();
+      try {
+        const phase = await readTeamPhaseState(sanitized, leaderCwd);
+        if (phase) {
+          await writeTeamPhaseState(sanitized, {
+            ...phase,
+            current_phase: 'failed',
+            transitions: [
+              ...phase.transitions,
+              { from: phase.current_phase, to: 'failed', at: failedAt, reason: failureMessage },
+            ],
+            updated_at: failedAt,
+          }, leaderCwd);
+        }
+        await syncRootTeamModeStateOnTerminalPhase(
+          sanitized,
+          'failed',
+          leaderCwd,
+          leaderSessionId,
+        );
+      } catch (cleanupError) {
+        rollbackErrors.push(`markTeamStartupFailed: ${String(cleanupError)}`);
+      }
+
+      if (provisionedWorktrees.length > 0) {
+        try {
+          const outcomes = await rollbackProvisionedWorktrees(provisionedWorktrees, {
+            preserveWorktrees: true,
+            salvageContext: `team-startup-${sanitized}`,
+          });
+          for (const outcome of outcomes) {
+            if (!outcome.preservedRef) continue;
+            process.stderr.write(
+              `[omx:team] failed startup preserved ${outcome.worktreePath} at ${outcome.preservedRef}\n`,
+            );
+          }
+        } catch (cleanupError) {
+          rollbackErrors.push(`preserveProvisionedWorktrees: ${String(cleanupError)}`);
+        }
+      }
+      restoreTeamModelInstructionsFile(sanitized);
+      if (rollbackErrors.length > 0) {
+        throw new Error(`${failureMessage}; rollback encountered errors: ${rollbackErrors.join(' | ')}`);
+      }
+      throw error;
+    }
+
+    let worktreeRollbackSafe = true;
     if (config) {
       for (const worker of config.workers) {
         if (!worker.worktree_path || !worker.team_state_root) continue;
@@ -3348,6 +3487,7 @@ export async function startTeam(
             worker.worktree_path,
           );
         } catch (cleanupError) {
+          worktreeRollbackSafe = false;
           rollbackErrors.push(`removeWorkerWorktreeRootAgentsFile(${worker.name}): ${String(cleanupError)}`);
         }
       }
@@ -3361,18 +3501,28 @@ export async function startTeam(
     }
     restoreTeamModelInstructionsFile(sanitized);
 
-    try {
-      await cleanupTeamState(sanitized, leaderCwd);
-    } catch (cleanupError) {
-      rollbackErrors.push(`cleanupTeamState: ${String(cleanupError)}`);
-    }
-    if (provisionedWorktrees.length > 0) {
+    if (provisionedWorktrees.length > 0 && worktreeRollbackSafe) {
       try {
-        await rollbackProvisionedWorktrees(provisionedWorktrees, {
+        const outcomes = await rollbackProvisionedWorktrees(provisionedWorktrees, {
           skipBranchDeletion: false,
+          salvageContext: `team-startup-${sanitized}`,
         });
+        for (const outcome of outcomes) {
+          if (!outcome.preservedRef) continue;
+          process.stderr.write(
+            `[omx:team] startup rollback preserved ${outcome.worktreePath} at ${outcome.preservedRef}\n`,
+          );
+        }
       } catch (cleanupError) {
+        worktreeRollbackSafe = false;
         rollbackErrors.push(`rollbackProvisionedWorktrees: ${String(cleanupError)}`);
+      }
+    }
+    if (worktreeRollbackSafe) {
+      try {
+        await cleanupTeamState(sanitized, leaderCwd);
+      } catch (cleanupError) {
+        rollbackErrors.push(`cleanupTeamState: ${String(cleanupError)}`);
       }
     }
 
@@ -4184,7 +4334,13 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   }
   restoreTeamModelInstructionsFile(sanitized);
 
-  const provisionedWorktrees = collectProvisionedShutdownWorktrees(config);
+  for (const report of shutdownReports) {
+    await rm(report.reportPath, { force: true }).catch((err) => {
+      process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
+    });
+  }
+
+  const provisionedWorktrees = collectProvisionedShutdownWorktrees(config, shutdownReports);
   if (provisionedWorktrees.length > 0) {
     try {
       await rollbackProvisionedWorktrees(provisionedWorktrees, {
@@ -4723,7 +4879,7 @@ async function dispatchCriticalInboxInstruction(params: {
   };
 
   if (config.worker_launch_mode === 'prompt') {
-    return await queueInboxInstruction({
+    const queued = await queueInboxInstruction({
       teamName,
       workerName,
       workerIndex,
@@ -4737,6 +4893,54 @@ async function dispatchCriticalInboxInstruction(params: {
       inboxCorrelationKey,
       notify: (_target, message) => notifyWorkerOutcome(config, workerIndex, message, paneId),
     });
+    noteTiming('dispatch_queued', {
+      ok: queued.ok,
+      reason: queued.reason,
+      transport: queued.transport,
+      request_id: queued.request_id,
+    });
+    if (!queued.ok) return queued;
+
+    const startupEvidence = await waitForRequiredStartupEvidenceAfterDirectFallback({
+      requireWorkerStartupEvidence,
+      workerCli,
+      teamName,
+      workerName,
+      cwd,
+      timeoutMs: startupEvidenceTimeoutMs,
+    });
+    const requiresObservedStartupEvidence = requireWorkerStartupEvidence === true
+      && (workerCli === 'claude' || workerCli === 'codex');
+    if (!requiresObservedStartupEvidence) return queued;
+
+    noteTiming('startup_evidence', {
+      ok: startupEvidence !== 'none',
+      reason: startupEvidence,
+      transport: queued.transport,
+      request_id: queued.request_id,
+    });
+    if (startupEvidence !== 'none') {
+      return {
+        ...queued,
+        reason: `${queued.reason}_with_${startupEvidence}`,
+      };
+    }
+
+    const reason = `${workerCli}_startup_no_evidence_after_fallback:${queued.reason}`;
+    if (queued.request_id) {
+      const current = await readDispatchRequest(teamName, queued.request_id, cwd);
+      if (current && current.status !== 'failed') {
+        await transitionDispatchRequest(
+          teamName,
+          queued.request_id,
+          current.status,
+          'failed',
+          { last_reason: reason },
+          cwd,
+        ).catch(() => {});
+      }
+    }
+    return { ...queued, ok: false, reason };
   }
 
   if (dispatchPolicy.dispatch_mode === 'transport_direct') {
