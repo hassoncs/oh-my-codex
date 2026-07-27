@@ -230,6 +230,30 @@ switch (command.command) {
   await chmod(runtimePath, 0o755);
 }
 
+async function createFailedRetryTask(teamName: string, cwd: string): Promise<TeamTaskV2> {
+  await initTeamState(teamName, 'retry failure fixture', 'executor', 1, cwd);
+  const task = await createTask(teamName, {
+    subject: 'retry',
+    description: 'retry',
+    status: 'pending',
+  }, cwd);
+  const claim = await claimTask(teamName, task.id, 'worker-1', task.version, cwd);
+  assert.equal(claim.ok, true);
+  if (!claim.ok) throw new Error('test fixture task claim failed');
+  const failed = await transitionTaskStatus(
+    teamName,
+    task.id,
+    'in_progress',
+    'failed',
+    claim.claimToken,
+    cwd,
+    { error: 'failed once' },
+  );
+  assert.equal(failed.ok, true);
+  if (!failed.ok) throw new Error('test fixture task transition failed');
+  return failed.task;
+}
+
 describe('team state', () => {
   it('initTeamState creates correct directory structure and config.json', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
@@ -1536,6 +1560,98 @@ exit 1
       const retried = await retryFailedTask('team-retry-completed', t.id, completed.task.version, cwd);
       assert.deepEqual(retried, { ok: false, error: 'invalid_transition' });
       assert.equal((await readTask('team-retry-completed', t.id, cwd))?.status, 'completed');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('retryFailedTask fails loud on corrupt task state', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-corrupt-task-'));
+    try {
+      const teamName = 'retry-corrupt-task';
+      const failed = await createFailedRetryTask(teamName, cwd);
+      const taskPath = join(await realpath(cwd), '.omx', 'state', 'team', teamName, 'tasks', `task-${failed.id}.json`);
+      await writeFile(taskPath, '{');
+
+      await assert.rejects(
+        () => retryFailedTask(teamName, failed.id, failed.version, cwd),
+        (error: unknown) => error instanceof Error
+          && (error as NodeJS.ErrnoException).code === 'TEAM_STATE_PARSE_ERROR'
+          && (error as Error & { path?: string }).path === taskPath,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('retryFailedTask distinguishes config I/O failure from missing config state', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-config-io-'));
+    try {
+      const teamName = 'retry-config-io';
+      const failed = await createFailedRetryTask(teamName, cwd);
+      const configPath = join(await realpath(cwd), '.omx', 'state', 'team', teamName, 'config.json');
+      await rm(configPath);
+      await mkdir(configPath);
+
+      await assert.rejects(
+        () => retryFailedTask(teamName, failed.id, failed.version, cwd),
+        (error: unknown) => error instanceof Error
+          && (error as NodeJS.ErrnoException).code === 'TEAM_STATE_IO_ERROR'
+          && (error as Error & { path?: string }).path === configPath,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('retryFailedTask preserves legacy fallback when team config is missing', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-missing-config-'));
+    try {
+      const teamName = 'retry-missing-config';
+      const failed = await createFailedRetryTask(teamName, cwd);
+      await rm(join(cwd, '.omx', 'state', 'team', teamName, 'config.json'));
+
+      const retried = await retryFailedTask(teamName, failed.id, failed.version, cwd);
+      assert.equal(retried.ok, true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('retryFailedTask fails loud on corrupt team config', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-corrupt-config-'));
+    try {
+      const teamName = 'retry-corrupt-config';
+      const failed = await createFailedRetryTask(teamName, cwd);
+      const configPath = join(await realpath(cwd), '.omx', 'state', 'team', teamName, 'config.json');
+      await writeFile(configPath, '{');
+
+      await assert.rejects(
+        () => retryFailedTask(teamName, failed.id, failed.version, cwd),
+        (error: unknown) => error instanceof Error
+          && (error as NodeJS.ErrnoException).code === 'TEAM_STATE_PARSE_ERROR'
+          && (error as Error & { path?: string }).path === configPath,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('retryFailedTask fails loud on corrupt retry event state', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-retry-corrupt-events-'));
+    try {
+      const teamName = 'retry-corrupt-events';
+      const failed = await createFailedRetryTask(teamName, cwd);
+      const eventsPath = join(await realpath(cwd), '.omx', 'state', 'team', teamName, 'events', 'events.ndjson');
+      await mkdir(dirname(eventsPath), { recursive: true });
+      await writeFile(eventsPath, '{\n');
+
+      await assert.rejects(
+        () => retryFailedTask(teamName, failed.id, failed.version, cwd),
+        (error: unknown) => error instanceof Error
+          && (error as NodeJS.ErrnoException).code === 'TEAM_STATE_PARSE_ERROR'
+          && (error as Error & { path?: string }).path === `${eventsPath}:1`,
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

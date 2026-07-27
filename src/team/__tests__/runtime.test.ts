@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'child_process';
-import { mkdtemp, rm, writeFile, readFile, mkdir, chmod, readdir } from 'fs/promises';
+import { mkdtemp, rm, writeFile, readFile, mkdir, chmod, readdir, rename } from 'fs/promises';
 import { join, relative } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
@@ -30,6 +30,8 @@ import {
   readTeamManifestV2,
   readTeamPhase,
   writeTeamManifestV2,
+  setWriteAtomicRenameForTests,
+  resetWriteAtomicRenameForTests,
 } from '../state.js';
 import {
   monitorTeam,
@@ -607,6 +609,7 @@ beforeEach(() => {
 
 afterEach(() => {
   setPromptWorkerTeardownForTests();
+  resetWriteAtomicRenameForTests();
   if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
   else delete process.env.OMX_TEAM_STATE_ROOT;
   if (typeof ORIGINAL_OMX_TEAM_CHILD_MODEL === 'string') process.env.OMX_TEAM_CHILD_MODEL = ORIGINAL_OMX_TEAM_CHILD_MODEL;
@@ -1443,6 +1446,53 @@ esac
       console.log = originalLog;
     }
     assert.ok(logs.some((line) => line.includes('thinking_level=none') && line.includes('source=none/default-none')));
+  });
+
+  it('startTeam surfaces failed dispatch-state persistence after prompt startup evidence is missing', { concurrency: false }, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-dispatch-state-failure-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    await mkdir(binDir, { recursive: true });
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      'process.stdin.resume();\nsetInterval(() => {}, 1000);\nprocess.on(\'SIGTERM\', () => process.exit(0));\n',
+      { emitStartupEvidence: false },
+    );
+
+    let injected = false;
+    setWriteAtomicRenameForTests(async (from, to) => {
+      if (!injected && String(to).endsWith('/dispatch/requests.json')) {
+        const requests = JSON.parse(await readFile(from, 'utf-8')) as Array<{ status?: string; last_reason?: string }>;
+        if (requests.some((request) => request.status === 'failed'
+          && request.last_reason?.startsWith('codex_startup_no_evidence_after_fallback:'))) {
+          injected = true;
+          throw Object.assign(new Error('simulated_dispatch_state_write_failure'), { code: 'EIO' });
+        }
+      }
+      await rename(from, to);
+    });
+
+    try {
+      await assert.rejects(
+        withPromptModeCodexEnv(binDir, {
+          OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS: '100',
+          OMX_TEAM_STARTUP_DISPATCH_RETRIES: '1',
+          OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS: '10',
+        }, () => withoutTeamWorkerEnv(() => startTeam(
+          'team-dispatch-state-failure',
+          'dispatch failure must stay visible',
+          'executor',
+          1,
+          [{ subject: 's', description: 'd', owner: 'worker-1' }],
+          cwd,
+        ))),
+        /simulated_dispatch_state_write_failure/,
+      );
+      assert.equal(injected, true);
+    } finally {
+      resetWriteAtomicRenameForTests();
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 
   it('startTeam rejects nested team invocation inside worker context', async () => {

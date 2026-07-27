@@ -4951,7 +4951,7 @@ async function dispatchCriticalInboxInstruction(params: {
           'failed',
           { last_reason: reason },
           cwd,
-        ).catch(() => {});
+        );
       }
     }
     return { ...queued, ok: false, reason };

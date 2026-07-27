@@ -404,6 +404,36 @@ export interface TaskApprovalRecord {
   decided_at: string;
 }
 
+export class TeamStateFileError extends Error {
+  readonly code: 'TEAM_STATE_PARSE_ERROR' | 'TEAM_STATE_IO_ERROR';
+  readonly path: string;
+
+  constructor(kind: 'parse' | 'io', path: string, cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`team_state_${kind}_failed:${path}:${detail}`, { cause });
+    this.name = 'TeamStateFileError';
+    this.code = kind === 'parse' ? 'TEAM_STATE_PARSE_ERROR' : 'TEAM_STATE_IO_ERROR';
+    this.path = path;
+  }
+}
+
+async function readStateFile(path: string): Promise<string | null> {
+  try {
+    return await readFile(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw new TeamStateFileError('io', path, error);
+  }
+}
+
+function parseStateJson(raw: string, path: string): unknown {
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch (error) {
+    throw new TeamStateFileError('parse', path, error);
+  }
+}
+
 let renameForAtomicWrite: typeof rename = rename;
 
 export function setWriteAtomicRenameForTests(fn: typeof rename): void {
@@ -696,14 +726,14 @@ async function readTaskForStateRoot(
   taskId: string,
   stateRoot: string,
 ): Promise<TeamTask | null> {
-  try {
-    const path = taskFilePathForStateRoot(teamName, taskId, stateRoot);
-    if (!existsSync(path)) return null;
-    const parsed = JSON.parse(await readFile(path, 'utf8')) as unknown;
-    return isTeamTask(parsed) ? normalizeTask(parsed) : null;
-  } catch {
-    return null;
+  const path = taskFilePathForStateRoot(teamName, taskId, stateRoot);
+  const raw = await readStateFile(path);
+  if (raw === null) return null;
+  const parsed = parseStateJson(raw, path);
+  if (!isTeamTask(parsed)) {
+    throw new TeamStateFileError('parse', path, new Error('invalid_team_task'));
   }
+  return normalizeTask(parsed);
 }
 
 async function withTaskClaimLockForStateRoot<T>(
@@ -1691,9 +1721,10 @@ async function reactivateTeamWorkflowForRetry(
       workflowLockLease: authority.lockLease,
     });
     const configPath = join(teamDirForStateRoot(teamName, baseStateDir), 'config.json');
-    const config = await readFile(configPath, 'utf8')
-      .then((raw) => JSON.parse(raw) as { task?: unknown })
-      .catch(() => null);
+    const configRaw = await readStateFile(configPath);
+    const config = configRaw === null
+      ? null
+      : parseStateJson(configRaw, configPath) as { task?: unknown };
     const taskDescription = typeof config?.task === 'string' && config.task.trim()
       ? config.task
       : `Retry failed task ${taskId}`;
@@ -1732,16 +1763,17 @@ async function hasRetryEvent(
   const path = stateRoot
     ? teamEventLogPathForStateRoot(teamName, stateRoot)
     : teamEventLogPath(teamName, cwd);
-  const raw = await readFile(path, 'utf-8').catch(() => '');
-  return raw.split('\n').some((line) => {
+  const raw = await readStateFile(path);
+  if (raw === null) return false;
+  return raw.split('\n').some((line, index) => {
     if (!line.trim()) return false;
     try {
       const event = JSON.parse(line) as TeamEvent;
       return event.type === 'task_retried'
         && event.task_id === intent.task_id
         && event.metadata?.retry_version === intent.retry_version;
-    } catch {
-      return false;
+    } catch (error) {
+      throw new TeamStateFileError('parse', `${path}:${index + 1}`, error);
     }
   });
 }
