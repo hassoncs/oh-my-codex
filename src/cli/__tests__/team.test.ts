@@ -3487,6 +3487,7 @@ process.on('SIGTERM', () => process.exit(0));
     const previousTmux = process.env.TMUX;
     const previousLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
     const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const previousStartupEvidenceTimeout = process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
     const logs: string[] = [];
     const stderr: string[] = [];
     const originalLog = console.log;
