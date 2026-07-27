@@ -5625,6 +5625,18 @@ describe('state operations directory initialization', () => {
         });
         assert.equal(cancelled.isError, undefined);
 
+        const cancelledState = JSON.parse(await readFile(statePath, 'utf-8')) as Record<string, unknown>;
+        assert.equal(cancelledState.active, false);
+        assert.equal(cancelledState.current_phase, 'cancelled');
+        assert.equal(cancelledState.run_outcome, 'cancelled');
+        assert.equal(cancelledState.completed_at, '2026-07-27T18:00:00.000Z');
+        assert.deepEqual(cancelledState.handoff_artifacts, {
+          ultragoal: {
+            goals: '.omx/ultragoal/goals.json',
+            active_goal_id: 'G008',
+          },
+        });
+
         const resumed = await executeStateOperation('state_write', {
           workingDirectory: wd,
           session_id: sessionId,
