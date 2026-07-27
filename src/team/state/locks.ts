@@ -84,7 +84,8 @@ export async function withTeamLock<T>(
   deps: TeamPathDeps,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const lockDir = join(deps.teamDir(teamName, cwd), '.lock.lifecycle');
+  // On-disk name is compatibility ABI with older installed createTask writers.
+  const lockDir = join(deps.teamDir(teamName, cwd), '.lock.create-task');
   const ownerPath = join(lockDir, 'owner');
   const ownerToken = lockOwnerToken();
   const deadline = Date.now() + 5000;

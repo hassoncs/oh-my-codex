@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { chmod, mkdtemp, rename, rm, writeFile, readFile, mkdir, utimes } from 'fs/promises';
 import { dirname, join } from 'path';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'os';
 import { existsSync, readFileSync } from 'fs';
 import {
@@ -2513,6 +2514,59 @@ exit 1
       assert.equal(t1.id, '1');
       assert.equal(t2.id, '2');
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes current createTask with a legacy installed lock holder', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-legacy-lock-'));
+    const teamName = 'team-legacy-lock';
+    const teamRoot = join(cwd, '.omx', 'state', 'team', teamName);
+    const acquiredPath = join(cwd, 'legacy-lock-acquired');
+    const releasePath = join(cwd, 'legacy-lock-release');
+    const fixtureExtension = import.meta.url.endsWith('.ts') ? 'ts' : 'js';
+    const fixturePath = fileURLToPath(new URL('./fixtures/run-legacy-create-task-lock.' + fixtureExtension, import.meta.url));
+    let child: ReturnType<typeof spawn> | undefined;
+    let childClosed: Promise<number | null> | undefined;
+    let currentCreate: Promise<TeamTaskV2> | undefined;
+    try {
+      await initTeamState(teamName, 't', 'executor', 1, cwd);
+      child = spawn(process.execPath, [...CHILD_NODE_ARGS, fixturePath, teamRoot, acquiredPath, releasePath], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      childClosed = new Promise<number | null>((resolve, reject) => {
+        child!.once('error', reject);
+        child!.once('close', resolve);
+      });
+      const deadline = Date.now() + 2_000;
+      while (!existsSync(acquiredPath) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(existsSync(acquiredPath), true);
+
+      let currentSettled = false;
+      currentCreate = createTask(
+        teamName,
+        { subject: 'current', description: 'current', status: 'pending' },
+        cwd,
+      ).finally(() => {
+        currentSettled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(currentSettled, false);
+      assert.equal(existsSync(join(teamRoot, 'tasks', 'task-1.json')), false);
+
+      await writeFile(releasePath, 'release');
+      assert.equal(await childClosed, 0);
+      const current = await currentCreate;
+      assert.equal(current.id, '2');
+      assert.equal(JSON.parse(await readFile(join(teamRoot, 'tasks', 'task-1.json'), 'utf-8')).subject, 'legacy-installed');
+      assert.equal(JSON.parse(await readFile(join(teamRoot, 'tasks', 'task-2.json'), 'utf-8')).subject, 'current');
+    } finally {
+      await writeFile(releasePath, 'release').catch(() => {});
+      await currentCreate?.catch(() => {});
+      if (childClosed) await childClosed.catch(() => null);
+      child?.kill('SIGTERM');
       await rm(cwd, { recursive: true, force: true });
     }
   });

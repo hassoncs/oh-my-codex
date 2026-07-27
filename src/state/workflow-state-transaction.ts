@@ -22,8 +22,9 @@ interface PersistedWorkflowStateTransactionEntry {
 }
 
 interface PersistedWorkflowStateTransaction {
-  version: 3 | 4;
+  version: 3 | 4 | 5;
   transaction_id: string;
+  context_root_sha256?: string;
   lock_token: string;
   lock_generation: string;
   files: PersistedWorkflowStateTransactionEntry[];
@@ -54,7 +55,7 @@ export interface WorkflowStateMutationAuthority {
 }
 
 const activeLeases = new WeakSet<object>();
-const activeTransactions = new Map<string, WorkflowStateTransactionLease>();
+const activeTransactions = new Map<string, WorkflowStateTransactionLease | symbol>();
 
 export async function captureWorkflowStateSnapshot(
   cwd: string,
@@ -184,7 +185,7 @@ async function snapshotFromPersisted(
   }
   const record = persisted as Partial<PersistedWorkflowStateTransaction>;
   if (
-    (record.version !== 3 && record.version !== 4)
+    (record.version !== 3 && record.version !== 4 && record.version !== 5)
     || typeof record.transaction_id !== 'string'
     || !/^[0-9a-f-]{36}$/.test(record.transaction_id)
     || typeof record.lock_token !== 'string'
@@ -197,6 +198,20 @@ async function snapshotFromPersisted(
   }
 
   const contextRoot = contextRootForCwd(trustedCwd);
+  const hasContextEntries = record.files.some((file) => file?.scope === 'context');
+  if (record.version === 4 && hasContextEntries) {
+    throw new Error('workflow_state_transaction_invalid:context_provenance');
+  }
+  if (
+    record.version === 5
+    && hasContextEntries
+    && (
+      typeof record.context_root_sha256 !== 'string'
+      || record.context_root_sha256 !== sha256(Buffer.from(resolve(contextRoot), 'utf-8'))
+    )
+  ) {
+    throw new Error('workflow_state_transaction_invalid:context_provenance');
+  }
   return {
     files: await Promise.all(record.files.map(async (file) => {
       if (
@@ -208,14 +223,14 @@ async function snapshotFromPersisted(
       ) {
         throw new Error('workflow_state_transaction_invalid:entry');
       }
-      if (record.version === 4 && file.scope !== 'state' && file.scope !== 'context') {
+      if (record.version !== 3 && file.scope !== 'state' && file.scope !== 'context') {
         throw new Error('workflow_state_transaction_invalid:entry_scope');
       }
       if (isAbsolute(file.path)) {
         throw new Error('workflow_state_transaction_invalid:absolute_path');
       }
       let path: string;
-      if (record.version === 4 && file.scope === 'context') {
+      if (record.version === 5 && file.scope === 'context') {
         await assertSafeContextRoot(contextRoot);
         path = resolve(contextRoot, validateContextTransactionRelativePath(file.path));
       } else {
@@ -281,17 +296,21 @@ async function writeWorkflowStateTransaction(
 ): Promise<void> {
   const path = transactionPath(baseStateDir);
   const contextRoot = contextRootForCwd(cwd);
+  const files = await Promise.all(snapshot.files.map(async (file) => ({
+    ...await persistedEntryPath(baseStateDir, contextRoot, file.path),
+    content_base64: file.content?.toString('base64') ?? null,
+    byte_length: file.content?.length ?? null,
+    sha256: file.content ? sha256(file.content) : null,
+  })));
   const persisted: PersistedWorkflowStateTransaction = {
-    version: 4,
+    version: 5,
     transaction_id: transactionId,
     lock_token: lockToken,
     lock_generation: lockGeneration,
-    files: await Promise.all(snapshot.files.map(async (file) => ({
-      ...await persistedEntryPath(baseStateDir, contextRoot, file.path),
-      content_base64: file.content?.toString('base64') ?? null,
-      byte_length: file.content?.length ?? null,
-      sha256: file.content ? sha256(file.content) : null,
-    }))),
+    context_root_sha256: files.some((file) => file.scope === 'context')
+      ? sha256(Buffer.from(resolve(contextRoot), 'utf-8'))
+      : undefined,
+    files,
   };
   await writeDurableFile(path, Buffer.from(JSON.stringify(persisted), 'utf-8'), dependencies);
 }
@@ -534,49 +553,72 @@ export async function withWorkflowStateTransaction<T>(
   if (activeTransactions.has(path)) {
     throw new Error(`workflow_state_transaction_contended:${baseStateDir}`);
   }
-  await options.lockLease.assertOwned();
+  const reservation = Symbol(path);
+  activeTransactions.set(path, reservation);
 
-  const snapshot = await captureWorkflowStateSnapshot(cwd, sessionId, extraPaths, baseStateDir);
-  const transactionId = randomUUID();
-  await writeWorkflowStateTransaction(
-    baseStateDir,
-    cwd,
-    snapshot,
-    transactionId,
-    options.lockLease.token,
-    options.lockLease.generation,
-    options.dependencies ?? {},
-  );
-  const acquiredLease: WorkflowStateTransactionLease = Object.freeze({
-    journalPath: path,
-    transactionId,
-    capturePath: async (capturedPath: string) => {
-      await options.lockLease!.assertOwned();
-      const normalizedPath = resolve(capturedPath);
-      await persistedEntryPath(baseStateDir, contextRootForCwd(cwd), normalizedPath);
-      if (snapshot.files.some((file) => resolve(file.path) === normalizedPath)) return;
-      snapshot.files.push({
-        path: normalizedPath,
-        content: await readFile(normalizedPath).catch((error: NodeJS.ErrnoException) => {
-          if (error.code === 'ENOENT') return null;
-          throw error;
-        }),
-      });
+  try {
+    await options.lockLease.assertOwned();
+
+    const snapshot = await captureWorkflowStateSnapshot(cwd, sessionId, extraPaths, baseStateDir);
+    const transactionId = randomUUID();
+    try {
       await writeWorkflowStateTransaction(
         baseStateDir,
         cwd,
         snapshot,
         transactionId,
-        options.lockLease!.token,
-        options.lockLease!.generation,
+        options.lockLease.token,
+        options.lockLease.generation,
         options.dependencies ?? {},
       );
-    },
-  });
-  activeLeases.add(acquiredLease);
-  activeTransactions.set(path, acquiredLease);
+    } catch (error) {
+      try {
+        await removeWorkflowStateTransaction(baseStateDir, options.dependencies);
+      } catch (cleanupError) {
+        try {
+          await options.lockLease.markRecoveryRequired();
+        } catch (provenanceError) {
+          throw new AggregateError(
+            [error, cleanupError, provenanceError],
+            `workflow_state_transaction_initialization_recovery_provenance_failed:${String(error)}`,
+          );
+        }
+        throw new AggregateError(
+          [error, cleanupError],
+          `workflow_state_transaction_initialization_cleanup_failed:${String(error)}`,
+        );
+      }
+      throw error;
+    }
+    const acquiredLease: WorkflowStateTransactionLease = Object.freeze({
+      journalPath: path,
+      transactionId,
+      capturePath: async (capturedPath: string) => {
+        await options.lockLease!.assertOwned();
+        const normalizedPath = resolve(capturedPath);
+        await persistedEntryPath(baseStateDir, contextRootForCwd(cwd), normalizedPath);
+        if (snapshot.files.some((file) => resolve(file.path) === normalizedPath)) return;
+        snapshot.files.push({
+          path: normalizedPath,
+          content: await readFile(normalizedPath).catch((error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT') return null;
+            throw error;
+          }),
+        });
+        await writeWorkflowStateTransaction(
+          baseStateDir,
+          cwd,
+          snapshot,
+          transactionId,
+          options.lockLease!.token,
+          options.lockLease!.generation,
+          options.dependencies ?? {},
+        );
+      },
+    });
+    activeLeases.add(acquiredLease);
+    activeTransactions.set(path, acquiredLease);
 
-  try {
     try {
       const result = await fn(acquiredLease);
       await options.lockLease.assertOwned();
@@ -629,9 +671,11 @@ export async function withWorkflowStateTransaction<T>(
         );
       }
       throw error;
+    } finally {
+      activeLeases.delete(acquiredLease);
+      if (activeTransactions.get(path) === acquiredLease) activeTransactions.delete(path);
     }
   } finally {
-    activeLeases.delete(acquiredLease);
-    if (activeTransactions.get(path) === acquiredLease) activeTransactions.delete(path);
+    if (activeTransactions.get(path) === reservation) activeTransactions.delete(path);
   }
 }

@@ -4831,6 +4831,7 @@ async function cleanupPostLaunchModeStateFilesLocked(
   cwd: string,
   sessionId: string,
   dependencies: PostLaunchModeCleanupDependencies = {},
+  scopedFiles?: ReadonlyMap<string, readonly string[]>,
 ): Promise<void> {
   const readdir =
     dependencies.readdir ?? (await import("fs/promises")).readdir;
@@ -4851,7 +4852,7 @@ async function cleanupPostLaunchModeStateFilesLocked(
     const targetSessionId = stateDir === getStateDir(cwd, sessionId)
       ? sessionId
       : undefined;
-    const files = await readdir(stateDir).catch(() => [] as string[]);
+    const files = scopedFiles?.get(stateDir) ?? await readdir(stateDir).catch(() => [] as string[]);
     const autopilotPath = join(stateDir, "autopilot-state.json");
     const autopilotPrecheck = files.includes("autopilot-state.json")
       ? await readPostLaunchModeStateFile(autopilotPath, dependencies)
@@ -5023,7 +5024,19 @@ export async function cleanupPostLaunchModeStateFiles(
       baseStateDir,
       cwd,
       sessionId || undefined,
-      () => cleanupPostLaunchModeStateFilesLocked(cwd, sessionId, dependencies),
+      async (transactionLease) => {
+        const readdir = dependencies.readdir ?? (await import("fs/promises")).readdir;
+        const stateDirs = sessionId ? [getStateDir(cwd, sessionId)] : [baseStateDir];
+        const scopedFiles = new Map<string, string[]>();
+        for (const stateDir of stateDirs) {
+          const files = await readdir(stateDir).catch(() => [] as string[]);
+          scopedFiles.set(stateDir, files);
+          await Promise.all(files
+            .filter((file) => file.endsWith("-state.json") && file !== "session.json")
+            .map((file) => transactionLease.capturePath(join(stateDir, file))));
+        }
+        await cleanupPostLaunchModeStateFilesLocked(cwd, sessionId, dependencies, scopedFiles);
+      },
       [],
       { lockLease },
     ),
