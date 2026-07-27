@@ -49,6 +49,16 @@ import { deriveAutopilotChildPhase, AUTOPILOT_CHILD_PHASES } from '../autopilot/
 import { canAdvanceAutopilotDeepInterviewToRalplan } from '../autopilot/deep-interview-gate.js';
 import { canAdvanceAutopilotRalplanToUltragoal } from '../autopilot/ralplan-gate.js';
 import { validateAutopilotCompletionTransition } from '../autopilot/completion-gate.js';
+import {
+  withWorkflowStateLock,
+  type WorkflowStateLockLease,
+  type WorkflowStateLockDependencies,
+} from '../state/workflow-state-lock.js';
+import {
+  withWorkflowStateTransaction,
+  type WorkflowStateTransactionLease,
+  type WorkflowStateTransactionDependencies,
+} from '../state/workflow-state-transaction.js';
 
 export interface KeywordMatch {
   keyword: string;
@@ -113,6 +123,30 @@ export interface RecordSkillActivationInput {
   nowIso?: string;
 }
 
+export interface RecordSkillActivationDependencies {
+  workflowLock?: WorkflowStateLockDependencies;
+  transaction?: WorkflowStateTransactionDependencies;
+  writeSkillActiveFile?: typeof import('node:fs/promises').writeFile;
+}
+
+export class SkillActivationPersistenceError extends Error {
+  readonly code = 'skill_activation_persistence_failed' as const;
+
+  constructor(stateDir: string, cause: unknown) {
+    super(`skill_activation_persistence_failed:${stateDir}:${cause instanceof Error ? cause.message : String(cause)}`, {
+      cause,
+    });
+    this.name = 'SkillActivationPersistenceError';
+  }
+}
+
+class SkillActivationTransitionDenied extends Error {
+  constructor(readonly state: SkillActiveState) {
+    super(String(state.transition_error ?? 'skill_activation_transition_denied'));
+    this.name = 'SkillActivationTransitionDenied';
+  }
+}
+
 export interface DeepInterviewModeStatePersistenceInput {
   sessionId?: string;
   threadId?: string;
@@ -130,6 +164,12 @@ interface StatefulSkillSeedConfig {
   initialPhase: string;
   includeIteration?: boolean;
   scope?: 'session' | 'root';
+}
+
+interface SkillActivationMutationAuthority {
+  lockLease: WorkflowStateLockLease;
+  transactionLease: WorkflowStateTransactionLease;
+  dependencies: RecordSkillActivationDependencies;
 }
 
 const PLANNING_LIKE_WORKFLOW_SKILLS = new Set<TrackedWorkflowMode>([
@@ -326,6 +366,7 @@ async function writeUniqueAutopilotContextSnapshot(
   slug: string,
   nowIso: string,
   body: string,
+  transactionLease?: WorkflowStateTransactionLease,
 ): Promise<string> {
   const contextDir = await ensureSafeAutopilotContextDir(sourceCwd);
   const timestamp = utcCompactTimestamp(nowIso);
@@ -335,6 +376,7 @@ async function writeUniqueAutopilotContextSnapshot(
     const relativePath = `.omx/context/${filename}`;
     const absolutePath = resolve(contextDir, filename);
     try {
+      await transactionLease?.capturePath(absolutePath);
       await writeFile(absolutePath, body, { encoding: 'utf-8', flag: 'wx' });
       return relativePath;
     } catch (error) {
@@ -350,7 +392,11 @@ async function ensureAutopilotContextSnapshot(
   nowIso: string,
   activationText: string,
   existingSnapshot?: AutopilotContextSnapshotDescriptor,
-  options: { allowTaskSnapshotCreation?: boolean; recoveryReason?: AutopilotContextRecoveryReason } = {},
+  options: {
+    allowTaskSnapshotCreation?: boolean;
+    recoveryReason?: AutopilotContextRecoveryReason;
+    transactionLease?: WorkflowStateTransactionLease;
+  } = {},
 ): Promise<AutopilotContextSnapshotResult> {
   if (existingSnapshot) {
     if (isSafeAutopilotContextSnapshotPath(existingSnapshot.path)) {
@@ -379,7 +425,13 @@ async function ensureAutopilotContextSnapshot(
       '- required follow-up: re-establish or confirm the intended task context before downstream handoff.',
       '',
     ].join('\n');
-    const path = await writeUniqueAutopilotContextSnapshot(sourceCwd, slug, nowIso, body);
+    const path = await writeUniqueAutopilotContextSnapshot(
+      sourceCwd,
+      slug,
+      nowIso,
+      body,
+      options.transactionLease,
+    );
     return {
       path,
       kind: 'recovery',
@@ -409,7 +461,13 @@ async function ensureAutopilotContextSnapshot(
     '',
   ].join('\n');
   return {
-    path: await writeUniqueAutopilotContextSnapshot(sourceCwd, slug, nowIso, body),
+    path: await writeUniqueAutopilotContextSnapshot(
+      sourceCwd,
+      slug,
+      nowIso,
+      body,
+      options.transactionLease,
+    ),
     kind: 'canonical',
     original_task_status: 'activation-prompt',
   };
@@ -625,7 +683,10 @@ async function persistStatefulSkillSeedState(
   previousSkill: SkillActiveState | null,
   activationText: string,
   sourceCwd: string,
-  options: { activeContinuation?: boolean } = {},
+  options: {
+    activeContinuation?: boolean;
+    transactionLease?: WorkflowStateTransactionLease;
+  } = {},
 ): Promise<SkillActiveState> {
   const config = STATEFUL_SKILL_SEED_CONFIG[nextSkill.skill as StatefulSkillMode];
   if (!config) return nextSkill;
@@ -725,6 +786,7 @@ async function persistStatefulSkillSeedState(
       {
         allowTaskSnapshotCreation: !(preserveExistingModeState || options.activeContinuation === true),
         recoveryReason,
+        transactionLease: options.transactionLease,
       },
     );
     const contextSnapshotPath = contextSnapshot.path;
@@ -1190,7 +1252,11 @@ async function persistAutopilotSupervisedChildPhaseState(
   sessionId: string | undefined,
   childSkill: string,
   nowIso: string,
-  options: { threadId?: string; turnId?: string } = {},
+  options: {
+    threadId?: string;
+    turnId?: string;
+    writeFile?: typeof writeFile;
+  } = {},
 ): Promise<string> {
   const { absolutePath } = resolveSeedStateFilePath(stateDir, 'autopilot', sessionId);
   const existingResult = await readJsonStateWithStatus(absolutePath);
@@ -1213,7 +1279,7 @@ async function persistAutopilotSupervisedChildPhaseState(
   );
 
   await mkdir(dirname(absolutePath), { recursive: true });
-  await writeFile(absolutePath, JSON.stringify(withModeRuntimeContext(
+  await (options.writeFile ?? writeFile)(absolutePath, JSON.stringify(withModeRuntimeContext(
     existing ?? {},
     {
       ...(existing ?? {}),
@@ -1238,10 +1304,10 @@ async function reconcileAutopilotSupervisedChildModeStates(
   sessionId: string | undefined,
   childSkill: string,
   nowIso: string,
-  options: { threadId?: string; turnId?: string } = {},
+  authority: SkillActivationMutationAuthority,
 ): Promise<{ completedPaths: string[]; effectivePhase: string }> {
   if (!isTrackedWorkflowMode(childSkill)) {
-    const effectivePhase = await persistAutopilotSupervisedChildPhaseState(cwd, stateDir, sessionId, childSkill, nowIso, options);
+    const effectivePhase = await resolveAutopilotSupervisedChildPhaseState(cwd, stateDir, sessionId, childSkill);
     return { completedPaths: [], effectivePhase };
   }
 
@@ -1270,8 +1336,8 @@ async function reconcileAutopilotSupervisedChildModeStates(
     nowIso,
     sessionId,
     source: 'autopilot-supervised-child',
+    workflowLockLease: authority.lockLease,
   });
-  await persistAutopilotSupervisedChildPhaseState(cwd, stateDir, sessionId, childSkill, nowIso, options);
   return { completedPaths: transition.completedPaths, effectivePhase };
 }
 
@@ -1354,8 +1420,46 @@ function selectRootSkillStateCopy(
   return null;
 }
 
-export async function recordSkillActivation(input: RecordSkillActivationInput): Promise<SkillActiveState | null> {
+export async function recordSkillActivation(
+  input: RecordSkillActivationInput,
+  dependencies: RecordSkillActivationDependencies = {},
+): Promise<SkillActiveState | null> {
   const sourceCwd = input.sourceCwd ?? dirname(dirname(input.stateDir));
+  try {
+    return await withWorkflowStateLock(
+      input.stateDir,
+      sourceCwd,
+      (lockLease) =>
+        withWorkflowStateTransaction(
+          input.stateDir,
+          sourceCwd,
+          input.sessionId,
+          (transactionLease) => recordSkillActivationLocked(
+            input,
+            sourceCwd,
+            { lockLease, transactionLease, dependencies },
+          ),
+          [],
+          { lockLease, dependencies: dependencies.transaction },
+        ),
+      undefined,
+      {
+        ...dependencies.workflowLock,
+        transaction: dependencies.transaction,
+      },
+    );
+  } catch (error) {
+    if (error instanceof SkillActivationTransitionDenied) return error.state;
+    if (error instanceof SkillActivationPersistenceError) throw error;
+    throw new SkillActivationPersistenceError(input.stateDir, error);
+  }
+}
+
+async function recordSkillActivationLocked(
+  input: RecordSkillActivationInput,
+  sourceCwd: string,
+  authority: SkillActivationMutationAuthority,
+): Promise<SkillActiveState | null> {
   const rootStatePath = join(input.stateDir, SKILL_ACTIVE_STATE_FILE);
   const sessionStatePath = input.sessionId
     ? join(input.stateDir, 'sessions', input.sessionId, SKILL_ACTIVE_STATE_FILE)
@@ -1393,17 +1497,14 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
       ...(previous?.input_lock ? { input_lock: releaseDeepInterviewInputLock(previous.input_lock, nowIso, 'abort') } : {}),
     };
 
-    try {
-      await writeSkillActiveStateCopiesForStateDir(
-        input.stateDir,
-        state,
-        input.sessionId,
-        selectRootSkillStateCopy(previousRoot, state, input.sessionId),
-      );
-      await persistDeepInterviewModeState(input.stateDir, state, nowIso, previous, input);
-    } catch (error) {
-      console.warn('[omx] warning: failed to persist keyword activation state', error);
-    }
+    await writeSkillActiveStateCopiesForStateDir(
+      input.stateDir,
+      state,
+      input.sessionId,
+      selectRootSkillStateCopy(previousRoot, state, input.sessionId),
+      { writeFile: authority.dependencies.writeSkillActiveFile },
+    );
+    await persistDeepInterviewModeState(input.stateDir, state, nowIso, previous, input);
 
     return state;
   }
@@ -1467,53 +1568,21 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
     : null;
 
   if (previous?.active === true && previous.skill === 'autopilot' && isAutopilotSupervisedChildSkill(match.skill)) {
+    // Reconcile first so skill-active phase reflects the gate-held phase the
+    // autopilot detail state actually advanced to (a blocked advance keeps the
+    // current phase).
+    let effectivePhase: string;
     try {
-      // Reconcile first so skill-active phase reflects the gate-held phase the
-      // autopilot detail state actually advanced to (a blocked advance keeps the
-      // current phase).
-      const { effectivePhase } = await reconcileAutopilotSupervisedChildModeStates(
+      ({ effectivePhase } = await reconcileAutopilotSupervisedChildModeStates(
         sourceCwd,
         input.stateDir,
         input.sessionId ?? previous.session_id,
         match.skill,
         nowIso,
-        { threadId: input.threadId, turnId: input.turnId },
-      );
-      const nextState: SkillActiveState = {
-        ...previous,
-        version: 1,
-        active: true,
-        updated_at: nowIso,
-        source: 'keyword-detector',
-        session_id: input.sessionId ?? previous.session_id,
-        thread_id: input.threadId ?? previous.thread_id,
-        turn_id: input.turnId ?? previous.turn_id,
-        phase: effectivePhase,
-        active_skills: listActiveSkills(previous).map((entry) => (
-          entry.skill === 'autopilot'
-            ? {
-                ...entry,
-                phase: effectivePhase,
-                active: true,
-                updated_at: nowIso,
-                session_id: input.sessionId ?? entry.session_id,
-                thread_id: input.threadId ?? entry.thread_id,
-                turn_id: input.turnId ?? entry.turn_id,
-              }
-            : entry
-        )),
-        supervised_child_keyword: match.keyword,
-        supervised_child_skill: match.skill,
-      };
-      await writeSkillActiveStateCopiesForStateDir(
-        input.stateDir,
-        nextState,
-        input.sessionId,
-        selectRootSkillStateCopy(previousRoot, nextState, input.sessionId),
-      );
-      return nextState;
+        authority,
+      ));
     } catch (error) {
-      return {
+      throw new SkillActivationTransitionDenied({
         ...previous,
         version: 1,
         active: true,
@@ -1524,8 +1593,54 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
         turn_id: input.turnId ?? previous.turn_id,
         active_skills: listActiveSkills(previous),
         transition_error: error instanceof Error ? error.message : String(error),
-      };
+      });
     }
+    await persistAutopilotSupervisedChildPhaseState(
+      sourceCwd,
+      input.stateDir,
+      input.sessionId ?? previous.session_id,
+      match.skill,
+      nowIso,
+      {
+        threadId: input.threadId,
+        turnId: input.turnId,
+        writeFile: authority.dependencies.writeSkillActiveFile,
+      },
+    );
+    const nextState: SkillActiveState = {
+      ...previous,
+      version: 1,
+      active: true,
+      updated_at: nowIso,
+      source: 'keyword-detector',
+      session_id: input.sessionId ?? previous.session_id,
+      thread_id: input.threadId ?? previous.thread_id,
+      turn_id: input.turnId ?? previous.turn_id,
+      phase: effectivePhase,
+      active_skills: listActiveSkills(previous).map((entry) => (
+        entry.skill === 'autopilot'
+          ? {
+              ...entry,
+              phase: effectivePhase,
+              active: true,
+              updated_at: nowIso,
+              session_id: input.sessionId ?? entry.session_id,
+              thread_id: input.threadId ?? entry.thread_id,
+              turn_id: input.turnId ?? entry.turn_id,
+            }
+          : entry
+      )),
+      supervised_child_keyword: match.keyword,
+      supervised_child_skill: match.skill,
+    };
+    await writeSkillActiveStateCopiesForStateDir(
+      input.stateDir,
+      nextState,
+      input.sessionId,
+      selectRootSkillStateCopy(previousRoot, nextState, input.sessionId),
+      { writeFile: authority.dependencies.writeSkillActiveFile },
+    );
+    return nextState;
   }
 
   if (isTrackedWorkflowMatch) {
@@ -1572,10 +1687,11 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
               source: 'keyword-detector',
               baseStateDir: input.stateDir,
               currentModes: nextWorkflowEntries.map((entry) => entry.skill),
+              workflowLockLease: authority.lockLease,
             },
           );
         } catch (error) {
-          return {
+          throw new SkillActivationTransitionDenied({
             ...(previous ?? {}),
             version: 1,
             active: previous?.active ?? nextWorkflowEntries.length > 0,
@@ -1591,7 +1707,7 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
             active_skills: previousEntries,
             ...(previous?.input_lock ? { input_lock: previous.input_lock } : {}),
             transition_error: error instanceof Error ? error.message : String(error),
-          };
+          });
         }
         if (transition.transitionMessage) {
           transitionMessages.push(transition.transitionMessage);
@@ -1659,48 +1775,46 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
       ...(primarySkill === 'deep-interview' && deepInterviewConfig ? { deep_interview_config: deepInterviewConfig } : {}),
     };
 
-    try {
-      let nextState: SkillActiveState = { ...workflowState };
-      for (const requestedEntry of nextWorkflowEntries) {
-        const seeded = await persistStatefulSkillSeedState(
-          input.stateDir,
-          {
-            ...workflowState,
-            skill: requestedEntry.skill,
-            keyword: requestedEntry.skill === workflowState.skill ? workflowState.keyword : `$${requestedEntry.skill}`,
-            phase: requestedEntry.phase || workflowState.phase,
-            activated_at: requestedEntry.activated_at || workflowState.activated_at,
-            updated_at: requestedEntry.updated_at || workflowState.updated_at,
-            ...(requestedEntry.skill === 'deep-interview' && deepInterviewConfig ? { deep_interview_config: deepInterviewConfig } : {}),
-          },
-          nowIso,
-          previous,
-          input.text,
-          sourceCwd,
-          { activeContinuation: requestedEntry.skill === 'autopilot' && sameSkillContinuation },
-        );
-        if (requestedEntry.skill === workflowState.skill) {
-          nextState = {
-            ...workflowState,
-            initialized_mode: seeded.initialized_mode,
-            initialized_state_path: seeded.initialized_state_path,
-          };
-        }
-      }
-      nextState.active_skills = buildActiveSkills(nextState);
-      await writeSkillActiveStateCopiesForStateDir(
+    let nextState: SkillActiveState = { ...workflowState };
+    for (const requestedEntry of nextWorkflowEntries) {
+      const seeded = await persistStatefulSkillSeedState(
         input.stateDir,
-        nextState,
-        input.sessionId,
-        selectRootSkillStateCopy(previousRoot, nextState, input.sessionId),
+        {
+          ...workflowState,
+          skill: requestedEntry.skill,
+          keyword: requestedEntry.skill === workflowState.skill ? workflowState.keyword : `$${requestedEntry.skill}`,
+          phase: requestedEntry.phase || workflowState.phase,
+          activated_at: requestedEntry.activated_at || workflowState.activated_at,
+          updated_at: requestedEntry.updated_at || workflowState.updated_at,
+          ...(requestedEntry.skill === 'deep-interview' && deepInterviewConfig ? { deep_interview_config: deepInterviewConfig } : {}),
+        },
+        nowIso,
+        previous,
+        input.text,
+        sourceCwd,
+        {
+          activeContinuation: requestedEntry.skill === 'autopilot' && sameSkillContinuation,
+          transactionLease: authority.transactionLease,
+        },
       );
-      await persistDeepInterviewModeState(input.stateDir, nextState, nowIso, previous, input);
-      return nextState;
-    } catch (error) {
-      console.warn('[omx] warning: failed to persist keyword activation state', error);
+      if (requestedEntry.skill === workflowState.skill) {
+        nextState = {
+          ...workflowState,
+          initialized_mode: seeded.initialized_mode,
+          initialized_state_path: seeded.initialized_state_path,
+        };
+      }
     }
-
-    return workflowState;
+    nextState.active_skills = buildActiveSkills(nextState);
+    await writeSkillActiveStateCopiesForStateDir(
+      input.stateDir,
+      nextState,
+      input.sessionId,
+      selectRootSkillStateCopy(previousRoot, nextState, input.sessionId),
+      { writeFile: authority.dependencies.writeSkillActiveFile },
+    );
+    await persistDeepInterviewModeState(input.stateDir, nextState, nowIso, previous, input);
+    return nextState;
   }
 
   const state: SkillActiveState = {
@@ -1729,30 +1843,28 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
     ...(match.skill === 'deep-interview' && deepInterviewConfig ? { deep_interview_config: deepInterviewConfig } : {}),
   };
 
-  try {
-    const nextState = await persistStatefulSkillSeedState(
-      input.stateDir,
-      state,
-      nowIso,
-      previous,
-      input.text,
-      sourceCwd,
-      { activeContinuation: match.skill === 'autopilot' && sameSkillContinuation },
-    );
-    nextState.active_skills = buildActiveSkills(nextState);
-    await writeSkillActiveStateCopiesForStateDir(
-      input.stateDir,
-      nextState,
-      input.sessionId,
-      selectRootSkillStateCopy(previousRoot, nextState, input.sessionId),
-    );
-    await persistDeepInterviewModeState(input.stateDir, nextState, nowIso, previous, input);
-    return nextState;
-  } catch (error) {
-    console.warn('[omx] warning: failed to persist keyword activation state', error);
-  }
-
-  return state;
+  const nextState = await persistStatefulSkillSeedState(
+    input.stateDir,
+    state,
+    nowIso,
+    previous,
+    input.text,
+    sourceCwd,
+    {
+      activeContinuation: match.skill === 'autopilot' && sameSkillContinuation,
+      transactionLease: authority.transactionLease,
+    },
+  );
+  nextState.active_skills = buildActiveSkills(nextState);
+  await writeSkillActiveStateCopiesForStateDir(
+    input.stateDir,
+    nextState,
+    input.sessionId,
+    selectRootSkillStateCopy(previousRoot, nextState, input.sessionId),
+    { writeFile: authority.dependencies.writeSkillActiveFile },
+  );
+  await persistDeepInterviewModeState(input.stateDir, nextState, nowIso, previous, input);
+  return nextState;
 }
 
 /**

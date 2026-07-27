@@ -53,6 +53,8 @@ import {
 import { reconcileWorkflowTransition } from './workflow-transition-reconcile.js';
 import { withWorkflowStateLock } from './workflow-state-lock.js';
 import { withWorkflowStateTransaction } from './workflow-state-transaction.js';
+import type { WorkflowStateLockDependencies } from './workflow-state-lock.js';
+import type { WorkflowStateTransactionDependencies } from './workflow-state-transaction.js';
 import {
   buildAutopilotDeepInterviewRalplanGateError,
   canAdvanceAutopilotDeepInterviewToRalplan,
@@ -68,7 +70,6 @@ import {
 import {
   isUnsupportedNativeSubagentEvidenceForScope,
 } from '../leader/contract.js';
-import { getStateMutationCommitHook } from '../testing/state-fault-injection.js';
 import {
   buildRalplanConsensusGateFromSources,
 } from '../ralplan/consensus-gate.js';
@@ -133,6 +134,16 @@ export interface StateOperationResponse {
 }
 
 const stateWriteQueues = new Map<string, Promise<void>>();
+
+export interface StateOperationDependencies {
+  workflowLock?: WorkflowStateLockDependencies;
+  transaction?: WorkflowStateTransactionDependencies;
+  onMutationCommitted?: (
+    stage: 'detail-written' | 'clear-detail-written',
+    mode: string,
+  ) => void | Promise<void>;
+  writeSkillActiveFile?: typeof writeFile;
+}
 
 async function withStateWriteLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   const tail = stateWriteQueues.get(path) ?? Promise.resolve();
@@ -737,6 +748,7 @@ async function readSessionDetailTransitionModes(
 export async function executeStateOperation(
   name: StateOperationName,
   rawArgs: Record<string, unknown> = {},
+  dependencies: StateOperationDependencies = {},
 ): Promise<StateOperationResponse> {
   let cwd: string;
   let explicitSessionId: string | undefined;
@@ -783,7 +795,7 @@ export async function executeStateOperation(
         let transitionMessage: string | undefined;
         let ensureRalphArtifacts = false;
 
-        await withWorkflowStateLock(baseStateDir, async (lockLease) => {
+        await withWorkflowStateLock(baseStateDir, cwd, async (lockLease) => {
           try {
             await withWorkflowStateTransaction(baseStateDir, cwd, effectiveSessionId, async () => {
               await withStateWriteLock(path, async () => {
@@ -1003,7 +1015,7 @@ export async function executeStateOperation(
 
           const merged = withModeRuntimeContext(existing, mergedRaw);
           await writeAtomicFile(path, JSON.stringify(merged, null, 2));
-          await getStateMutationCommitHook()?.('detail-written', mode);
+          await dependencies.onMutationCommitted?.('detail-written', mode);
               });
 
               if (validationError) throw new Error(validationError);
@@ -1011,7 +1023,13 @@ export async function executeStateOperation(
               if (mode === SKILL_ACTIVE_STATE_MODE) {
                 const state = await readSkillActiveState(path);
                 if (state) {
-                  await writeSkillActiveStateCopiesForStateDir(baseStateDir, state, effectiveSessionId);
+                  await writeSkillActiveStateCopiesForStateDir(
+                    baseStateDir,
+                    state,
+                    effectiveSessionId,
+                    undefined,
+                    { writeFile: dependencies.writeSkillActiveFile },
+                  );
                 }
               } else {
                 if (mode === 'ralph' && ensureRalphArtifacts) {
@@ -1036,13 +1054,17 @@ export async function executeStateOperation(
                     currentPhase: typeof data.current_phase === 'string' ? data.current_phase : undefined,
                     sessionId: effectiveSessionId,
                     source: 'state-operations',
+                    writeFile: dependencies.writeSkillActiveFile,
                   });
                 }
               }
-            }, [], { lockLease });
+            }, [], { lockLease, dependencies: dependencies.transaction });
           } catch (error) {
             if (!validationError) throw error;
           }
+        }, undefined, {
+          ...dependencies.workflowLock,
+          transaction: dependencies.transaction,
         });
 
         if (validationError) {
@@ -1070,7 +1092,7 @@ export async function executeStateOperation(
 
         const mode = validateStateModeSegment(rawArgs.mode);
         const allSessions = rawArgs.all_sessions === true;
-        return await withWorkflowStateLock(baseStateDir, async (lockLease) => {
+        return await withWorkflowStateLock(baseStateDir, cwd, async (lockLease) => {
           const paths = allSessions
             ? await getAllScopedStatePaths(mode, cwd)
             : [getStatePath(mode, cwd, effectiveSessionId)];
@@ -1104,7 +1126,7 @@ export async function executeStateOperation(
               const nativeStopCleared = effectiveSessionId
                 ? await clearSessionNativeStopState(baseStateDir, effectiveSessionId)
                 : [];
-              await getStateMutationCommitHook()?.('clear-detail-written', mode);
+              await dependencies.onMutationCommitted?.('clear-detail-written', mode);
               if (mode !== SKILL_ACTIVE_STATE_MODE) {
                 await syncCanonicalSkillStateForMode({
                   cwd,
@@ -1113,6 +1135,7 @@ export async function executeStateOperation(
                   active: false,
                   sessionId: effectiveSessionId,
                   source: 'state-operations',
+                  writeFile: dependencies.writeSkillActiveFile,
                 });
               }
               return {
@@ -1131,7 +1154,7 @@ export async function executeStateOperation(
               await unlink(path);
               removedPaths.push(path);
             }
-            await getStateMutationCommitHook()?.('clear-detail-written', mode);
+            await dependencies.onMutationCommitted?.('clear-detail-written', mode);
             if (mode !== SKILL_ACTIVE_STATE_MODE) {
               await syncCanonicalSkillStateForMode({
                 cwd,
@@ -1140,6 +1163,7 @@ export async function executeStateOperation(
                 active: false,
                 source: 'state-operations',
                 allSessions: true,
+                writeFile: dependencies.writeSkillActiveFile,
               });
             }
 
@@ -1153,7 +1177,10 @@ export async function executeStateOperation(
                 warning: 'all_sessions clears global and session-scoped state files',
               },
             };
-          }, transactionPaths, { lockLease });
+          }, transactionPaths, { lockLease, dependencies: dependencies.transaction });
+        }, undefined, {
+          ...dependencies.workflowLock,
+          transaction: dependencies.transaction,
         });
       }
 

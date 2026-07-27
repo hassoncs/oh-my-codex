@@ -1041,6 +1041,7 @@ describe("cleanupPostLaunchModeStateFiles", () => {
     const detailPath = join(sessionStateDir, "team-state.json");
     const canonicalPath = join(sessionStateDir, "skill-active-state.json");
     const runStatePath = join(sessionStateDir, "run-state.json");
+    const hudStatePath = join(sessionStateDir, "hud-state.json");
     const detailBefore = JSON.stringify({
       active: true,
       mode: "team",
@@ -1065,15 +1066,28 @@ describe("cleanupPostLaunchModeStateFiles", () => {
       updated_at: "2026-07-26T00:00:00.000Z",
       current_phase: "team-exec",
     }, null, 2);
+    const hudStateBefore = JSON.stringify({
+      active: true,
+      mode: "hud",
+      current_phase: "watching",
+      stable: "exact-bytes",
+    }, null, 2);
 
     try {
       await mkdir(sessionStateDir, { recursive: true });
       await writeFile(detailPath, detailBefore);
       await writeFile(canonicalPath, canonicalBefore);
       await writeFile(runStatePath, runStateBefore);
+      await writeFile(hudStatePath, hudStateBefore);
 
       await assert.rejects(
         () => cleanupPostLaunchModeStateFiles(wd, sessionId, {
+          readdir: (async () => [
+            "hud-state.json",
+            "team-state.json",
+            "skill-active-state.json",
+            "run-state.json",
+          ]) as unknown as typeof fsReaddir,
           writeFile: (async (path: unknown, content: unknown, options?: unknown) => {
             await writeFile(String(path), content as string, options as BufferEncoding);
             if (String(path) === detailPath) throw new Error("cleanup_write_failed");
@@ -1085,6 +1099,7 @@ describe("cleanupPostLaunchModeStateFiles", () => {
       assert.equal(await readFile(detailPath, "utf-8"), detailBefore);
       assert.equal(await readFile(canonicalPath, "utf-8"), canonicalBefore);
       assert.equal(await readFile(runStatePath, "utf-8"), runStateBefore);
+      assert.equal(await readFile(hudStatePath, "utf-8"), hudStateBefore);
       assert.equal(existsSync(join(stateDir, ".workflow-state-transaction.json")), false);
     } finally {
       await rm(wd, { recursive: true, force: true });

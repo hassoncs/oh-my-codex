@@ -69,6 +69,7 @@
     "Cargo.toml",
     "Cargo.lock",
     "dist/",
+    "!dist/testing/",
     "crates/",
     "!crates/**/.omx/**",
     "skills/",

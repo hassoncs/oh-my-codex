@@ -371,22 +371,21 @@ async function runContendedWorkflowWrite(
   contendedPath: string,
 ): Promise<{ payload: unknown; isError?: boolean }> {
   const operationsUrl = new URL('../../state/operations.js', import.meta.url).href;
-  const faultInjectionUrl = new URL('../../testing/state-fault-injection.js', import.meta.url).href;
   const script = `
     const { writeFile } = await import('node:fs/promises');
     const { executeStateOperation } = await import(${JSON.stringify(operationsUrl)});
-    const { configureWorkflowStateLockFaults } = await import(${JSON.stringify(faultInjectionUrl)});
-    configureWorkflowStateLockFaults({
-      hook: async (stage) => {
-        if (stage === 'contended') await writeFile(${JSON.stringify(contendedPath)}, 'contended');
-      },
-    });
     const response = await executeStateOperation('state_write', {
       workingDirectory: ${JSON.stringify(cwd)},
       mode: 'autopilot',
       active: true,
       current_phase: 'deep-interview',
       state: { concurrent_commit: true },
+    }, {
+      workflowLock: {
+        hook: async (stage) => {
+          if (stage === 'contended') await writeFile(${JSON.stringify(contendedPath)}, 'contended');
+        },
+      },
     });
     process.stdout.write(JSON.stringify(response));
   `;

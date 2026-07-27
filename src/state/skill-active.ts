@@ -9,7 +9,6 @@ import {
   pickPrimaryWorkflowMode,
   type WorkflowTransitionOptions,
 } from './workflow-transition.js';
-import { getSkillActiveWriteHook } from '../testing/state-fault-injection.js';
 
 export const SKILL_ACTIVE_STATE_MODE = 'skill-active';
 export const SKILL_ACTIVE_STATE_FILE = `${SKILL_ACTIVE_STATE_MODE}-state.json`;
@@ -71,6 +70,11 @@ export interface SyncCanonicalSkillStateOptions {
   source?: string;
   allSessions?: boolean;
   workflowTransitionOptions?: WorkflowTransitionOptions;
+  writeFile?: typeof writeFile;
+}
+
+export interface SkillActiveWriteDependencies {
+  writeFile?: typeof writeFile;
 }
 
 function safeString(value: unknown): string {
@@ -301,9 +305,10 @@ export async function writeSkillActiveStateCopiesForStateDir(
   state: SkillActiveStateLike,
   sessionId?: string,
   rootState?: SkillActiveStateLike | null,
+  dependencies: SkillActiveWriteDependencies = {},
 ): Promise<void> {
   const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(stateDir, sessionId);
-  await writeSkillActiveStateCopiesToPaths(rootPath, sessionPath, state, rootState);
+  await writeSkillActiveStateCopiesToPaths(rootPath, sessionPath, state, rootState, dependencies);
 }
 
 async function writeSkillActiveStateCopiesToPaths(
@@ -311,7 +316,9 @@ async function writeSkillActiveStateCopiesToPaths(
   sessionPath: string | undefined,
   state: SkillActiveStateLike,
   rootState?: SkillActiveStateLike | null,
+  dependencies: SkillActiveWriteDependencies = {},
 ): Promise<void> {
+  const writeFileFn = dependencies.writeFile ?? writeFile;
   const normalized = { version: 1, ...state };
   const normalizedRoot = rootState === null
     ? null
@@ -319,15 +326,13 @@ async function writeSkillActiveStateCopiesToPaths(
   if (normalizedRoot !== null) {
     const rootPayload = JSON.stringify(normalizedRoot, null, 2);
     await mkdir(dirname(rootPath), { recursive: true });
-    await getSkillActiveWriteHook()?.(rootPath);
-    await writeFile(rootPath, rootPayload);
+    await writeFileFn(rootPath, rootPayload);
   }
 
   if (sessionPath) {
     const sessionPayload = JSON.stringify(normalized, null, 2);
     await mkdir(dirname(sessionPath), { recursive: true });
-    await getSkillActiveWriteHook()?.(sessionPath);
-    await writeFile(sessionPath, sessionPayload);
+    await writeFileFn(sessionPath, sessionPayload);
   }
 }
 
@@ -479,7 +484,13 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
         mode,
         normalizedSessionId,
       );
-    await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextSessionState, sessionId, nextRootState);
+    await writeSkillActiveStateCopiesForStateDir(
+      baseStateDir,
+      nextSessionState,
+      sessionId,
+      nextRootState,
+      { writeFile: options.writeFile },
+    );
     return;
   }
 
@@ -505,7 +516,13 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
     : [...sessionScopedRootMirrorEntries, ...nextRootScopedEntries];
 
   const nextRootState = applyEntriesToState(existingRoot, nextRootEntries, mode);
-  await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextRootState, undefined, nextRootState);
+  await writeSkillActiveStateCopiesForStateDir(
+    baseStateDir,
+    nextRootState,
+    undefined,
+    nextRootState,
+    { writeFile: options.writeFile },
+  );
 
   const sessionsDir = join(baseStateDir, 'sessions');
   if (!existsSync(sessionsDir)) return;
@@ -536,6 +553,12 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
       nextSessionEntries[0]?.skill || mode,
       sessionId,
     );
-    await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextSessionState, sessionId, nextRootState);
+    await writeSkillActiveStateCopiesForStateDir(
+      baseStateDir,
+      nextSessionState,
+      sessionId,
+      nextRootState,
+      { writeFile: options.writeFile },
+    );
   }
 }

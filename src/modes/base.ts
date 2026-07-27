@@ -34,10 +34,12 @@ import {
 import { completeRalplanSession, validateRalplanTerminalConsensus } from '../state/operations.js';
 import {
   withWorkflowStateLock,
+  type WorkflowStateLockDependencies,
   type WorkflowStateLockLease,
 } from '../state/workflow-state-lock.js';
 import {
   withWorkflowStateTransaction,
+  type WorkflowStateTransactionDependencies,
   type WorkflowStateTransactionLease,
 } from '../state/workflow-state-transaction.js';
 
@@ -71,6 +73,9 @@ export interface StartModeOptions extends WorkflowTransitionOptions {
   preflightTransition?: PreflightedWorkflowTransition;
   workflowLockLease?: WorkflowStateLockLease;
   workflowTransactionLease?: WorkflowStateTransactionLease;
+  workflowLockDependencies?: WorkflowStateLockDependencies;
+  transactionDependencies?: WorkflowStateTransactionDependencies;
+  writeSkillActiveFile?: typeof writeFile;
 }
 
 const DEPRECATED_MODES: Record<DeprecatedModeName, string> = {
@@ -185,10 +190,16 @@ export async function startMode(
   if (isTrackedWorkflowMode(mode) && !options.workflowLockLease) {
     return withWorkflowStateLock(
       baseStateDir,
+      projectRoot ?? process.cwd(),
       (workflowLockLease) => startMode(mode, taskDescription, maxIterations, projectRoot, {
         ...options,
         workflowLockLease,
       }),
+      undefined,
+      {
+        ...options.workflowLockDependencies,
+        transaction: options.transactionDependencies,
+      },
     );
   }
   await mkdir(baseStateDir, { recursive: true });
@@ -234,6 +245,7 @@ export async function startMode(
         sessionId: scope.sessionId,
         source: 'startMode',
         workflowTransitionOptions: options,
+        writeFile: options.writeSkillActiveFile,
       });
     }
     return state;
@@ -248,6 +260,7 @@ export async function startMode(
       {
         lockLease: options.workflowLockLease,
         transactionLease: options.workflowTransactionLease,
+        dependencies: options.transactionDependencies,
       },
     )
     : run();
@@ -333,6 +346,7 @@ export async function updateModeState(
   if (isTrackedWorkflowMode(mode) && !options.workflowLockLease) {
     return withWorkflowStateLock(
       baseStateDir,
+      projectRoot ?? process.cwd(),
       (workflowLockLease) => updateModeState(mode, updates, projectRoot, explicitSessionId, {
         ...options,
         workflowLockLease,

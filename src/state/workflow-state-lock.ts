@@ -5,8 +5,8 @@ import { dirname, join, resolve } from 'node:path';
 import {
   recoverWorkflowStateTransactionUnderLock,
   WORKFLOW_STATE_RECOVERY_OWNER_FILE,
+  type WorkflowStateTransactionDependencies,
 } from './workflow-state-transaction.js';
-import { getWorkflowStateLockFaults } from '../testing/state-fault-injection.js';
 
 const DEFAULT_LOCK_STALE_MS = 120_000;
 const DEFAULT_LOCK_TIMEOUT_MS = 10_000;
@@ -28,6 +28,23 @@ interface LockOwner {
 type LockOwnerReadResult =
   | { kind: 'ok'; owner: LockOwner }
   | { kind: 'missing' | 'invalid' };
+
+export interface WorkflowStateLockDependencies {
+  staleMs?: number;
+  timeoutMs?: number;
+  retryMs?: number;
+  heartbeatMs?: number;
+  processIsAlive?: (pid: number) => boolean;
+  hook?: (
+    stage:
+      | 'contended'
+      | 'before-lock-publish'
+      | 'before-stale-rename'
+      | 'after-stale-rename'
+      | 'before-owner-write',
+  ) => void | Promise<void>;
+  transaction?: WorkflowStateTransactionDependencies;
+}
 
 const activeLeases = new WeakSet<object>();
 
@@ -72,8 +89,8 @@ async function readOwner(path: string): Promise<LockOwnerReadResult> {
   }
 }
 
-function processIsAlive(pid: number): boolean {
-  const processIsAliveOverride = getWorkflowStateLockFaults().processIsAlive;
+function processIsAlive(pid: number, dependencies: WorkflowStateLockDependencies): boolean {
+  const processIsAliveOverride = dependencies.processIsAlive;
   if (processIsAliveOverride) return processIsAliveOverride(pid);
   try {
     process.kill(pid, 0);
@@ -106,9 +123,13 @@ async function writeDurableJson(path: string, value: unknown): Promise<void> {
   await syncDirectory(dirname(path));
 }
 
-async function writeOwner(path: string, owner: LockOwner): Promise<void> {
+async function writeOwner(
+  path: string,
+  owner: LockOwner,
+  dependencies: WorkflowStateLockDependencies,
+): Promise<void> {
   const tempPath = `${path}.${owner.token}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
-  await getWorkflowStateLockFaults().hook?.('before-owner-write');
+  await dependencies.hook?.('before-owner-write');
   const handle = await open(tempPath, 'w');
   try {
     await handle.writeFile(JSON.stringify(owner), 'utf-8');
@@ -118,6 +139,57 @@ async function writeOwner(path: string, owner: LockOwner): Promise<void> {
   }
   await rename(tempPath, path);
   await syncDirectory(dirname(path));
+}
+
+async function recoverOrphanedPendingLocks(
+  baseStateDir: string,
+  lockDir: string,
+  dependencies: WorkflowStateLockDependencies,
+): Promise<void> {
+  const pendingPrefix = `${lockDir.slice(baseStateDir.length + 1)}.pending.`;
+  const staleMs = dependencies.staleMs ?? DEFAULT_LOCK_STALE_MS;
+  let removed = false;
+  for (const entry of await readdir(baseStateDir)) {
+    if (!entry.startsWith(pendingPrefix)) continue;
+    const pendingDir = join(baseStateDir, entry);
+    const owner = await readOwner(join(pendingDir, 'owner'));
+    if (owner.kind === 'ok') {
+      if (processIsAlive(owner.owner.pid, dependencies)) continue;
+    } else {
+      const pendingStat = await stat(pendingDir).catch(() => null);
+      if (!pendingStat || Date.now() - pendingStat.mtimeMs <= staleMs) continue;
+    }
+    await rm(pendingDir, { recursive: true, force: true });
+    removed = true;
+  }
+  if (removed) await syncDirectory(baseStateDir);
+}
+
+async function publishOwnerLock(
+  baseStateDir: string,
+  lockDir: string,
+  owner: LockOwner,
+  dependencies: WorkflowStateLockDependencies,
+): Promise<boolean> {
+  const pendingDir = `${lockDir}.pending.${owner.token}.${owner.generation}`;
+  await mkdir(pendingDir);
+  try {
+    await writeOwner(join(pendingDir, 'owner'), owner, dependencies);
+    await syncDirectory(pendingDir);
+    await dependencies.hook?.('before-lock-publish');
+    if (await stat(lockDir).catch(() => null)) return false;
+    try {
+      await rename(pendingDir, lockDir);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST' || code === 'ENOTEMPTY') return false;
+      throw error;
+    }
+    await syncDirectory(baseStateDir);
+    return true;
+  } finally {
+    await rm(pendingDir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 async function readRecoveryOwner(baseStateDir: string): Promise<LockOwner['recovery_owner']> {
@@ -209,6 +281,7 @@ async function recoverStaleLock(
   lockDir: string,
   ownerPath: string,
   contenderToken: string,
+  dependencies: WorkflowStateLockDependencies,
 ): Promise<LockOwner['recovery_owner']> {
   const observedStat = await stat(lockDir).catch(() => null);
   if (!observedStat) return undefined;
@@ -222,12 +295,12 @@ async function recoverStaleLock(
     && persistedRecoveryOwner.generation === observedOwner.generation
   );
   const recoveryRequired = observedOwner.recovery_required === true || markerRequiresRecovery;
-  const staleMs = getWorkflowStateLockFaults().staleMs ?? DEFAULT_LOCK_STALE_MS;
+  const staleMs = dependencies.staleMs ?? DEFAULT_LOCK_STALE_MS;
   const heartbeatAt = Date.parse(observedOwner.heartbeat_at);
   if (!recoveryRequired) {
     if (Date.now() - observedStat.mtimeMs <= staleMs) return undefined;
     if (Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt <= staleMs) return undefined;
-    if (processIsAlive(observedOwner.pid)) return undefined;
+    if (processIsAlive(observedOwner.pid, dependencies)) return undefined;
   }
 
   const confirmedStat = await stat(lockDir).catch(() => null);
@@ -240,7 +313,7 @@ async function recoverStaleLock(
     return undefined;
   }
 
-  await getWorkflowStateLockFaults().hook?.('before-stale-rename');
+  await dependencies.hook?.('before-stale-rename');
   const quarantineDir = `${lockDir}.stale.${contenderToken}`;
   try {
     await rename(lockDir, quarantineDir);
@@ -248,7 +321,7 @@ async function recoverStaleLock(
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
-  await getWorkflowStateLockFaults().hook?.('after-stale-rename');
+  await dependencies.hook?.('after-stale-rename');
 
   const movedStat = await stat(quarantineDir).catch(() => null);
   const movedOwnerResult = await readOwner(join(quarantineDir, 'owner'));
@@ -273,7 +346,7 @@ async function recoverStaleLock(
     || !sameOwner
     || (
       !recoveryRequired
-      && (movedOwnerIsFresh || Boolean(movedOwner && processIsAlive(movedOwner.pid)))
+      && (movedOwnerIsFresh || Boolean(movedOwner && processIsAlive(movedOwner.pid, dependencies)))
     )
   ) {
     await rename(quarantineDir, lockDir).catch(() => {});
@@ -292,8 +365,10 @@ async function recoverStaleLock(
 
 export async function withWorkflowStateLock<T>(
   baseStateDir: string,
+  trustedCwd: string,
   fn: (lease: WorkflowStateLockLease) => Promise<T>,
   lease?: WorkflowStateLockLease,
+  dependencies: WorkflowStateLockDependencies = {},
 ): Promise<T> {
   const normalizedBaseStateDir = resolve(baseStateDir);
   if (lease) {
@@ -307,11 +382,12 @@ export async function withWorkflowStateLock<T>(
   const ownerPath = join(lockDir, 'owner');
   const token = ownerToken();
   const generation = randomUUID();
-  const timeoutMs = getWorkflowStateLockFaults().timeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
-  const retryMs = getWorkflowStateLockFaults().retryMs ?? DEFAULT_LOCK_RETRY_MS;
-  const heartbeatMs = getWorkflowStateLockFaults().heartbeatMs ?? DEFAULT_LOCK_HEARTBEAT_MS;
+  const timeoutMs = dependencies.timeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
+  const retryMs = dependencies.retryMs ?? DEFAULT_LOCK_RETRY_MS;
+  const heartbeatMs = dependencies.heartbeatMs ?? DEFAULT_LOCK_HEARTBEAT_MS;
   const deadline = Date.now() + timeoutMs;
   await mkdir(normalizedBaseStateDir, { recursive: true });
+  await recoverOrphanedPendingLocks(normalizedBaseStateDir, lockDir, dependencies);
   let recoveryOwner = await recoverOrphanedTakeoverProvenance(
     normalizedBaseStateDir,
     lockDir,
@@ -320,37 +396,34 @@ export async function withWorkflowStateLock<T>(
 
   while (true) {
     try {
-      await mkdir(lockDir);
-      await writeOwner(ownerPath, {
+      const published = await publishOwnerLock(normalizedBaseStateDir, lockDir, {
         token,
         generation,
         pid: process.pid,
         heartbeat_at: new Date().toISOString(),
         ...(recoveryOwner ? { recovery_owner: recoveryOwner } : {}),
-      });
-      break;
+      }, dependencies);
+      if (published) break;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (code !== 'EEXIST') {
-        await rm(lockDir, { recursive: true, force: true }).catch(() => {});
-        throw error;
-      }
-      await getWorkflowStateLockFaults().hook?.('contended');
-      const recoveredOwner = await recoverStaleLock(
-        normalizedBaseStateDir,
-        lockDir,
-        ownerPath,
-        token,
-      );
-      if (recoveredOwner) {
-        recoveryOwner = recoveredOwner;
-        continue;
-      }
-      if (Date.now() >= deadline) {
-        throw new Error(`workflow_state_lock_timeout:${baseStateDir}`);
-      }
-      await new Promise((resolve) => setTimeout(resolve, retryMs));
+      if (code !== 'EEXIST' && code !== 'ENOTEMPTY') throw error;
     }
+    await dependencies.hook?.('contended');
+    const recoveredOwner = await recoverStaleLock(
+      normalizedBaseStateDir,
+      lockDir,
+      ownerPath,
+      token,
+      dependencies,
+    );
+    if (recoveredOwner) {
+      recoveryOwner = recoveredOwner;
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`workflow_state_lock_timeout:${baseStateDir}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, retryMs));
   }
 
   let heartbeatError: unknown;
@@ -364,7 +437,7 @@ export async function withWorkflowStateLock<T>(
       heartbeat_at: new Date().toISOString(),
       ...(recoveryRequired ? { recovery_required: true } : {}),
       ...(recoveryOwner ? { recovery_owner: recoveryOwner } : {}),
-    }).catch((error) => {
+    }, dependencies).catch((error) => {
       heartbeatError = error;
     }).finally(() => {
       heartbeatWrite = null;
@@ -413,14 +486,19 @@ export async function withWorkflowStateLock<T>(
         heartbeat_at: new Date().toISOString(),
         recovery_required: true,
         recovery_owner: recoveryOwner,
-      });
+      }, dependencies);
     },
   });
   activeLeases.add(acquiredLease);
   let operationError: unknown;
   try {
     const hadRecoveryOwner = recoveryOwner !== undefined;
-    await recoverWorkflowStateTransactionUnderLock(normalizedBaseStateDir, acquiredLease);
+    await recoverWorkflowStateTransactionUnderLock(
+      normalizedBaseStateDir,
+      trustedCwd,
+      acquiredLease,
+      dependencies.transaction,
+    );
     recoveryOwner = undefined;
     if (hadRecoveryOwner) {
       await writeOwner(ownerPath, {
@@ -428,7 +506,7 @@ export async function withWorkflowStateLock<T>(
         generation,
         pid: process.pid,
         heartbeat_at: new Date().toISOString(),
-      });
+      }, dependencies);
     }
     const result = await fn(acquiredLease);
     await acquiredLease.assertOwned();

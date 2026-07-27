@@ -1,13 +1,14 @@
 import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   detectKeywords,
   detectPrimaryKeyword,
   recordSkillActivation,
+  SkillActivationPersistenceError,
   DEEP_INTERVIEW_STATE_FILE,
   DEEP_INTERVIEW_BLOCKED_APPROVAL_INPUTS,
   DEEP_INTERVIEW_INPUT_LOCK_MESSAGE,
@@ -843,6 +844,47 @@ describe('keyword detector skill-active-state lifecycle', () => {
     }
   });
 
+  it('fails loud when supervised-child detail persistence fails', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-supervised-write-fail-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    const sessionId = 'sess-supervised-write-fail';
+    try {
+      await mkdir(stateDir, { recursive: true });
+      await recordSkillActivation({
+        stateDir,
+        sourceCwd: cwd,
+        text: 'please run $autopilot',
+        sessionId,
+        nowIso: '2026-07-26T00:00:00.000Z',
+      });
+      const autopilotPath = join(stateDir, 'sessions', sessionId, 'autopilot-state.json');
+      const before = await readFile(autopilotPath, 'utf-8');
+
+      await assert.rejects(
+        () => recordSkillActivation({
+          stateDir,
+          sourceCwd: cwd,
+          text: 'continue with $ralplan',
+          sessionId,
+          nowIso: '2026-07-26T00:01:00.000Z',
+        }, {
+          writeSkillActiveFile: (async (path: unknown, data: unknown, options?: unknown) => {
+            if (String(path) === autopilotPath) throw new Error('supervised_detail_write_failed');
+            await writeFile(String(path), data as string, options as BufferEncoding);
+          }) as typeof writeFile,
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof SkillActivationPersistenceError);
+          assert.match(error.message, /supervised_detail_write_failed/);
+          return true;
+        },
+      );
+      assert.equal(await readFile(autopilotPath, 'utf-8'), before);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('does not let a keyword jump ahead past a planning gate (forward skip)', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-skip-ahead-'));
     const stateDir = join(cwd, '.omx', 'state');
@@ -1302,22 +1344,22 @@ describe('keyword detector skill-active-state lifecycle', () => {
       await symlink(outside, join(cwd, '.omx', 'context'));
       await mkdir(stateDir, { recursive: true });
 
-      const warnings: unknown[][] = [];
-      mock.method(console, 'warn', (...args: unknown[]) => {
-        warnings.push(args);
-      });
-      await recordSkillActivation({
-        stateDir,
-        sourceCwd: cwd,
-        text: '$autopilot symlink escape',
-        sessionId: 'sess-autopilot-symlink-context',
-        threadId: 'thread-symlink-context',
-        turnId: 'turn-symlink-context',
-        nowIso: '2026-05-30T00:00:00.000Z',
-      });
-
-      assert.equal(warnings.length, 1);
-      assert.match(String(warnings[0][1]), /symbolic link/);
+      await assert.rejects(
+        () => recordSkillActivation({
+          stateDir,
+          sourceCwd: cwd,
+          text: '$autopilot symlink escape',
+          sessionId: 'sess-autopilot-symlink-context',
+          threadId: 'thread-symlink-context',
+          turnId: 'turn-symlink-context',
+          nowIso: '2026-05-30T00:00:00.000Z',
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof SkillActivationPersistenceError);
+          assert.match(error.message, /symbolic link/);
+          return true;
+        },
+      );
       assert.equal(existsSync(join(outside, 'symlink-escape-20260530T000000Z.md')), false);
       assert.equal(existsSync(join(stateDir, 'sessions', 'sess-autopilot-symlink-context', 'autopilot-state.json')), false);
     } finally {
@@ -3400,27 +3442,117 @@ deepMaxRounds = 21
     }
   });
 
-  it('emits a warning when skill-active-state persistence fails', async () => {
+  it('fails loud with a typed error when skill-active-state persistence fails', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-state-persist-fail-'));
-    const warnings: unknown[][] = [];
-    mock.method(console, 'warn', (...args: unknown[]) => {
-      warnings.push(args);
-    });
 
     try {
       const blockingFile = join(cwd, 'state-root-file');
       await writeFile(blockingFile, 'not a directory');
 
-      const result = await recordSkillActivation({
-        stateDir: join(blockingFile, 'nested', 'state-dir'),
-        text: 'please run $autopilot',
-        nowIso: '2026-02-25T00:00:00.000Z',
-      });
+      await assert.rejects(
+        () => recordSkillActivation({
+          stateDir: join(blockingFile, 'nested', 'state-dir'),
+          text: 'please run $autopilot',
+          nowIso: '2026-02-25T00:00:00.000Z',
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof SkillActivationPersistenceError);
+          assert.equal(error.code, 'skill_activation_persistence_failed');
+          return true;
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 
-      assert.ok(result);
-      assert.equal(result.skill, 'autopilot');
-      assert.equal(warnings.length, 1);
-      assert.match(String(warnings[0][0]), /failed to persist keyword activation state/);
+  it('rolls back exact mode and canonical bytes when activation persistence fails', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-state-rollback-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    const modePath = join(stateDir, 'autopilot-state.json');
+    const canonicalPath = join(stateDir, SKILL_ACTIVE_STATE_FILE);
+    const modeBefore = '{"active":false,"mode":"autopilot","current_phase":"cancelled","stable":"before"}';
+    const canonicalBefore = '{"version":1,"active":false,"skill":"","active_skills":[],"stable":"before"}';
+    try {
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(modePath, modeBefore);
+      await writeFile(canonicalPath, canonicalBefore);
+      await assert.rejects(
+        () => recordSkillActivation({
+          stateDir,
+          sourceCwd: cwd,
+          text: '$autopilot execute',
+          nowIso: '2026-07-26T00:00:00.000Z',
+        }, {
+          writeSkillActiveFile: (async (path: unknown, data: unknown, options?: unknown) => {
+            if (String(path) === canonicalPath) throw new Error('skill_active_write_failed');
+            await writeFile(String(path), data as string, options as BufferEncoding);
+          }) as typeof writeFile,
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof SkillActivationPersistenceError);
+          assert.match(error.message, /skill_active_write_failed/);
+          return true;
+        },
+      );
+
+      assert.equal(await readFile(modePath, 'utf-8'), modeBefore);
+      assert.equal(await readFile(canonicalPath, 'utf-8'), canonicalBefore);
+      assert.deepEqual(
+        await readdir(join(cwd, '.omx', 'context')).catch(() => []),
+        [],
+      );
+      assert.equal(existsSync(join(stateDir, '.workflow-state-transaction.json')), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes concurrent skill activation persistence', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-state-lock-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    const canonicalPath = join(stateDir, SKILL_ACTIVE_STATE_FILE);
+    let releaseFirst!: () => void;
+    let blocked = false;
+    const writeSkillActiveFile = (async (path: unknown, data: unknown, options?: unknown) => {
+      if (String(path) === canonicalPath && !blocked) {
+        blocked = true;
+        resolveBlocked();
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+      }
+      await writeFile(String(path), data as string, options as BufferEncoding);
+    }) as typeof writeFile;
+    let resolveBlocked!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      resolveBlocked = resolve;
+    });
+    try {
+      const first = recordSkillActivation({
+        stateDir,
+        sourceCwd: cwd,
+        text: '$team first',
+        nowIso: '2026-07-26T00:00:00.000Z',
+      }, { writeSkillActiveFile });
+      await firstBlocked;
+      let secondSettled = false;
+      const second = recordSkillActivation({
+        stateDir,
+        sourceCwd: cwd,
+        text: '$ralph second',
+        nowIso: '2026-07-26T00:00:01.000Z',
+      }, {
+        writeSkillActiveFile,
+      }).finally(() => {
+        secondSettled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(secondSettled, false);
+      releaseFirst();
+      await first;
+      const finalState = await second;
+      assert.equal(finalState?.skill, 'ralph');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

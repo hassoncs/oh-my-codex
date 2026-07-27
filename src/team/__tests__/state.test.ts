@@ -57,9 +57,6 @@ import { normalizeDispatchRequest } from '../state/dispatch.js';
 import { readModeState, startMode, updateModeState } from '../../modes/base.js';
 import { listActiveSkills, readVisibleSkillActiveState } from '../../state/skill-active.js';
 import { withWorkflowStateLock } from '../../state/workflow-state-lock.js';
-import {
-  configureWorkflowStateLockFaults,
-} from '../../testing/state-fault-injection.js';
 
 const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
 const CHILD_NODE_ARGS = import.meta.url.endsWith('.ts') ? ['--import', import.meta.resolve('tsx')] : [];
@@ -69,7 +66,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  configureWorkflowStateLockFaults();
   resetWriteAtomicRenameForTests();
   if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
   else delete process.env.OMX_TEAM_STATE_ROOT;
@@ -1928,25 +1924,25 @@ exit 1
       ] as const)));
       const markerPath = join(cwd, 'retry-mutated');
       const stateUrl = new URL('../state.js', import.meta.url).href;
-      const faultInjectionUrl = new URL('../../testing/state-fault-injection.js', import.meta.url).href;
       const script = `
         const { readFile, writeFile } = await import('node:fs/promises');
         const { retryFailedTask } = await import(${JSON.stringify(stateUrl)});
-        const { configureWorkflowStateTransactionFaults } = await import(${JSON.stringify(faultInjectionUrl)});
-        configureWorkflowStateTransactionFaults({
-          hook: async (stage, path) => {
-            if (stage !== 'before-file-sync' || path !== ${JSON.stringify(taskPath)}) return;
-            const task = JSON.parse(await readFile(path, 'utf-8'));
-            if (task.status !== 'pending') return;
-            await writeFile(${JSON.stringify(markerPath)}, 'ready');
-            process.kill(process.pid, 'SIGKILL');
-          },
-        });
         await retryFailedTask(
           ${JSON.stringify(teamName)},
           ${JSON.stringify(task.id)},
           ${failed.task.version},
           ${JSON.stringify(cwd)},
+          {
+            transaction: {
+              hook: async (stage, path) => {
+                if (stage !== 'before-file-sync' || path !== ${JSON.stringify(taskPath)}) return;
+                const task = JSON.parse(await readFile(path, 'utf-8'));
+                if (task.status !== 'pending') return;
+                await writeFile(${JSON.stringify(markerPath)}, 'ready');
+                process.kill(process.pid, 'SIGKILL');
+              },
+            },
+          },
         );
       `;
       const child = spawn(
@@ -1963,13 +1959,12 @@ exit 1
 
       const lockDir = join(stateDir, '.workflow-state.lock');
       await utimes(lockDir, new Date(0), new Date(0));
-      configureWorkflowStateLockFaults({
+      await withWorkflowStateLock(stateDir, cwd, async () => {}, undefined, {
         staleMs: 0,
         timeoutMs: 1_000,
         retryMs: 1,
         processIsAlive: () => false,
       });
-      await withWorkflowStateLock(stateDir, async () => {});
 
       for (const [path, content] of before) {
         assert.equal(await readFile(path, 'utf-8'), content);

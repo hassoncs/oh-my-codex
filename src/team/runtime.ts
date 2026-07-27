@@ -237,7 +237,7 @@ async function syncRootTeamModeStateOnTerminalPhase(
 
   const normalizedSessionId = leaderSessionId?.trim() || undefined;
   const baseStateDir = getBaseStateDir(cwd);
-  await withWorkflowStateLock(baseStateDir, (lockLease) =>
+  await withWorkflowStateLock(baseStateDir, cwd, (lockLease) =>
     withWorkflowStateTransaction(baseStateDir, cwd, normalizedSessionId, async () => {
       const completedAt = new Date().toISOString();
       let matched = false;
@@ -328,7 +328,7 @@ async function syncTeamModeStateOnShutdown(
 ): Promise<void> {
   const normalizedLeaderSessionId = typeof leaderSessionId === 'string' ? leaderSessionId.trim() : '';
   const baseStateDir = getBaseStateDir(cwd);
-  await withWorkflowStateLock(baseStateDir, (lockLease) =>
+  await withWorkflowStateLock(baseStateDir, cwd, (lockLease) =>
     withWorkflowStateTransaction(baseStateDir, cwd, normalizedLeaderSessionId || undefined, async () => {
       const rootPath = getStatePath('team', cwd);
       const sessionPath = normalizedLeaderSessionId
@@ -3248,7 +3248,7 @@ export async function startTeam(
     if (options.commitModeState) {
       const scope = await resolveStateScope(leaderCwd);
       const baseStateDir = getBaseStateDir(leaderCwd);
-      await withWorkflowStateLock(baseStateDir, (lockLease) =>
+      await withWorkflowStateLock(baseStateDir, leaderCwd, (lockLease) =>
         withWorkflowStateTransaction(
           baseStateDir,
           leaderCwd,

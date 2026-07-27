@@ -75,10 +75,12 @@ import { getBaseStateDir, resolveStateScope } from '../mcp/state-paths.js';
 import { preflightWorkflowTransition } from '../state/workflow-transition-reconcile.js';
 import {
   withWorkflowStateLock,
+  type WorkflowStateLockDependencies,
   type WorkflowStateLockLease,
 } from '../state/workflow-state-lock.js';
 import {
   withWorkflowStateTransaction,
+  type WorkflowStateTransactionDependencies,
   type WorkflowStateMutationAuthority,
 } from '../state/workflow-state-transaction.js';
 
@@ -1716,6 +1718,7 @@ async function withRetryWorkflowTransaction<T>(
   intentPaths: string[],
   fn: (authority: WorkflowStateMutationAuthority) => Promise<T>,
   additionalPaths: string[] = [],
+  dependencies: WorkflowStateTransactionDependencies = {},
 ): Promise<T> {
   const scope = await resolveStateScope(cwd);
   const parsedIntents = await Promise.all(intentPaths.map(async (path) => ({
@@ -1737,7 +1740,7 @@ async function withRetryWorkflowTransaction<T>(
     scope.sessionId,
     (transactionLease) => fn({ lockLease, transactionLease }),
     extraPaths,
-    { lockLease },
+    { lockLease, dependencies },
   );
 }
 
@@ -1746,7 +1749,7 @@ async function reconcileFailedTaskRetryIntentsUnderTeamLock(
   cwd: string,
 ): Promise<void> {
   const baseStateDir = getBaseStateDir(cwd);
-  await withWorkflowStateLock(baseStateDir, async (lockLease) => {
+  await withWorkflowStateLock(baseStateDir, cwd, async (lockLease) => {
     const intentPaths = await listRetryIntentPaths(teamName, cwd);
     if (intentPaths.length === 0) return;
     await withRetryWorkflowTransaction(
@@ -1776,11 +1779,15 @@ export async function retryFailedTask(
   teamName: string,
   taskId: string,
   expectedVersion: number,
-  cwd: string
+  cwd: string,
+  dependencies: {
+    workflowLock?: WorkflowStateLockDependencies;
+    transaction?: WorkflowStateTransactionDependencies;
+  } = {},
 ): Promise<RetryFailedTaskResult> {
   return withReconciledTaskMutation(teamName, cwd, async () => {
     const baseStateDir = getBaseStateDir(cwd);
-    return withWorkflowStateLock(baseStateDir, async (lockLease) => {
+    return withWorkflowStateLock(baseStateDir, cwd, async (lockLease) => {
       const intentPath = retryIntentPath(teamName, taskId, cwd);
       return withRetryWorkflowTransaction(teamName, cwd, lockLease, [], async (authority) => {
         let retryIntent!: Awaited<ReturnType<typeof writeRetryIntent>>;
@@ -1796,7 +1803,6 @@ export async function retryFailedTask(
           writeAtomic,
           beforeRetry: async (previous, next) => {
             retryIntent = await writeRetryIntent(teamName, previous, next, cwd);
-            return async () => rm(retryIntent.path, { force: true });
           },
           afterRetry: async () => {
             await reactivateTeamWorkflowForRetry(teamName, taskId, cwd, authority);
@@ -1807,7 +1813,10 @@ export async function retryFailedTask(
       }, [
         intentPath,
         taskFilePath(teamName, taskId, cwd),
-      ]);
+      ], dependencies.transaction);
+    }, undefined, {
+      ...dependencies.workflowLock,
+      transaction: dependencies.transaction,
     });
   });
 }

@@ -284,7 +284,7 @@ interface RetryFailedTaskDeps extends ReleaseDeps {
   beforeRetry?: (
     previous: TeamTaskV2,
     next: TeamTaskV2,
-  ) => Promise<(() => Promise<void>) | void>;
+  ) => Promise<void>;
   afterRetry?: (
     previous: TeamTaskV2,
     next: TeamTaskV2,
@@ -366,22 +366,8 @@ export async function retryFailedTask(
     delete updated.completed_at;
     delete updated.delegation_compliance;
     delete updated.coordination_compliance;
-    const rollback = await deps.beforeRetry?.(v, updated);
-    try {
-      await deps.writeAtomic(deps.taskFilePath(deps.teamName, taskId, deps.cwd), JSON.stringify(updated, null, 2));
-    } catch (error) {
-      if (rollback) {
-        try {
-          await rollback();
-        } catch (rollbackError) {
-          throw new AggregateError(
-            [error, rollbackError],
-            'retry_failed_task_write_and_workflow_rollback_failed',
-          );
-        }
-      }
-      throw error;
-    }
+    await deps.beforeRetry?.(v, updated);
+    await deps.writeAtomic(deps.taskFilePath(deps.teamName, taskId, deps.cwd), JSON.stringify(updated, null, 2));
     await deps.afterRetry?.(v, updated);
     return { ok: true as const, task: updated };
   });

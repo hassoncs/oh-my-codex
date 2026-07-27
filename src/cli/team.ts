@@ -1313,7 +1313,7 @@ async function ensureTeamModeState(
     await mutate(authority);
     return;
   }
-  await withWorkflowStateLock(baseStateDir, (lockLease) =>
+  await withWorkflowStateLock(baseStateDir, cwd, (lockLease) =>
     withWorkflowStateTransaction(
       baseStateDir,
       cwd,
@@ -1375,7 +1375,7 @@ async function persistTeamShutdownModeState(
   };
 
   const baseStateDir = getBaseStateDir(cwd);
-  await withWorkflowStateLock(baseStateDir, (lockLease) =>
+  await withWorkflowStateLock(baseStateDir, cwd, (lockLease) =>
     withWorkflowStateTransaction(baseStateDir, cwd, scopedSessionId, async (transactionLease) => {
       const authority = { lockLease, transactionLease };
       const rootStatePath = getStatePath('team', cwd);

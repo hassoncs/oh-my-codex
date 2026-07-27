@@ -5018,7 +5018,7 @@ export async function cleanupPostLaunchModeStateFiles(
   dependencies: PostLaunchModeCleanupDependencies = {},
 ): Promise<void> {
   const baseStateDir = getBaseStateDir(cwd);
-  await withWorkflowStateLock(baseStateDir, (lockLease) =>
+  await withWorkflowStateLock(baseStateDir, cwd, (lockLease) =>
     withWorkflowStateTransaction(
       baseStateDir,
       cwd,

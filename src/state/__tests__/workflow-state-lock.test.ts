@@ -4,19 +4,69 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { withWorkflowStateLock } from '../workflow-state-lock.js';
-import { withWorkflowStateTransaction } from '../workflow-state-transaction.js';
 import {
-  configureWorkflowStateLockFaults,
-  configureWorkflowStateTransactionFaults,
-} from '../../testing/state-fault-injection.js';
+  withWorkflowStateLock as withProductionWorkflowStateLock,
+  type WorkflowStateLockDependencies,
+  type WorkflowStateLockLease,
+} from '../workflow-state-lock.js';
+import {
+  withWorkflowStateTransaction as withProductionWorkflowStateTransaction,
+  type WorkflowStateTransactionDependencies,
+  type WorkflowStateTransactionLease,
+} from '../workflow-state-transaction.js';
 
 const CHILD_NODE_ARGS = import.meta.url.endsWith('.ts') ? ['--import', import.meta.resolve('tsx')] : [];
 const PRIOR_LOCK_TOKEN = 'prior-lock';
 const PRIOR_LOCK_GENERATION = '00000000-0000-4000-8000-000000000001';
+let lockDependencies: WorkflowStateLockDependencies = {};
+let transactionDependencies: WorkflowStateTransactionDependencies = {};
+
+function configureWorkflowStateLockFaults(
+  dependencies: WorkflowStateLockDependencies = {},
+): void {
+  lockDependencies = dependencies;
+}
+
+function configureWorkflowStateTransactionFaults(
+  dependencies: WorkflowStateTransactionDependencies = {},
+): void {
+  transactionDependencies = dependencies;
+}
+
+function withWorkflowStateLock<T>(
+  baseStateDir: string,
+  fn: (lease: WorkflowStateLockLease) => Promise<T>,
+  lease?: WorkflowStateLockLease,
+): Promise<T> {
+  return withProductionWorkflowStateLock(baseStateDir, dirname(dirname(baseStateDir)), fn, lease, {
+    ...lockDependencies,
+    transaction: transactionDependencies,
+  });
+}
+
+function withWorkflowStateTransaction<T>(
+  baseStateDir: string,
+  cwd: string,
+  sessionId: string | undefined,
+  fn: (lease: WorkflowStateTransactionLease) => Promise<T>,
+  extraPaths: string[] = [],
+  options: {
+    lockLease?: WorkflowStateLockLease;
+    transactionLease?: WorkflowStateTransactionLease;
+  } = {},
+): Promise<T> {
+  return withProductionWorkflowStateTransaction(
+    baseStateDir,
+    cwd,
+    sessionId,
+    fn,
+    extraPaths,
+    { ...options, dependencies: transactionDependencies },
+  );
+}
 
 afterEach(() => {
   configureWorkflowStateLockFaults();
@@ -50,6 +100,15 @@ function persistedTransaction(
     lock_token: owner.token,
     lock_generation: owner.generation,
     files: entries,
+  };
+}
+
+function persistedTransactionV4(
+  entries: Record<string, unknown>[],
+): Record<string, unknown> {
+  return {
+    ...persistedTransaction(entries),
+    version: 4,
   };
 }
 
@@ -87,7 +146,7 @@ describe('workflow state lock', () => {
           const { writeFile } = await import('node:fs/promises');
           const { withWorkflowStateLock } = await import(${JSON.stringify(lockUrl)});
           const { withWorkflowStateTransaction } = await import(${JSON.stringify(transactionUrl)});
-          await withWorkflowStateLock(${JSON.stringify(baseStateDir)}, (lockLease) =>
+          await withWorkflowStateLock(${JSON.stringify(baseStateDir)}, ${JSON.stringify(cwd)}, (lockLease) =>
             withWorkflowStateTransaction(
               ${JSON.stringify(baseStateDir)},
               ${JSON.stringify(cwd)},
@@ -130,6 +189,153 @@ describe('workflow state lock', () => {
       }
     });
   }
+
+  it('recovers keyword-owned context from a different workflow lock entrypoint', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-workflow-context-recovery-'));
+    try {
+      const baseStateDir = join(cwd, '.omx', 'state');
+      const contextPath = join(cwd, '.omx', 'context', 'handoff-20260727T000000Z.md');
+      const markerPath = join(cwd, 'crashed');
+      await mkdir(dirname(contextPath), { recursive: true });
+      await writeFile(contextPath, 'before');
+
+      const lockUrl = new URL('../workflow-state-lock.js', import.meta.url).href;
+      const transactionUrl = new URL('../workflow-state-transaction.js', import.meta.url).href;
+      const script = `
+        const { writeFile } = await import('node:fs/promises');
+        const { withWorkflowStateLock } = await import(${JSON.stringify(lockUrl)});
+        const { withWorkflowStateTransaction } = await import(${JSON.stringify(transactionUrl)});
+        await withWorkflowStateLock(
+          ${JSON.stringify(baseStateDir)},
+          ${JSON.stringify(cwd)},
+          (lockLease) => withWorkflowStateTransaction(
+            ${JSON.stringify(baseStateDir)},
+            ${JSON.stringify(cwd)},
+            undefined,
+            async (transactionLease) => {
+              await transactionLease.capturePath(${JSON.stringify(contextPath)});
+              await writeFile(${JSON.stringify(contextPath)}, 'mutated');
+              await writeFile(${JSON.stringify(markerPath)}, 'ready');
+              process.kill(process.pid, 'SIGKILL');
+            },
+            [],
+            { lockLease },
+          ),
+        );
+      `;
+      const child = spawn(process.execPath, [...CHILD_NODE_ARGS, '--input-type=module', '--eval', script], {
+        stdio: 'ignore',
+      });
+      await new Promise<void>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', () => resolve());
+      });
+      assert.equal(existsSync(markerPath), true);
+      assert.equal(await readFile(contextPath, 'utf-8'), 'mutated');
+
+      configureWorkflowStateLockFaults({
+        staleMs: 0,
+        timeoutMs: 1_000,
+        retryMs: 1,
+        processIsAlive: () => false,
+      });
+      await withWorkflowStateLock(baseStateDir, async () => {});
+
+      assert.equal(await readFile(contextPath, 'utf-8'), 'before');
+      assert.equal(existsSync(join(baseStateDir, '.workflow-state-transaction.json')), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers a process killed before atomic lock publication', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-workflow-lock-publish-'));
+    try {
+      const baseStateDir = join(cwd, '.omx', 'state');
+      const lockDir = join(baseStateDir, '.workflow-state.lock');
+      const markerPath = join(cwd, 'before-publish');
+      const lockUrl = new URL('../workflow-state-lock.js', import.meta.url).href;
+      const script = `
+        const { writeFile } = await import('node:fs/promises');
+        const { withWorkflowStateLock } = await import(${JSON.stringify(lockUrl)});
+        await withWorkflowStateLock(
+          ${JSON.stringify(baseStateDir)},
+          ${JSON.stringify(cwd)},
+          async () => {},
+          undefined,
+          {
+            hook: async (stage) => {
+              if (stage !== 'before-lock-publish') return;
+              await writeFile(${JSON.stringify(markerPath)}, 'ready');
+              await new Promise(() => {});
+            },
+          },
+        );
+      `;
+      const child = spawn(process.execPath, [...CHILD_NODE_ARGS, '--input-type=module', '--eval', script], {
+        stdio: 'ignore',
+      });
+      const childClosed = new Promise<void>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', () => resolve());
+      });
+      for (let attempt = 0; attempt < 200 && !existsSync(markerPath); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(existsSync(markerPath), true);
+      assert.equal(existsSync(lockDir), false);
+      assert.equal(
+        (await readdir(baseStateDir)).some((entry) => entry.startsWith('.workflow-state.lock.pending.')),
+        true,
+      );
+
+      child.kill('SIGKILL');
+      await childClosed;
+
+      await withWorkflowStateLock(baseStateDir, async () => {});
+      assert.equal(existsSync(lockDir), false);
+      assert.equal(
+        (await readdir(baseStateDir)).some((entry) => entry.startsWith('.workflow-state.lock.pending.')),
+        false,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not roll back concurrently written non-workflow state', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-workflow-unowned-state-'));
+    try {
+      const baseStateDir = join(cwd, '.omx', 'state');
+      const hudPath = join(baseStateDir, 'hud-state.json');
+      const notifyPath = join(baseStateDir, 'notify-fallback-state.json');
+      await mkdir(baseStateDir, { recursive: true });
+      await writeFile(hudPath, '{"value":"before"}');
+      await writeFile(notifyPath, '{"value":"before"}');
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, (lockLease) =>
+          withWorkflowStateTransaction(
+            baseStateDir,
+            cwd,
+            undefined,
+            async () => {
+              await writeFile(hudPath, '{"value":"concurrent"}');
+              await writeFile(notifyPath, '{"value":"concurrent"}');
+              throw new Error('workflow mutation failed');
+            },
+            [],
+            { lockLease },
+          )),
+        /workflow mutation failed/,
+      );
+
+      assert.equal(await readFile(hudPath, 'utf-8'), '{"value":"concurrent"}');
+      assert.equal(await readFile(notifyPath, 'utf-8'), '{"value":"concurrent"}');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 
   it('rolls back callback failures before deleting the journal', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-workflow-transaction-callback-'));
@@ -222,6 +428,42 @@ describe('workflow state lock', () => {
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
+    }
+  });
+
+  it('rejects forged context recovery paths outside the trusted project', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-workflow-context-scope-'));
+    try {
+      const cwd = join(root, 'project-a');
+      const sibling = join(root, 'project-b');
+      const baseStateDir = join(cwd, '.omx', 'state');
+      const siblingContextDir = join(sibling, '.omx', 'context');
+      const targetPath = join(siblingContextDir, 'target-20260727T000000Z.md');
+      const journalPath = join(baseStateDir, '.workflow-state-transaction.json');
+      await mkdir(baseStateDir, { recursive: true });
+      await mkdir(siblingContextDir, { recursive: true });
+      await writeFile(targetPath, 'sibling-owned');
+      await writeFile(
+        journalPath,
+        JSON.stringify(persistedTransactionV4([{
+          ...persistedEntry(targetPath, null),
+          scope: 'context',
+        }])),
+      );
+      await writeFile(
+        join(baseStateDir, '.workflow-state-recovery-owner.json'),
+        JSON.stringify(persistedRecoveryOwner()),
+      );
+
+      await assert.rejects(
+        () => withWorkflowStateLock(baseStateDir, async () => {}),
+        /workflow_state_transaction_invalid:absolute_path/,
+      );
+
+      assert.equal(await readFile(targetPath, 'utf-8'), 'sibling-owned');
+      assert.equal(existsSync(journalPath), true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 

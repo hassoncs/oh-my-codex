@@ -46,7 +46,7 @@ describe('error-handling warning guards', () => {
     assert.match(replyListenerSource, /detached: true,\s+stdio: 'ignore',\s+windowsHide: true,/);
   });
 
-  it('replaces silent log-write catches with warning logs', async () => {
+  it('replaces silent persistence catches with warnings or typed failures', async () => {
     const loggingSource = await readSource('src/hooks/extensibility/logging.ts');
     const dispatchSource = await readSource('src/hooks/extensibility/dispatcher.ts');
     const keywordSource = await readSource('src/hooks/keyword-detector.ts');
@@ -57,6 +57,7 @@ describe('error-handling warning guards', () => {
 
     assert.match(loggingSource, /failed to append hook plugin log entry/);
     assert.match(dispatchSource, /failed to append hook dispatch log entry/);
-    assert.match(keywordSource, /failed to persist keyword activation state/);
+    assert.match(keywordSource, /class SkillActivationPersistenceError extends Error/);
+    assert.match(keywordSource, /throw new SkillActivationPersistenceError/);
   });
 });

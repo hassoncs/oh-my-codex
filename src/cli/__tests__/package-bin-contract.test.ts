@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { arch, platform, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -97,6 +97,7 @@ describe('package bin contract', () => {
     }
 
     assert.equal(pkg.files?.includes('dist/'), true, 'expected package files allowlist to include dist/');
+    assert.equal(pkg.files?.includes('!dist/testing/'), true, 'expected package files allowlist to exclude test fault injection');
     assert.equal(pkg.files?.includes('src/scripts/'), true, 'expected package files allowlist to include runtime build/test helpers');
     assert.equal(pkg.files?.includes('bin/'), false, 'did not expect broad bin/ allowlist in package files');
     assert.equal(pkg.files?.includes('agents/'), false, 'native agent TOMLs are setup output, not package input');
@@ -149,6 +150,23 @@ describe('package bin contract', () => {
 
     const binSource = readFileSync(binPath, 'utf-8');
     const compiledCliSource = readFileSync(compiledCliPath, 'utf-8');
+    const productionDistFiles = readdirSync(join(process.cwd(), 'dist'), {
+      recursive: true,
+      withFileTypes: true,
+    }).filter((entry) =>
+      entry.isFile()
+      && entry.name.endsWith('.js')
+      && !entry.parentPath.includes(`${join('dist', 'testing')}`)
+      && !entry.parentPath.includes('__tests__')
+    );
+    for (const file of productionDistFiles) {
+      const path = join(file.parentPath, file.name);
+      assert.doesNotMatch(
+        readFileSync(path, 'utf-8'),
+        /testing\/state-fault-injection/,
+        `production module imports test fault injection: ${path}`,
+      );
+    }
     assert.match(binSource, /^#!\/usr\/bin\/env node/);
     const mcpInitialize = JSON.stringify({
       jsonrpc: '2.0',
@@ -285,6 +303,11 @@ describe('package bin contract', () => {
     assert.ok(traceServerEntry, 'expected npm pack output to include dist/mcp/trace-server.js for omx mcp-serve');
     assert.ok(wikiServerEntry, 'expected npm pack output to include dist/mcp/wiki-server.js for omx mcp-serve');
     const packedFilePaths = new Set((results[0]?.files ?? []).map((file) => file.path));
+    assert.equal(
+      [...packedFilePaths].some((path) => path.startsWith('dist/testing/')),
+      false,
+      'did not expect test fault injection in npm pack output',
+    );
     const manifest = readCatalogManifest(process.cwd());
     const installableSkillNames = [...getSetupInstallableSkillNames(manifest)].sort();
     for (const skillName of installableSkillNames) {

@@ -320,6 +320,7 @@ export async function preflightWorkflowTransition(
   if (!options.workflowLockLease) {
     return withWorkflowStateLock(
       baseStateDir ? resolve(baseStateDir) : getBaseStateDir(cwd),
+      cwd,
       (workflowLockLease) => preflightWorkflowTransition(cwd, requestedMode, {
         ...options,
         workflowLockLease,
@@ -384,6 +385,7 @@ export async function reconcileWorkflowTransition(
   if (!options.workflowLockLease) {
     return withWorkflowStateLock(
       baseStateDir ? resolve(baseStateDir) : getBaseStateDir(cwd),
+      cwd,
       (workflowLockLease) => reconcileWorkflowTransition(cwd, requestedMode, {
         ...options,
         workflowLockLease,
