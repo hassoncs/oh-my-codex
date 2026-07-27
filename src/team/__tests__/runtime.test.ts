@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'child_process';
-import { mkdtemp, rm, writeFile, readFile, mkdir, chmod, readdir, rename } from 'fs/promises';
-import { join, relative } from 'path';
+import { mkdtemp, rm, writeFile, readFile, mkdir, chmod, readdir, rename, utimes } from 'fs/promises';
+import { dirname, join, relative } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
 import { DEFAULT_TEAM_CHILD_MODEL } from '../../config/models.js';
@@ -49,6 +49,8 @@ import {
   waitForWorkerStartupEvidence,
   waitForClaudeStartupEvidence,
   cleanupTeamWorkerLaunchOrphanedMcpProcesses,
+  recoverTeamWorktreeProvisioning,
+  teamWorktreeProvisioningPath,
   settleStartupAttemptResults,
   setPromptWorkerTeardownForTests,
   TEAM_LOW_COMPLEXITY_DEFAULT_MODEL,
@@ -369,6 +371,126 @@ async function waitForFileText(
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error(`timed out waiting for ${filePath}`);
+}
+
+async function crashAfterFirstTeamWorktreeAdd(
+  repo: string,
+  requestedTeamName: string,
+  dirty: boolean,
+): Promise<{ internalTeamName: string; childPid: number; toolingDir: string }> {
+  const toolingDir = await mkdtemp(join(tmpdir(), 'omx-runtime-provision-crash-'));
+  const gitPath = join(toolingDir, 'git');
+  const crashMarker = join(toolingDir, 'crashed');
+  const realGit = execFileSync('bash', ['-lc', 'command -v git'], { encoding: 'utf-8' }).trim();
+  await writeFile(gitPath, [
+    '#!/bin/sh',
+    'if [ "${1:-}" = "worktree" ] && [ "${2:-}" = "add" ]; then',
+    '  "${OMX_REAL_GIT}" "$@"',
+    '  status=$?',
+    '  if [ $status -eq 0 ] && [ ! -e "${OMX_CRASH_MARKER}" ]; then',
+    '    : > "${OMX_CRASH_MARKER}"',
+    '    if [ "${OMX_CRASH_DIRTY:-0}" = "1" ]; then',
+    '      previous=""',
+    '      worktree_path=""',
+    '      for arg in "$@"; do worktree_path="$previous"; previous="$arg"; done',
+    '      printf \'survive recovery\\n\' > "$worktree_path/recovery-dirty.txt"',
+    '    fi',
+    '    kill -KILL "$PPID"',
+    '  fi',
+    '  exit $status',
+    'fi',
+    'exec "${OMX_REAL_GIT}" "$@"',
+    '',
+  ].join('\n'));
+  await chmod(gitPath, 0o755);
+
+  const sessionId = 'provision-crash-' + (dirty ? 'dirty' : 'clean');
+  const env = {
+    ...process.env,
+    PATH: toolingDir + ':' + (process.env.PATH ?? ''),
+    TMUX: undefined,
+    OMX_SESSION_ID: sessionId,
+    OMX_TEAM_WORKER: undefined,
+    OMX_TEAM_WORKER_LAUNCH_MODE: 'prompt',
+    OMX_TEAM_WORKER_CLI: 'codex',
+    OMX_TEST_ALLOW_NONTTY_CODEX_PROMPT: '1',
+    OMX_REAL_GIT: realGit,
+    OMX_CRASH_MARKER: crashMarker,
+    OMX_CRASH_DIRTY: dirty ? '1' : '0',
+  } satisfies NodeJS.ProcessEnv;
+  const internalTeamName = buildInternalTeamName(
+    sanitizeTeamName(requestedTeamName),
+    resolveTeamIdentityScope(env),
+  );
+  const runtimeUrl = new URL('../runtime.js', import.meta.url).href;
+  const script = [
+    'const { startTeam } = await import(' + JSON.stringify(runtimeUrl) + ');',
+    'await startTeam(' + JSON.stringify(requestedTeamName) + ', "crash after first durable worktree add", "executor", 2, [], ' + JSON.stringify(repo) + ', { worktreeMode: { enabled: true, detached: true, name: null } });',
+  ].join('\n');
+  const child = spawn(process.execPath, [...CHILD_NODE_ARGS, '--input-type=module', '--eval', script], {
+    cwd: repo,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const childPid = child.pid;
+  assert.ok(childPid, 'crash child pid should exist');
+  const closed = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (code, signal) => resolve({ code, signal }));
+  });
+  assert.equal(closed.code, null);
+  assert.equal(closed.signal, 'SIGKILL');
+  assert.equal(existsSync(crashMarker), true);
+  return { internalTeamName, childPid: childPid!, toolingDir };
+}
+
+async function crashAfterProvisioningRecoveryUnlock(
+  repo: string,
+  internalTeamName: string,
+): Promise<string> {
+  const toolingDir = await mkdtemp(join(tmpdir(), 'omx-runtime-recovery-crash-'));
+  const gitPath = join(toolingDir, 'git');
+  const crashMarker = join(toolingDir, 'crashed');
+  const realGit = execFileSync('bash', ['-lc', 'command -v git'], { encoding: 'utf-8' }).trim();
+  await writeFile(gitPath, [
+    '#!/bin/sh',
+    'if [ "${1:-}" = "worktree" ] && [ "${2:-}" = "unlock" ]; then',
+    '  "${OMX_REAL_GIT}" "$@"',
+    '  status=$?',
+    '  if [ $status -eq 0 ] && [ ! -e "${OMX_CRASH_MARKER}" ]; then',
+    '    : > "${OMX_CRASH_MARKER}"',
+    '    kill -KILL "$PPID"',
+    '  fi',
+    '  exit $status',
+    'fi',
+    'exec "${OMX_REAL_GIT}" "$@"',
+    '',
+  ].join('\n'));
+  await chmod(gitPath, 0o755);
+
+  const runtimeUrl = new URL('../runtime.js', import.meta.url).href;
+  const script = [
+    'const { recoverTeamWorktreeProvisioning } = await import(' + JSON.stringify(runtimeUrl) + ');',
+    'await recoverTeamWorktreeProvisioning(' + JSON.stringify(internalTeamName) + ', ' + JSON.stringify(repo) + ');',
+  ].join('\n');
+  const child = spawn(process.execPath, [...CHILD_NODE_ARGS, '--input-type=module', '--eval', script], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      PATH: toolingDir + ':' + (process.env.PATH ?? ''),
+      OMX_REAL_GIT: realGit,
+      OMX_CRASH_MARKER: crashMarker,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const closed = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (code, signal) => resolve({ code, signal }));
+  });
+  assert.equal(closed.code, null);
+  assert.equal(closed.signal, 'SIGKILL');
+  assert.equal(existsSync(crashMarker), true);
+  return toolingDir;
 }
 
 async function runContendedWorkflowWrite(
@@ -1744,12 +1866,11 @@ process.on('SIGTERM', () => process.exit(0));`,
     }
   });
 
-  it('startTeam serializes concurrent admission so only one team can start', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-concurrent-team-start-'));
-    const binDir = join(cwd, 'bin');
+  it('startTeam holds worktree provisioning ownership through concurrent admission', async () => {
+    const cwd = await initRepo();
+    const binDir = await mkdtemp(join(tmpdir(), 'omx-runtime-concurrent-team-bin-'));
     const fakeCodexPath = join(binDir, 'codex');
-    const spawnCapturePath = join(cwd, 'worker-spawns');
-    await mkdir(binDir, { recursive: true });
+    const spawnCapturePath = join(binDir, 'worker-spawns');
     await writeFakePromptWorkerBinary(
       fakeCodexPath,
       `
@@ -1769,6 +1890,8 @@ process.on('SIGTERM', () => process.exit(0));
       markFirstAdmissionEntered = resolve;
     });
     let runtimeTeamName = '';
+    let firstInternalTeamName = '';
+    let firstWorktreePath = '';
 
     try {
       await withPromptModeCodexEnv(binDir, {
@@ -1799,13 +1922,22 @@ process.on('SIGTERM', () => process.exit(0));
                 workflowLockLease: authority.lockLease,
                 workflowTransactionLease: authority.transactionLease,
               });
+              firstInternalTeamName = admission.teamName;
+              const ledger = JSON.parse(
+                await readFile(teamWorktreeProvisioningPath(admission.teamName, cwd), 'utf-8'),
+              ) as { worktrees: Array<{ worktreePath: string }> };
+              firstWorktreePath = ledger.worktrees[0]?.worktreePath ?? '';
+              assert.ok(firstWorktreePath);
+              assert.equal(existsSync(firstWorktreePath), true);
               markFirstAdmissionEntered();
               await firstAdmissionRelease;
             },
+            worktreeMode: { enabled: true, detached: true, name: null },
           },
         ));
 
         await firstAdmissionEntered;
+        const concurrentRecovery = recoverTeamWorktreeProvisioning(firstInternalTeamName, cwd);
         const secondStart = withoutTeamWorkerEnv(() => startTeam(
           'second-concurrent-team',
           'second concurrent team must lose admission',
@@ -1813,23 +1945,35 @@ process.on('SIGTERM', () => process.exit(0));
           1,
           [{ subject: 'second', description: 'second task', owner: 'worker-1' }],
           cwd,
+          { worktreeMode: { enabled: true, detached: true, name: null } },
         ));
         await new Promise<void>((resolve) => setImmediate(resolve));
         releaseFirstAdmission();
 
-        const [firstResult, secondResult] = await Promise.allSettled([firstStart, secondStart]);
+        const [firstResult, secondResult, recoveryResult] = await Promise.allSettled([
+          firstStart,
+          secondStart,
+          concurrentRecovery,
+        ]);
         assert.equal(firstResult.status, 'fulfilled');
         assert.equal(secondResult.status, 'rejected');
-        if (firstResult.status !== 'fulfilled' || secondResult.status !== 'rejected') return;
+        assert.equal(recoveryResult.status, 'fulfilled');
+        if (firstResult.status !== 'fulfilled' || secondResult.status !== 'rejected' || recoveryResult.status !== 'fulfilled') return;
+        assert.deepEqual(recoveryResult.value, { status: 'none', outcomes: [] });
         const runtime = firstResult.value;
         runtimeTeamName = runtime.teamName;
         assert.match(
           String(secondResult.reason),
-          /leader_session_conflict: active team exists \(first-concurrent-team-[a-f0-9]{8}\)/,
+          /leader_workspace_dirty_for_worktrees|leader_session_conflict: active team exists/,
         );
 
         const spawns = (await readFile(spawnCapturePath, 'utf-8')).trim().split('\n');
         assert.deepEqual(spawns, [`${runtime.teamName}/worker-1`]);
+        assert.equal(runtime.config.workers[0]?.worktree_path, firstWorktreePath);
+        assert.equal(existsSync(firstWorktreePath), true);
+        assert.equal(existsSync(teamWorktreeProvisioningPath(runtime.teamName, cwd)), false);
+        const listed = execFileSync('git', ['worktree', 'list', '--porcelain'], { cwd, encoding: 'utf-8' });
+        assert.doesNotMatch(listed, /locked omx-provision:/);
         const mode = await readModeState('team', cwd);
         assert.equal(mode?.team_name, runtime.teamName);
         const teams = await readdir(join(cwd, '.omx', 'state', 'team'), { withFileTypes: true });
@@ -1838,6 +1982,7 @@ process.on('SIGTERM', () => process.exit(0));
     } finally {
       releaseFirstAdmission();
       if (runtimeTeamName) await shutdownTeam(runtimeTeamName, cwd, { force: true }).catch(() => {});
+      await rm(binDir, { recursive: true, force: true });
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -3857,6 +4002,212 @@ process.on('SIGTERM', () => process.exit(0));
     }
   });
 
+  it('refuses worktree recovery while provisioning owner is live', async () => {
+    const repo = await initRepo();
+    const teamName = 'team-provision-owner-live';
+    const ledgerPath = teamWorktreeProvisioningPath(teamName, repo);
+    try {
+      await mkdir(dirname(ledgerPath), { recursive: true });
+      const now = new Date().toISOString();
+      await writeFile(ledgerPath, JSON.stringify({
+        schemaVersion: 1,
+        teamName,
+        owner: { sessionId: 'live-owner-session', pid: process.pid, startedAt: now },
+        status: 'provisioning',
+        worktrees: [],
+        updatedAt: now,
+      }));
+
+      await assert.rejects(
+        recoverTeamWorktreeProvisioning(teamName, repo),
+        new RegExp(`team_worktree_provisioning_owner_live:${teamName}:live-owner-session:${process.pid}`),
+      );
+      assert.equal(existsSync(ledgerPath), true);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a foreign unlocked worktree created after provisioning intent', async () => {
+    const repo = await initRepo();
+    const repoRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: repo, encoding: 'utf-8' }).trim();
+    const teamName = 'team-provision-foreign-path';
+    const ledgerPath = teamWorktreeProvisioningPath(teamName, repoRoot);
+    const worktreePath = join(repoRoot, '.omx', 'team', teamName, 'worktrees', 'worker-1');
+    try {
+      const baseRef = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf-8' }).trim();
+      await mkdir(dirname(worktreePath), { recursive: true });
+      execFileSync('git', ['worktree', 'add', '--detach', worktreePath, baseRef], { cwd: repoRoot, stdio: 'ignore' });
+      await mkdir(dirname(ledgerPath), { recursive: true });
+      const now = new Date().toISOString();
+      await writeFile(ledgerPath, JSON.stringify({
+        schemaVersion: 1,
+        teamName,
+        owner: { sessionId: 'dead-owner-session', pid: 99_999_999, startedAt: now },
+        status: 'provisioning',
+        worktrees: [{
+          workerName: 'worker-1',
+          repoRoot,
+          worktreePath,
+          baseRef,
+          detached: true,
+          branchName: null,
+          createdBranch: false,
+          provisioningToken: 'foreign-ledger-token',
+          created: null,
+        }],
+        updatedAt: now,
+      }));
+
+      const recovery = await recoverTeamWorktreeProvisioning(teamName, repoRoot);
+
+      assert.equal(recovery.status, 'preserved');
+      assert.equal(recovery.outcomes[0]?.status, 'ownership_conflict');
+      if (recovery.outcomes[0]?.status !== 'ownership_conflict') throw new Error('expected ownership conflict');
+      assert.equal(recovery.outcomes[0].reason, 'worktree_not_owned');
+      assert.equal(existsSync(worktreePath), true);
+      const after = JSON.parse(await readFile(ledgerPath, 'utf-8')) as {
+        status: string;
+        worktrees: Array<{ recoveryPhase?: string; recovery?: { status: string; reason?: string } }>;
+      };
+      assert.equal(after.status, 'recovery_required');
+      assert.equal(after.worktrees[0]?.recoveryPhase, undefined);
+      assert.equal(after.worktrees[0]?.recovery?.status, 'ownership_conflict');
+      assert.equal(after.worktrees[0]?.recovery?.reason, 'worktree_not_owned');
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers a clean detached worktree after process death between add and config ownership', async () => {
+    const repo = await initRepo();
+    let toolingDir = '';
+    try {
+      const crashed = await crashAfterFirstTeamWorktreeAdd(repo, 'team-provision-crash-clean', false);
+      toolingDir = crashed.toolingDir;
+      const ledgerPath = teamWorktreeProvisioningPath(crashed.internalTeamName, repo);
+      const ledger = JSON.parse(await readFile(ledgerPath, 'utf-8')) as {
+        owner: { sessionId: string; pid: number };
+        status: string;
+        worktrees: Array<{ worktreePath: string; created: boolean | null }>;
+      };
+      assert.equal(ledger.owner.sessionId, 'provision-crash-clean');
+      assert.equal(ledger.owner.pid, crashed.childPid);
+      assert.equal(ledger.status, 'provisioning');
+      assert.equal(ledger.worktrees.length, 1);
+      assert.equal(ledger.worktrees[0]?.created, null);
+      const worktreePath = ledger.worktrees[0]?.worktreePath;
+      assert.ok(worktreePath);
+      assert.equal(existsSync(worktreePath), true);
+      assert.equal(await readTeamConfig(crashed.internalTeamName, repo), null);
+
+      const staleAt = new Date(Date.now() - 6 * 60 * 1000);
+      await utimes(join(repo, '.omx', 'state', 'team', crashed.internalTeamName, '.lock.scaling'), staleAt, staleAt);
+      const recovery = await recoverTeamWorktreeProvisioning(crashed.internalTeamName, repo);
+
+      assert.equal(recovery.status, 'recovered');
+      assert.equal(recovery.outcomes[0]?.status, 'removed');
+      assert.equal(existsSync(worktreePath), false);
+      assert.equal(existsSync(join(repo, '.omx', 'team', crashed.internalTeamName)), false);
+      assert.equal(existsSync(ledgerPath), false);
+    } finally {
+      if (toolingDir) await rm(toolingDir, { recursive: true, force: true });
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('resumes recovery after process death immediately after claim release', async () => {
+    const repo = await initRepo();
+    let provisioningToolingDir = '';
+    let recoveryToolingDir = '';
+    try {
+      const crashed = await crashAfterFirstTeamWorktreeAdd(repo, 'team-recovery-crash-after-unlock', false);
+      provisioningToolingDir = crashed.toolingDir;
+      const ledgerPath = teamWorktreeProvisioningPath(crashed.internalTeamName, repo);
+      const before = JSON.parse(await readFile(ledgerPath, 'utf-8')) as {
+        worktrees: Array<{ worktreePath: string }>;
+      };
+      const worktreePath = before.worktrees[0]?.worktreePath;
+      assert.ok(worktreePath);
+
+      const lockPath = join(repo, '.omx', 'state', 'team', crashed.internalTeamName, '.lock.scaling');
+      const staleAt = new Date(Date.now() - 6 * 60 * 1000);
+      await utimes(lockPath, staleAt, staleAt);
+      recoveryToolingDir = await crashAfterProvisioningRecoveryUnlock(repo, crashed.internalTeamName);
+
+      const interrupted = JSON.parse(await readFile(ledgerPath, 'utf-8')) as {
+        worktrees: Array<{ recoveryPhase?: string; recovery?: unknown }>;
+      };
+      assert.equal(interrupted.worktrees[0]?.recoveryPhase, 'claim_verified');
+      assert.equal(interrupted.worktrees[0]?.recovery, undefined);
+      assert.equal(existsSync(worktreePath), true);
+      assert.doesNotMatch(
+        execFileSync('git', ['worktree', 'list', '--porcelain'], { cwd: repo, encoding: 'utf-8' }),
+        /locked omx-provision:/,
+      );
+
+      await utimes(lockPath, staleAt, staleAt);
+      const recovery = await recoverTeamWorktreeProvisioning(crashed.internalTeamName, repo);
+
+      assert.equal(recovery.status, 'recovered');
+      assert.equal(recovery.outcomes[0]?.status, 'removed');
+      assert.equal(existsSync(worktreePath), false);
+      assert.equal(existsSync(ledgerPath), false);
+    } finally {
+      if (recoveryToolingDir) await rm(recoveryToolingDir, { recursive: true, force: true });
+      if (provisioningToolingDir) await rm(provisioningToolingDir, { recursive: true, force: true });
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves dirty detached worktree ownership after process death', async () => {
+    const repo = await initRepo();
+    let toolingDir = '';
+    try {
+      const crashed = await crashAfterFirstTeamWorktreeAdd(repo, 'team-provision-crash-dirty', true);
+      toolingDir = crashed.toolingDir;
+      const ledgerPath = teamWorktreeProvisioningPath(crashed.internalTeamName, repo);
+      const before = JSON.parse(await readFile(ledgerPath, 'utf-8')) as {
+        owner: { sessionId: string; pid: number };
+        worktrees: Array<{ worktreePath: string; created: boolean | null }>;
+      };
+      const worktreePath = before.worktrees[0]?.worktreePath;
+      assert.ok(worktreePath);
+      assert.equal(before.worktrees[0]?.created, null);
+      assert.equal(await readFile(join(worktreePath, 'recovery-dirty.txt'), 'utf-8'), 'survive recovery\n');
+
+      const staleAt = new Date(Date.now() - 6 * 60 * 1000);
+      await utimes(join(repo, '.omx', 'state', 'team', crashed.internalTeamName, '.lock.scaling'), staleAt, staleAt);
+      const recovery = await recoverTeamWorktreeProvisioning(crashed.internalTeamName, repo);
+
+      assert.equal(recovery.status, 'preserved');
+      if (recovery.status !== 'preserved') throw new Error('expected preserved recovery');
+      const outcome = recovery.outcomes[0];
+      assert.equal(outcome?.status, 'preserved');
+      if (!outcome || outcome.status !== 'preserved') throw new Error('missing preserved outcome');
+      assert.ok(outcome.preservedRef);
+      assert.equal(existsSync(worktreePath), true);
+      assert.equal(await readFile(join(worktreePath, 'recovery-dirty.txt'), 'utf-8'), 'survive recovery\n');
+      assert.equal(
+        execFileSync('git', ['show', outcome.preservedRef + ':recovery-dirty.txt'], { cwd: repo, encoding: 'utf-8' }),
+        'survive recovery\n',
+      );
+
+      const after = JSON.parse(await readFile(ledgerPath, 'utf-8')) as {
+        owner: { sessionId: string; pid: number };
+        status: string;
+        worktrees: Array<{ recovery?: { status: string; preservedRef?: string | null } }>;
+      };
+      assert.deepEqual(after.owner, before.owner);
+      assert.equal(after.status, 'recovery_required');
+      assert.equal(after.worktrees[0]?.recovery?.status, 'preserved');
+      assert.equal(after.worktrees[0]?.recovery?.preservedRef, outcome.preservedRef);
+    } finally {
+      if (toolingDir) await rm(toolingDir, { recursive: true, force: true });
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
   it('startTeam runs worker MCP orphan cleanup before prompt worker spawn', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-prompt-mcp-cleanup-'));
     const binDir = join(cwd, 'bin');
@@ -3980,10 +4331,7 @@ process.on('SIGTERM', () => process.exit(0));
                   assert.equal(admission.config.workers[0]?.pid, undefined);
                   assert.equal(existsSync(spawnCapturePath), false);
                   assert.equal(cleanupCalled, false);
-                  assert.equal(
-                    existsSync(join(cwd, '.omx', 'state', 'team', admission.teamName)),
-                    false,
-                  );
+                  assert.equal(await readTeamConfig(admission.teamName, cwd), null);
                   await startMode('team', 'partial mode-state commit', 5, cwd, {
                     workflowLockLease: authority.lockLease,
                     workflowTransactionLease: authority.transactionLease,

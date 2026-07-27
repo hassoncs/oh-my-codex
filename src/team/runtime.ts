@@ -1,6 +1,6 @@
 import { join, resolve, dirname } from 'path';
 import { existsSync, appendFileSync, mkdirSync } from 'fs';
-import { mkdir, readdir, readFile, rm, writeFile } from 'fs/promises';
+import { mkdir, readdir, readFile, rm, rmdir, writeFile } from 'fs/promises';
 import { performance } from 'perf_hooks';
 import { spawn, spawnSync, type ChildProcessByStdio } from 'child_process';
 import type { Writable } from 'stream';
@@ -73,6 +73,7 @@ import {
   teamReadPhase as readTeamPhaseState,
   teamWritePhase as writeTeamPhaseState,
   teamWriteWorkerStatus as writeWorkerStatus,
+  teamWithScalingLock as withTeamProvisioningLock,
   writeAtomic,
   type TeamConfig,
   type WorkerInfo,
@@ -174,13 +175,19 @@ import {
 } from './commit-hygiene.js';
 import {
   assertCleanLeaderWorkspaceForWorkerWorktrees,
-  ensureWorktree,
+  ensureWorktreeWithProvisioningIntent,
   isGitRepository,
   isWorktreeDirty,
   planWorktreeTarget,
   removeWorktreeForce,
   rollbackProvisionedWorktrees,
+  recoverProvisionedWorktree,
+  releaseProvisionedWorktreeClaim,
+  verifyProvisionedWorktreeClaim,
   type EnsureWorktreeResult,
+  type ProvisionedWorktreeRecoveryOutcome,
+  type RollbackWorktreeOutcome,
+  type WorktreeCreateIntent,
   type WorktreeMode,
 } from './worktree.js';
 import {
@@ -1674,6 +1681,280 @@ export function teamRuntimeTeamRoot(teamName: string, cwd: string): string {
   return join(teamRuntimeTeamsRoot(cwd), teamName);
 }
 
+const WORKTREE_PROVISIONING_FILE = 'worktree-provisioning.json';
+
+type TeamWorktreeRecoveryOutcome = ProvisionedWorktreeRecoveryOutcome & { workerName: string };
+
+interface TeamWorktreeProvisioningEntry extends WorktreeCreateIntent {
+  workerName: string;
+  created: boolean | null;
+  recoveryPhase?: 'claim_verified';
+  recovery?: TeamWorktreeRecoveryOutcome;
+}
+
+interface TeamWorktreeProvisioningState {
+  schemaVersion: 1;
+  teamName: string;
+  owner: {
+    sessionId: string;
+    pid: number;
+    startedAt: string;
+  };
+  status: 'provisioning' | 'recovery_required';
+  worktrees: TeamWorktreeProvisioningEntry[];
+  updatedAt: string;
+}
+
+export type TeamWorktreeProvisioningRecovery =
+  | { status: 'none'; outcomes: [] }
+  | { status: 'recovered'; outcomes: TeamWorktreeRecoveryOutcome[] }
+  | { status: 'preserved'; owner: TeamWorktreeProvisioningState['owner']; outcomes: TeamWorktreeRecoveryOutcome[] };
+
+export function teamWorktreeProvisioningPath(teamName: string, cwd: string): string {
+  return join(teamRuntimeTeamRoot(teamName, cwd), WORKTREE_PROVISIONING_FILE);
+}
+
+function isTeamWorktreeProvisioningState(value: unknown): value is TeamWorktreeProvisioningState {
+  if (!value || typeof value !== 'object') return false;
+  const state = value as Record<string, unknown>;
+  if (state.schemaVersion !== 1 || typeof state.teamName !== 'string') return false;
+  if (state.status !== 'provisioning' && state.status !== 'recovery_required') return false;
+  if (!state.owner || typeof state.owner !== 'object' || !Array.isArray(state.worktrees)) return false;
+  const owner = state.owner as Record<string, unknown>;
+  if (typeof owner.sessionId !== 'string' || typeof owner.pid !== 'number' || typeof owner.startedAt !== 'string') return false;
+  return state.worktrees.every((entry) => {
+    if (!entry || typeof entry !== 'object') return false;
+    const worktree = entry as Record<string, unknown>;
+    return typeof worktree.workerName === 'string'
+      && typeof worktree.repoRoot === 'string'
+      && typeof worktree.worktreePath === 'string'
+      && typeof worktree.baseRef === 'string'
+      && typeof worktree.detached === 'boolean'
+      && (typeof worktree.branchName === 'string' || worktree.branchName === null)
+      && typeof worktree.createdBranch === 'boolean'
+      && typeof worktree.provisioningToken === 'string'
+      && (typeof worktree.created === 'boolean' || worktree.created === null)
+      && (worktree.recoveryPhase === undefined || worktree.recoveryPhase === 'claim_verified');
+  });
+}
+
+async function readTeamWorktreeProvisioningState(
+  teamName: string,
+  cwd: string,
+): Promise<TeamWorktreeProvisioningState | null> {
+  const path = teamWorktreeProvisioningPath(teamName, cwd);
+  if (!existsSync(path)) return null;
+  const parsed = JSON.parse(await readFile(path, 'utf-8')) as unknown;
+  if (!isTeamWorktreeProvisioningState(parsed) || parsed.teamName !== teamName) {
+    throw new Error(`team_worktree_provisioning_state_corrupt:${path}`);
+  }
+  return parsed;
+}
+
+async function writeTeamWorktreeProvisioningState(
+  cwd: string,
+  state: TeamWorktreeProvisioningState,
+): Promise<void> {
+  state.updatedAt = new Date().toISOString();
+  await writeAtomic(teamWorktreeProvisioningPath(state.teamName, cwd), JSON.stringify(state, null, 2));
+}
+
+async function recordTeamWorktreeProvisioningIntent(
+  teamName: string,
+  cwd: string,
+  ownerSessionId: string,
+  workerName: string,
+  intent: WorktreeCreateIntent,
+): Promise<void> {
+  const existing = await readTeamWorktreeProvisioningState(teamName, cwd);
+  if (existing?.status === 'recovery_required') {
+    throw new Error(`team_worktree_recovery_required:${teamName}:${existing.worktrees.map((entry) => entry.worktreePath).join(',')}`);
+  }
+  const now = new Date().toISOString();
+  const state: TeamWorktreeProvisioningState = existing ?? {
+    schemaVersion: 1,
+    teamName,
+    owner: { sessionId: ownerSessionId, pid: process.pid, startedAt: now },
+    status: 'provisioning',
+    worktrees: [],
+    updatedAt: now,
+  };
+  if (state.owner.sessionId !== ownerSessionId) {
+    throw new Error(`team_worktree_provisioning_owner_conflict:${teamName}:${state.owner.sessionId}:${ownerSessionId}`);
+  }
+  state.worktrees.push({ ...intent, workerName, created: null });
+  await writeTeamWorktreeProvisioningState(cwd, state);
+}
+
+async function markTeamWorktreeProvisioned(
+  teamName: string,
+  cwd: string,
+  workerName: string,
+  created: boolean,
+): Promise<void> {
+  const state = await readTeamWorktreeProvisioningState(teamName, cwd);
+  if (!state) throw new Error(`team_worktree_provisioning_state_missing:${teamName}:${workerName}`);
+  const entry = state.worktrees.find((candidate) => candidate.workerName === workerName && candidate.created === null);
+  if (!entry) throw new Error(`team_worktree_provisioning_entry_missing:${teamName}:${workerName}`);
+  entry.created = created;
+  await writeTeamWorktreeProvisioningState(cwd, state);
+}
+
+function teamConfigOwnsProvisioning(
+  config: TeamConfig | null,
+  state: TeamWorktreeProvisioningState,
+): boolean {
+  if (!config) return false;
+  return state.worktrees.every((entry) => config.workers.some((worker) =>
+    worker.name === entry.workerName
+      && worker.worktree_repo_root === entry.repoRoot
+      && worker.worktree_path === entry.worktreePath
+      && worker.worktree_base_ref === entry.baseRef
+      && worker.worktree_detached === entry.detached
+      && (worker.worktree_branch ?? null) === entry.branchName
+      && worker.worktree_created === entry.created));
+}
+
+interface TeamWorktreeRecoveryOptions {
+  allowOwnerRecovery?: boolean;
+  ownerPid?: number;
+  ownerSessionId?: string;
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+async function markTeamWorktreeProvisioningRecoveryRequired(
+  teamName: string,
+  cwd: string,
+  outcomes: RollbackWorktreeOutcome[],
+): Promise<void> {
+  await withTeamProvisioningLock(teamName, cwd, async () => {
+    const state = await readTeamWorktreeProvisioningState(teamName, cwd);
+    if (!state) return;
+    for (const entry of state.worktrees) {
+      const outcome = outcomes.find((candidate) => candidate.worktreePath === entry.worktreePath);
+      if (!outcome) continue;
+      entry.recovery = {
+        status: 'preserved',
+        workerName: entry.workerName,
+        worktreePath: outcome.worktreePath,
+        preservedRef: outcome.preservedRef,
+        checkpointCommit: outcome.checkpointCommit,
+      };
+    }
+    if (state.worktrees.some((entry) => !entry.recovery)) {
+      throw new Error(`team_worktree_recovery_state_incomplete:${teamName}`);
+    }
+    state.status = 'recovery_required';
+    await writeTeamWorktreeProvisioningState(cwd, state);
+  });
+}
+
+async function recoverTeamWorktreeProvisioningUnderLock(
+  teamName: string,
+  cwd: string,
+  options: TeamWorktreeRecoveryOptions = {},
+): Promise<TeamWorktreeProvisioningRecovery> {
+  const state = await readTeamWorktreeProvisioningState(teamName, cwd);
+  if (!state) return { status: 'none', outcomes: [] };
+  if (teamConfigOwnsProvisioning(await readTeamConfig(teamName, cwd), state)) {
+    for (const entry of state.worktrees) {
+      releaseProvisionedWorktreeClaim(entry, { allowUnlocked: true });
+    }
+    await rm(teamWorktreeProvisioningPath(teamName, cwd), { force: true });
+    return { status: 'recovered', outcomes: [] };
+  }
+
+  if (state.status === 'recovery_required') {
+    const outcomes = state.worktrees.map((entry) => {
+      if (!entry.recovery) {
+        throw new Error(`team_worktree_recovery_state_incomplete:${teamName}:${entry.worktreePath}`);
+      }
+      return entry.recovery;
+    });
+    return { status: 'preserved', owner: state.owner, outcomes };
+  }
+
+  const ownerAllowed = options.allowOwnerRecovery
+    && options.ownerPid === state.owner.pid
+    && options.ownerSessionId === state.owner.sessionId;
+  if (processIsAlive(state.owner.pid) && !ownerAllowed) {
+    throw new Error(
+      `team_worktree_provisioning_owner_live:${teamName}:${state.owner.sessionId}:${state.owner.pid}:`
+      + state.worktrees.map((entry) => entry.worktreePath).join(','),
+    );
+  }
+
+  const outcomes: TeamWorktreeRecoveryOutcome[] = [];
+  for (const entry of state.worktrees) {
+    if (entry.recovery) {
+      outcomes.push(entry.recovery);
+      continue;
+    }
+    if (existsSync(entry.worktreePath) && entry.recoveryPhase !== 'claim_verified') {
+      const verification = verifyProvisionedWorktreeClaim(entry);
+      if (!verification.owned) {
+        const outcome: TeamWorktreeRecoveryOutcome = {
+          status: 'ownership_conflict',
+          workerName: entry.workerName,
+          worktreePath: entry.worktreePath,
+          reason: verification.reason,
+        };
+        entry.recovery = outcome;
+        outcomes.push(outcome);
+        await writeTeamWorktreeProvisioningState(cwd, state);
+        continue;
+      }
+      entry.recoveryPhase = 'claim_verified';
+      await writeTeamWorktreeProvisioningState(cwd, state);
+    }
+    const outcome = {
+      ...await recoverProvisionedWorktree(entry, `team-provisioning-${teamName}`, {
+        allowUnlockedClaim: entry.recoveryPhase === 'claim_verified',
+      }),
+      workerName: entry.workerName,
+    };
+    entry.recovery = outcome;
+    outcomes.push(outcome);
+    await writeTeamWorktreeProvisioningState(cwd, state);
+  }
+
+  const preserved = outcomes.some((outcome) => outcome.status === 'preserved' || outcome.status === 'ownership_conflict');
+  if (preserved) {
+    state.status = 'recovery_required';
+    await writeTeamWorktreeProvisioningState(cwd, state);
+    return { status: 'preserved', owner: state.owner, outcomes };
+  }
+
+  await rm(teamWorktreeProvisioningPath(teamName, cwd), { force: true });
+  return { status: 'recovered', outcomes };
+}
+
+export async function recoverTeamWorktreeProvisioning(
+  teamName: string,
+  cwd: string,
+  options: TeamWorktreeRecoveryOptions = {},
+): Promise<TeamWorktreeProvisioningRecovery> {
+  return withTeamProvisioningLock(teamName, cwd, () =>
+    recoverTeamWorktreeProvisioningUnderLock(teamName, cwd, options));
+}
+
+async function removeEmptyTeamRuntimeDir(teamName: string, cwd: string): Promise<void> {
+  try {
+    await rmdir(teamRuntimeTeamRoot(teamName, cwd));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT' && code !== 'ENOTEMPTY' && code !== 'EEXIST') throw error;
+  }
+}
+
 export function teamRuntimeSessionPath(cwd: string): string {
   return join(resolveCanonicalTeamStateRoot(cwd), 'session.json');
 }
@@ -2713,98 +2994,147 @@ export async function startTeam(
       assertCleanLeaderWorkspaceForWorkerWorktrees(leaderCwd);
     }
 
-    await withWorkflowStateLock(baseStateDir, leaderCwd, async (lockLease) => {
+    config = await withWorkflowStateLock(baseStateDir, leaderCwd, async (lockLease) => {
+      await withTeamProvisioningLock(sanitized, leaderCwd, async () => {
+        const recovery = await recoverTeamWorktreeProvisioningUnderLock(sanitized, leaderCwd);
+        if (recovery.status === 'preserved') {
+          throw new Error(
+            `team_worktree_recovery_preserved:${sanitized}:${recovery.outcomes.map((outcome) => outcome.worktreePath).join(',')}`,
+          );
+        }
+      });
       await assertTeamStartupIsNonDestructive(sanitized, leaderCwd, leaderSessionId, scope.sessionId);
       if (displayName !== sanitized) {
         await assertTeamStartupIsNonDestructive(displayName, leaderCwd, leaderSessionId, scope.sessionId);
       }
-      if (activeWorktreeMode) {
-        for (let i = 1; i <= workerCount; i++) {
-          const workerName = `worker-${i}`;
-          const planned = planWorktreeTarget({
-            cwd: leaderCwd,
-            scope: 'team',
-            mode: effectiveWorktreeMode,
-            teamName: sanitized,
-            workerName,
-          });
-          const ensured = ensureWorktree(planned);
-          provisionedWorktrees.push(ensured);
-          if (ensured.enabled) {
-            workerWorkspaceByName.set(workerName, {
-              cwd: ensured.worktreePath,
-              worktreeRepoRoot: ensured.repoRoot,
-              worktreePath: ensured.worktreePath,
-              worktreeBranch: ensured.branchName ?? undefined,
-              worktreeBaseRef: ensured.baseRef,
-              worktreeDetached: ensured.detached,
-              worktreeCreated: ensured.created,
+      await detectAndCleanStaleTeam(sanitized, leaderCwd, workerCount, options.confirmStaleCleanup);
+
+      return withTeamProvisioningLock(sanitized, leaderCwd, async (): Promise<TeamConfig> => {
+        await assertTeamStartupIsNonDestructive(sanitized, leaderCwd, leaderSessionId, scope.sessionId);
+        if (displayName !== sanitized) {
+          await assertTeamStartupIsNonDestructive(displayName, leaderCwd, leaderSessionId, scope.sessionId);
+        }
+        if (activeWorktreeMode) {
+          for (let i = 1; i <= workerCount; i++) {
+            const workerName = `worker-${i}`;
+            const planned = planWorktreeTarget({
+              cwd: leaderCwd,
+              scope: 'team',
+              mode: effectiveWorktreeMode,
+              teamName: sanitized,
+              workerName,
             });
+            const ensured = await ensureWorktreeWithProvisioningIntent(
+              planned,
+              (intent) => recordTeamWorktreeProvisioningIntent(
+                sanitized,
+                leaderCwd,
+                leaderSessionId,
+                workerName,
+                intent,
+              ),
+            );
+            provisionedWorktrees.push(ensured);
+            if (ensured.enabled) {
+              if (ensured.created) {
+                await markTeamWorktreeProvisioned(sanitized, leaderCwd, workerName, true);
+              }
+              workerWorkspaceByName.set(workerName, {
+                cwd: ensured.worktreePath,
+                worktreeRepoRoot: ensured.repoRoot,
+                worktreePath: ensured.worktreePath,
+                worktreeBranch: ensured.branchName ?? undefined,
+                worktreeBaseRef: ensured.baseRef,
+                worktreeDetached: ensured.detached,
+                worktreeCreated: ensured.created,
+              });
+            }
           }
         }
-      }
-      await withWorkflowStateTransaction(
-        baseStateDir,
-        leaderCwd,
-        scope.sessionId,
-        (transactionLease) => commitModeState({
-          teamName: sanitized,
-          sanitizedName: sanitized,
-          config: {
-            worker_count: workerCount,
-            workers: Array.from({ length: workerCount }, (_, index) => ({
-              name: `worker-${index + 1}`,
-              index: index + 1,
-              role: agentType,
-              assigned_tasks: [],
-            })),
-            display_name: displayName,
+
+        await withWorkflowStateTransaction(
+          baseStateDir,
+          leaderCwd,
+          scope.sessionId,
+          (transactionLease) => commitModeState({
+            teamName: sanitized,
+            sanitizedName: sanitized,
+            config: {
+              worker_count: workerCount,
+              workers: Array.from({ length: workerCount }, (_, index) => ({
+                name: `worker-${index + 1}`,
+                index: index + 1,
+                role: agentType,
+                assigned_tasks: [],
+              })),
+              display_name: displayName,
+            },
+            cwd: leaderCwd,
+          }, { lockLease, transactionLease }),
+          [],
+          { lockLease },
+        );
+        admissionCommitted = true;
+
+        const initializedConfig = await initTeamState(
+          sanitized,
+          task,
+          agentType,
+          workerCount,
+          leaderCwd,
+          DEFAULT_MAX_WORKERS,
+          {
+            ...launchEnv,
+            OMX_SESSION_ID: leaderSessionId,
+            OMX_TEAM_DISPLAY_MODE: displayMode,
+            OMX_TEAM_WORKER_LAUNCH_MODE: workerLaunchMode,
           },
-          cwd: leaderCwd,
-        }, { lockLease, transactionLease }),
-        [],
-        { lockLease },
-      );
+          {
+            leader_cwd: leaderCwd,
+            team_state_root: teamStateRoot,
+            workspace_mode: workspaceMode,
+            display_name: displayName,
+            requested_name: displayName,
+            identity_source: identityScope.source,
+            worktree_mode: effectiveWorktreeMode,
+          },
+          'default',
+        );
+        if (!initializedConfig) throw new Error('failed to initialize team config');
+        initializedConfig.leader_cwd = leaderCwd;
+        initializedConfig.team_state_root = teamStateRoot;
+        initializedConfig.workspace_mode = workspaceMode;
+        initializedConfig.display_name = displayName;
+        initializedConfig.requested_name = displayName;
+        initializedConfig.identity_source = identityScope.source;
+        initializedConfig.worktree_mode = effectiveWorktreeMode;
+        for (const worker of initializedConfig.workers) {
+          const workspace = workerWorkspaceByName.get(worker.name);
+          if (!workspace) continue;
+          worker.working_dir = workspace.cwd;
+          worker.worktree_repo_root = workspace.worktreeRepoRoot;
+          worker.worktree_path = workspace.worktreePath;
+          worker.worktree_branch = workspace.worktreeBranch;
+          worker.worktree_base_ref = workspace.worktreeBaseRef;
+          worker.worktree_detached = workspace.worktreeDetached;
+          worker.worktree_created = workspace.worktreeCreated;
+          worker.team_state_root = teamStateRoot;
+        }
+        await saveTeamConfig(initializedConfig, leaderCwd);
+        const provisioning = await readTeamWorktreeProvisioningState(sanitized, leaderCwd);
+        if (provisioning) {
+          if (!teamConfigOwnsProvisioning(initializedConfig, provisioning)) {
+            throw new Error(`team_worktree_config_ownership_incomplete:${sanitized}`);
+          }
+          for (const entry of provisioning.worktrees) {
+            releaseProvisionedWorktreeClaim(entry);
+          }
+          await rm(teamWorktreeProvisioningPath(sanitized, leaderCwd), { force: true });
+        }
+        return initializedConfig;
+      });
     });
-    admissionCommitted = true;
 
-    await detectAndCleanStaleTeam(sanitized, leaderCwd, workerCount, options.confirmStaleCleanup);
-
-    // 3. Init state directory + config
-    config = await initTeamState(
-      sanitized,
-      task,
-      agentType,
-      workerCount,
-      leaderCwd,
-      DEFAULT_MAX_WORKERS,
-      {
-        ...launchEnv,
-        OMX_SESSION_ID: leaderSessionId,
-        OMX_TEAM_DISPLAY_MODE: displayMode,
-        OMX_TEAM_WORKER_LAUNCH_MODE: workerLaunchMode,
-      },
-      {
-        leader_cwd: leaderCwd,
-        team_state_root: teamStateRoot,
-        workspace_mode: workspaceMode,
-        display_name: displayName,
-        requested_name: displayName,
-        identity_source: identityScope.source,
-        worktree_mode: effectiveWorktreeMode,
-      },
-      'default',
-    );
-    if (!config) {
-      throw new Error('failed to initialize team config');
-    }
-    config.leader_cwd = leaderCwd;
-    config.team_state_root = teamStateRoot;
-    config.workspace_mode = workspaceMode;
-    config.display_name = displayName;
-    config.requested_name = displayName;
-    config.identity_source = identityScope.source;
-    config.worktree_mode = effectiveWorktreeMode;
     await writePersistedApprovedTeamExecutionBinding(
       sanitized,
       leaderCwd,
@@ -3346,21 +3676,21 @@ export async function startTeam(
   } catch (error) {
     const rollbackErrors: string[] = [];
     if (!admissionCommitted) {
-      if (provisionedWorktrees.length > 0) {
-        try {
-          const outcomes = await rollbackProvisionedWorktrees(provisionedWorktrees, {
-            skipBranchDeletion: false,
-            salvageContext: `team-startup-${sanitized}`,
-          });
-          for (const outcome of outcomes) {
-            if (!outcome.preservedRef) continue;
-            process.stderr.write(
-              `[omx:team] pre-admission rollback preserved ${outcome.worktreePath} at ${outcome.preservedRef}\n`,
-            );
-          }
-        } catch (cleanupError) {
-          rollbackErrors.push(`rollbackProvisionedWorktrees: ${String(cleanupError)}`);
+      try {
+        const recovery = await recoverTeamWorktreeProvisioning(sanitized, leaderCwd, {
+          allowOwnerRecovery: true,
+          ownerPid: process.pid,
+          ownerSessionId: leaderSessionId,
+        });
+        if (recovery.status === 'preserved') {
+          rollbackErrors.push(
+            `team_worktree_recovery_preserved:${recovery.outcomes.map((outcome) => outcome.worktreePath).join(',')}`,
+          );
+        } else {
+          await removeEmptyTeamRuntimeDir(sanitized, leaderCwd);
         }
+      } catch (cleanupError) {
+        rollbackErrors.push(`recoverTeamWorktreeProvisioning: ${String(cleanupError)}`);
       }
       if (rollbackErrors.length > 0) {
         const message = error instanceof Error ? error.message : String(error);
@@ -3476,6 +3806,7 @@ export async function startTeam(
               `[omx:team] failed startup preserved ${outcome.worktreePath} at ${outcome.preservedRef}\n`,
             );
           }
+          await markTeamWorktreeProvisioningRecoveryRequired(sanitized, leaderCwd, outcomes);
         } catch (cleanupError) {
           rollbackErrors.push(`preserveProvisionedWorktrees: ${String(cleanupError)}`);
         }
@@ -4501,7 +4832,7 @@ async function detectAndCleanStaleTeam(
   confirmFn?: (summary: StaleTeamSummary) => Promise<boolean>,
 ): Promise<void> {
   const stateDir = teamRuntimeTeamRoot(teamName, leaderCwd);
-  if (!existsSync(stateDir)) return;
+  if (!existsSync(stateDir) || existsSync(teamWorktreeProvisioningPath(teamName, leaderCwd))) return;
 
   const sessions = new Set(listTeamSessions());
   if (sessions.has(`omx-team-${teamName}`)) return;

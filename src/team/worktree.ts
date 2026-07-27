@@ -1,7 +1,8 @@
 import { execFile as execFileCb, execFileSync, spawnSync } from 'child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'fs';
+import { randomUUID } from 'crypto';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, rmdirSync } from 'fs';
 import { tmpdir } from 'os';
-import { basename, dirname, join, resolve } from 'path';
+import { basename, dirname, join, resolve, sep } from 'path';
 import { promisify } from 'util';
 import {
   assertCurrentTaskBranchAvailable,
@@ -49,6 +50,7 @@ export interface EnsureWorktreeResult {
   created: boolean;
   reused: boolean;
   createdBranch: boolean;
+  provisioningToken?: string;
   /** True when the worktree had uncommitted changes at launch time. */
   dirty?: boolean;
 }
@@ -57,13 +59,32 @@ export interface EnsureWorktreeOptions {
   allowDirtyReuse?: boolean;
 }
 
+export interface WorktreeCreateIntent {
+  repoRoot: string;
+  worktreePath: string;
+  baseRef: string;
+  detached: boolean;
+  branchName: string | null;
+  createdBranch: boolean;
+  provisioningToken: string;
+}
+
+interface PreparedWorktreeCreate {
+  kind: 'create';
+  plan: PlannedWorktreeTarget;
+  branchAlreadyExisted: boolean;
+  addArgs: string[];
+}
+
 interface GitWorktreeEntry {
   path: string;
   head: string;
   branchRef: string | null;
   detached: boolean;
+  lockReason: string | null;
 }
 
+const PROVISIONING_REASON_PREFIX = 'omx-provision:';
 const BRANCH_IN_USE_PATTERN = /already checked out|already used by worktree|is already checked out/i;
 
 export function isGitRepository(cwd: string): boolean {
@@ -178,6 +199,7 @@ function listWorktrees(repoRoot: string): GitWorktreeEntry[] {
     const worktreeLine = lines.find((line) => line.startsWith('worktree '));
     const headLine = lines.find((line) => line.startsWith('HEAD '));
     const branchLine = lines.find((line) => line.startsWith('branch '));
+    const lockedLine = lines.find((line) => line === 'locked' || line.startsWith('locked '));
     if (!worktreeLine || !headLine) continue;
 
     entries.push({
@@ -185,6 +207,7 @@ function listWorktrees(repoRoot: string): GitWorktreeEntry[] {
       head: headLine.slice('HEAD '.length).trim(),
       branchRef: branchLine ? branchLine.slice('branch '.length).trim() : null,
       detached: lines.includes('detached') || !branchLine,
+      lockReason: lockedLine ? lockedLine.slice('locked'.length).trim() : null,
     });
   }
 
@@ -294,11 +317,13 @@ function readWorktreeEntryFromPath(repoRoot: string, worktreePath: string): GitW
     });
   const branchRef = branchResult.status === 0 ? (branchResult.stdout || '').trim() : null;
 
+  const listed = findWorktreeByPath(listWorktrees(repoRoot), worktreePath);
   return {
     path: resolve(worktreePath),
     head,
     branchRef: branchRef || null,
     detached: !branchRef,
+    lockReason: listed?.lockReason ?? null,
   };
 }
 
@@ -377,10 +402,10 @@ export function planWorktreeTarget(input: WorktreePlanInput): PlannedWorktreeTar
   };
 }
 
-export function ensureWorktree(
+function prepareWorktree(
   plan: PlannedWorktreeTarget | { enabled: false },
   options: EnsureWorktreeOptions = {},
-): EnsureWorktreeResult | { enabled: false } {
+): EnsureWorktreeResult | { enabled: false } | PreparedWorktreeCreate {
   if (!plan.enabled) return { enabled: false };
 
   let allWorktrees = listWorktrees(plan.repoRoot);
@@ -444,7 +469,6 @@ export function ensureWorktree(
     assertCurrentTaskBranchAvailable(plan.repoRoot, plan.branchName, plan.worktreePath);
   }
 
-  mkdirSync(dirname(plan.worktreePath), { recursive: true });
   const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
 
   const addArgs = ['worktree', 'add'];
@@ -455,6 +479,13 @@ export function ensureWorktree(
   } else {
     addArgs.push('-b', plan.branchName as string, plan.worktreePath, plan.baseRef);
   }
+
+  return { kind: 'create', plan, branchAlreadyExisted, addArgs };
+}
+
+function createPreparedWorktree(prepared: PreparedWorktreeCreate): EnsureWorktreeResult {
+  const { plan, branchAlreadyExisted, addArgs } = prepared;
+  mkdirSync(dirname(plan.worktreePath), { recursive: true });
 
   const result = spawnSync('git', addArgs, {
     cwd: plan.repoRoot,
@@ -492,6 +523,167 @@ export function ensureWorktree(
   }
 
   return ensured;
+}
+
+function provisioningReason(token: string): string {
+  return `${PROVISIONING_REASON_PREFIX}${token}`;
+}
+
+function branchClaimMatches(repoRoot: string, branchName: string, token: string): boolean {
+  const result = spawnSync('git', ['reflog', 'show', '--format=%gs', `refs/heads/${branchName}`], {
+    cwd: repoRoot,
+    encoding: 'utf-8',
+    windowsHide: true,
+  });
+  return result.status === 0
+    && (result.stdout || '').split(/\r?\n/).some((line) => line.trim() === provisioningReason(token));
+}
+
+function claimBranchForProvisioning(prepared: PreparedWorktreeCreate, token: string): void {
+  const { plan, branchAlreadyExisted } = prepared;
+  if (!plan.branchName || branchAlreadyExisted) return;
+  const branchRef = `refs/heads/${plan.branchName}`;
+  const result = spawnSync('git', [
+    'update-ref',
+    '--create-reflog',
+    '-m',
+    provisioningReason(token),
+    branchRef,
+    plan.baseRef,
+    '0'.repeat(plan.baseRef.length),
+  ], {
+    cwd: plan.repoRoot,
+    encoding: 'utf-8',
+    windowsHide: true,
+  });
+  if (result.status === 0) return;
+  const stderr = (result.stderr || '').trim();
+  if (branchExists(plan.repoRoot, plan.branchName)) {
+    throw new Error(`branch_ownership_conflict:${plan.branchName}`);
+  }
+  throw new Error(stderr || `worktree_branch_claim_failed:${branchRef}`);
+}
+
+function createClaimedWorktree(prepared: PreparedWorktreeCreate, token: string): EnsureWorktreeResult {
+  const { plan, branchAlreadyExisted } = prepared;
+  claimBranchForProvisioning(prepared, token);
+  mkdirSync(dirname(plan.worktreePath), { recursive: true });
+
+  const addArgs = ['worktree', 'add', '--lock', '--reason', provisioningReason(token)];
+  if (plan.detached) {
+    addArgs.push('--detach', plan.worktreePath, plan.baseRef);
+  } else {
+    addArgs.push(plan.worktreePath, plan.branchName as string);
+  }
+  const result = spawnSync('git', addArgs, {
+    cwd: plan.repoRoot,
+    encoding: 'utf-8',
+    windowsHide: true,
+  });
+  if (result.status !== 0) {
+    const stderr = (result.stderr || '').trim();
+    if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) {
+      throw new Error(`branch_in_use:${plan.branchName}`);
+    }
+    throw new Error(stderr || `worktree_add_failed:${addArgs.join(' ')}`);
+  }
+
+  const ensured = {
+    enabled: true,
+    repoRoot: plan.repoRoot,
+    worktreePath: resolve(plan.worktreePath),
+    baseRef: plan.baseRef,
+    detached: plan.detached,
+    branchName: plan.branchName,
+    created: true,
+    reused: false,
+    createdBranch: Boolean(plan.branchName && !branchAlreadyExisted),
+    provisioningToken: token,
+  } satisfies EnsureWorktreeResult;
+
+  if (plan.branchName) {
+    upsertCurrentTaskBaseline(plan.repoRoot, {
+      branch_name: plan.branchName,
+      worktree_path: ensured.worktreePath,
+      base_ref: plan.baseRef,
+      status: 'active',
+    });
+  }
+  return ensured;
+}
+
+export function releaseProvisionedWorktreeClaim(
+  input: WorktreeCreateIntent,
+  options: { allowUnlocked?: boolean } = {},
+): void {
+  const entry = readWorktreeEntryFromPath(input.repoRoot, input.worktreePath);
+  if (!entry) throw new Error(`worktree_claim_missing:${input.worktreePath}`);
+  const expectedBranchRef = input.branchName ? `refs/heads/${input.branchName}` : null;
+  if (input.detached ? !entry.detached : entry.branchRef !== expectedBranchRef) {
+    throw new Error(`worktree_claim_identity_mismatch:${input.worktreePath}`);
+  }
+  const expectedReason = provisioningReason(input.provisioningToken);
+  if (entry.lockReason === null && options.allowUnlocked) return;
+  if (entry.lockReason !== expectedReason) {
+    throw new Error(`worktree_claim_owner_mismatch:${input.worktreePath}`);
+  }
+  const result = spawnSync('git', ['worktree', 'unlock', input.worktreePath], {
+    cwd: input.repoRoot,
+    encoding: 'utf-8',
+    windowsHide: true,
+  });
+  if (result.status !== 0) {
+    const stderr = (result.stderr || '').trim();
+    throw new Error(stderr || `worktree_unlock_failed:${input.worktreePath}`);
+  }
+}
+
+function removeEmptyProvisioningParents(repoRoot: string, worktreePath: string): void {
+  const stop = resolve(repoRoot, '.omx');
+  let current = dirname(resolve(worktreePath));
+  while (current !== stop && current.startsWith(stop + sep)) {
+    try {
+      rmdirSync(current);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') {
+        current = dirname(current);
+        continue;
+      }
+      if (code === 'ENOTEMPTY' || code === 'EEXIST') return;
+      throw error;
+    }
+    current = dirname(current);
+  }
+}
+
+export function ensureWorktree(
+  plan: PlannedWorktreeTarget | { enabled: false },
+  options: EnsureWorktreeOptions = {},
+): EnsureWorktreeResult | { enabled: false } {
+  const prepared = prepareWorktree(plan, options);
+  if (!('kind' in prepared)) return prepared;
+  return createPreparedWorktree(prepared);
+}
+
+export async function ensureWorktreeWithProvisioningIntent(
+  plan: PlannedWorktreeTarget | { enabled: false },
+  beforeCreate: (intent: WorktreeCreateIntent) => Promise<void>,
+  options: EnsureWorktreeOptions = {},
+): Promise<EnsureWorktreeResult | { enabled: false }> {
+  const prepared = prepareWorktree(plan, options);
+  if (!('kind' in prepared)) return prepared;
+  const provisioningToken = randomUUID();
+  await beforeCreate({
+    repoRoot: prepared.plan.repoRoot,
+    worktreePath: resolve(prepared.plan.worktreePath),
+    baseRef: prepared.plan.baseRef,
+    detached: prepared.plan.detached,
+    branchName: prepared.plan.branchName,
+    createdBranch: Boolean(prepared.plan.branchName && !prepared.branchAlreadyExisted),
+    provisioningToken,
+  });
+  return createClaimedWorktree(prepared, provisioningToken);
 }
 
 export interface RollbackWorktreeOptions {
@@ -657,10 +849,11 @@ export async function rollbackProvisionedWorktrees(
     }
 
     try {
-      await execFilePromise('git', ['worktree', 'remove', '--force', result.worktreePath], {
+      await execFilePromise('git', ['worktree', 'remove', result.worktreePath], {
         cwd: result.repoRoot,
         encoding: 'utf-8',
       });
+      removeEmptyProvisioningParents(result.repoRoot, result.worktreePath);
     } catch (err: unknown) {
       errors.push(`remove:${result.worktreePath}:${gitFailure(err)}`);
       outcomes.push({
@@ -686,26 +879,38 @@ export async function rollbackProvisionedWorktrees(
 
     const entriesAfterRemove = listWorktrees(result.repoRoot);
     const stillCheckedOut = hasBranchInUse(entriesAfterRemove, result.branchName, result.worktreePath);
-    if (stillCheckedOut) {
+    const branchRef = `refs/heads/${result.branchName}`;
+    if (stillCheckedOut || !branchExists(result.repoRoot, result.branchName)) {
       outcomes.push({
         worktreePath: result.worktreePath,
         removed: true,
         preservedRef,
+        checkpointCommit,
+        branchDeleted: !branchExists(result.repoRoot, result.branchName),
+      });
+      continue;
+    }
+
+    const branchHead = readGit(result.repoRoot, ['rev-parse', branchRef]);
+    if (!result.baseRef || branchHead !== result.baseRef) {
+      outcomes.push({
+        worktreePath: result.worktreePath,
+        removed: true,
+        preservedRef: branchRef,
         checkpointCommit,
         branchDeleted: false,
       });
       continue;
     }
 
-    try {
-      await execFilePromise('git', ['branch', '-d', result.branchName], {
-        cwd: result.repoRoot,
-        encoding: 'utf-8',
-      });
-    } catch (err: unknown) {
-      if (branchExists(result.repoRoot, result.branchName)) {
-        errors.push(`delete_branch:${result.branchName}:${gitFailure(err)}`);
-      }
+    const deleted = spawnSync('git', ['update-ref', '-d', branchRef, branchHead], {
+      cwd: result.repoRoot,
+      encoding: 'utf-8',
+      windowsHide: true,
+    });
+    if (deleted.status !== 0 && branchExists(result.repoRoot, result.branchName)) {
+      const stderr = (deleted.stderr || '').trim();
+      errors.push(`delete_branch:${result.branchName}:${stderr || 'compare_and_delete_failed'}`);
     }
     outcomes.push({
       worktreePath: result.worktreePath,
@@ -720,6 +925,127 @@ export async function rollbackProvisionedWorktrees(
     throw new Error(`worktree_rollback_failed:${errors.join(' | ')}`);
   }
   return outcomes;
+}
+
+export interface ProvisionedWorktreeRecoveryInput extends WorktreeCreateIntent {
+  created: boolean | null;
+}
+
+export interface ProvisionedWorktreeRecoveryOptions {
+  allowUnlockedClaim?: boolean;
+}
+
+export type ProvisionedWorktreeClaimVerification =
+  | { owned: true }
+  | { owned: false; reason: string };
+
+export type ProvisionedWorktreeRecoveryOutcome =
+  | { status: 'absent'; worktreePath: string }
+  | { status: 'removed'; worktreePath: string; branchDeleted: boolean }
+  | { status: 'preserved'; worktreePath: string; preservedRef: string | null; checkpointCommit: string | null }
+  | { status: 'ownership_conflict'; worktreePath: string; reason: string };
+
+export function verifyProvisionedWorktreeClaim(
+  input: WorktreeCreateIntent,
+  options: ProvisionedWorktreeRecoveryOptions = {},
+): ProvisionedWorktreeClaimVerification {
+  const entry = readWorktreeEntryFromPath(input.repoRoot, input.worktreePath);
+  if (!entry) return { owned: false, reason: 'not_repo_worktree' };
+  const expectedReason = provisioningReason(input.provisioningToken);
+  const claimOwned = entry.lockReason === expectedReason
+    || (options.allowUnlockedClaim === true && entry.lockReason === null);
+  if (!claimOwned) return { owned: false, reason: 'worktree_not_owned' };
+  const expectedBranchRef = input.branchName ? `refs/heads/${input.branchName}` : null;
+  if (input.detached ? !entry.detached : entry.branchRef !== expectedBranchRef) {
+    return { owned: false, reason: 'identity_mismatch' };
+  }
+  if (input.createdBranch && (!input.branchName || !branchExists(input.repoRoot, input.branchName)
+    || !branchClaimMatches(input.repoRoot, input.branchName, input.provisioningToken))) {
+    return { owned: false, reason: 'branch_not_owned' };
+  }
+  return { owned: true };
+}
+
+export async function recoverProvisionedWorktree(
+  input: ProvisionedWorktreeRecoveryInput,
+  salvageContext: string,
+  options: ProvisionedWorktreeRecoveryOptions = {},
+): Promise<ProvisionedWorktreeRecoveryOutcome> {
+  if (input.created === false) {
+    return { status: 'ownership_conflict', worktreePath: input.worktreePath, reason: 'not_created_by_owner' };
+  }
+
+  const branchPresent = Boolean(input.branchName && branchExists(input.repoRoot, input.branchName));
+  const branchOwned = Boolean(
+    input.createdBranch
+      && input.branchName
+      && branchPresent
+      && branchClaimMatches(input.repoRoot, input.branchName, input.provisioningToken),
+  );
+  if (!existsSync(input.worktreePath)) {
+    if (!input.createdBranch || !input.branchName || !branchPresent) {
+      removeEmptyProvisioningParents(input.repoRoot, input.worktreePath);
+      return { status: 'absent', worktreePath: input.worktreePath };
+    }
+    if (!branchOwned) {
+      return { status: 'ownership_conflict', worktreePath: input.worktreePath, reason: 'branch_not_owned' };
+    }
+    const worktrees = listWorktrees(input.repoRoot);
+    if (hasBranchInUse(worktrees, input.branchName, input.worktreePath)) {
+      return { status: 'ownership_conflict', worktreePath: input.worktreePath, reason: 'branch_in_use' };
+    }
+    const branchRef = `refs/heads/${input.branchName}`;
+    const branchHead = readGit(input.repoRoot, ['rev-parse', branchRef]);
+    if (branchHead !== input.baseRef) {
+      return {
+        status: 'preserved',
+        worktreePath: input.worktreePath,
+        preservedRef: branchRef,
+        checkpointCommit: null,
+      };
+    }
+    const deleted = spawnSync('git', ['update-ref', '-d', branchRef, branchHead], {
+      cwd: input.repoRoot,
+      encoding: 'utf-8',
+      windowsHide: true,
+    });
+    if (deleted.status !== 0) {
+      const stderr = (deleted.stderr || '').trim();
+      throw new Error(stderr || `worktree_recovery_branch_delete_failed:${branchRef}`);
+    }
+    removeEmptyProvisioningParents(input.repoRoot, input.worktreePath);
+    return { status: 'removed', worktreePath: input.worktreePath, branchDeleted: true };
+  }
+
+  const verification = verifyProvisionedWorktreeClaim(input, options);
+  if (!verification.owned) {
+    return { status: 'ownership_conflict', worktreePath: input.worktreePath, reason: verification.reason };
+  }
+
+  releaseProvisionedWorktreeClaim(input, { allowUnlocked: options.allowUnlockedClaim });
+  const [outcome] = await rollbackProvisionedWorktrees([{
+    enabled: true,
+    repoRoot: input.repoRoot,
+    worktreePath: input.worktreePath,
+    baseRef: input.baseRef,
+    detached: input.detached,
+    branchName: input.branchName,
+    created: true,
+    reused: false,
+    createdBranch: input.createdBranch,
+    provisioningToken: input.provisioningToken,
+  }], { salvageContext });
+  if (!outcome) {
+    throw new Error(`worktree_recovery_outcome_missing:${input.worktreePath}`);
+  }
+  return outcome.removed
+    ? { status: 'removed', worktreePath: outcome.worktreePath, branchDeleted: outcome.branchDeleted }
+    : {
+        status: 'preserved',
+        worktreePath: outcome.worktreePath,
+        preservedRef: outcome.preservedRef,
+        checkpointCommit: outcome.checkpointCommit,
+      };
 }
 
 export async function removeWorktreeForce(repoRoot: string, worktreePath: string): Promise<void> {

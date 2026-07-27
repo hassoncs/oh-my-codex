@@ -1,15 +1,18 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   parseWorktreeMode,
   planWorktreeTarget,
   ensureWorktree,
+  ensureWorktreeWithProvisioningIntent,
   rollbackProvisionedWorktrees,
+  recoverProvisionedWorktree,
+  type WorktreeCreateIntent,
 } from '../worktree.js';
 
 async function initRepo(): Promise<string> {
@@ -31,6 +34,184 @@ function branchExists(repoRoot: string, branch: string): boolean {
     return false;
   }
 }
+
+describe('worktree provisioning recovery', () => {
+  it('deletes an owned branch left at base before its worktree path was created', async () => {
+    const repo = await initRepo();
+    try {
+      const baseRef = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf-8' }).trim();
+      const branchName = 'branch-only-clean';
+      const branchRef = `refs/heads/${branchName}`;
+      const provisioningToken = 'branch-only-clean-token';
+      const worktreePath = join(repo, '.omx', 'team', 'branch-only', 'worktrees', 'worker-1');
+      await mkdir(dirname(worktreePath), { recursive: true });
+      execFileSync('git', [
+        'update-ref', '--create-reflog', '-m', `omx-provision:${provisioningToken}`,
+        branchRef, baseRef, '0'.repeat(baseRef.length),
+      ], { cwd: repo, stdio: 'ignore' });
+
+      const outcome = await recoverProvisionedWorktree({
+        repoRoot: repo,
+        worktreePath,
+        baseRef,
+        detached: false,
+        branchName,
+        createdBranch: true,
+        provisioningToken,
+        created: null,
+      }, 'branch-only-clean-test');
+
+      assert.deepEqual(outcome, { status: 'removed', worktreePath, branchDeleted: true });
+      assert.equal(branchExists(repo, branchName), false);
+      assert.equal(existsSync(join(repo, '.omx', 'team')), false);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves an owned branch advanced before its worktree path was created', async () => {
+    const repo = await initRepo();
+    try {
+      const baseRef = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf-8' }).trim();
+      const branchName = 'branch-only-advanced';
+      const branchRef = `refs/heads/${branchName}`;
+      const provisioningToken = 'branch-only-advanced-token';
+      const worktreePath = join(repo, '.omx', 'team', 'branch-only', 'worktrees', 'worker-1');
+      execFileSync('git', [
+        'update-ref', '--create-reflog', '-m', `omx-provision:${provisioningToken}`,
+        branchRef, baseRef, '0'.repeat(baseRef.length),
+      ], { cwd: repo, stdio: 'ignore' });
+      const advancedRef = execFileSync(
+        'git',
+        ['commit-tree', `${baseRef}^{tree}`, '-p', baseRef, '-m', 'advance branch before worktree creation'],
+        { cwd: repo, encoding: 'utf-8' },
+      ).trim();
+      execFileSync('git', ['update-ref', '-m', 'foreign advance', branchRef, advancedRef, baseRef], {
+        cwd: repo,
+        stdio: 'ignore',
+      });
+
+      const outcome = await recoverProvisionedWorktree({
+        repoRoot: repo,
+        worktreePath,
+        baseRef,
+        detached: false,
+        branchName,
+        createdBranch: true,
+        provisioningToken,
+        created: null,
+      }, 'branch-only-advanced-test');
+
+      assert.deepEqual(outcome, {
+        status: 'preserved',
+        worktreePath,
+        preservedRef: branchRef,
+        checkpointCommit: null,
+      });
+      assert.equal(execFileSync('git', ['rev-parse', branchRef], { cwd: repo, encoding: 'utf-8' }).trim(), advancedRef);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a foreign exact-base branch created after provisioning intent', async () => {
+    const repo = await initRepo();
+    let intent!: WorktreeCreateIntent;
+    try {
+      const planned = planWorktreeTarget({
+        cwd: repo,
+        scope: 'team',
+        mode: { enabled: true, detached: false, name: 'foreign-branch' },
+        teamName: 'foreign-race',
+        workerName: 'worker-1',
+      });
+      if (!planned.enabled) throw new Error('worktree plan not enabled');
+      await assert.rejects(
+        ensureWorktreeWithProvisioningIntent(planned, async (candidate) => {
+          intent = candidate;
+          execFileSync('git', ['branch', candidate.branchName!, candidate.baseRef], { cwd: repo, stdio: 'ignore' });
+        }),
+        /branch_ownership_conflict:foreign-branch\/worker-1/,
+      );
+
+      const outcome = await recoverProvisionedWorktree({ ...intent, created: null }, 'foreign-branch-race');
+      assert.deepEqual(outcome, {
+        status: 'ownership_conflict',
+        worktreePath: intent.worktreePath,
+        reason: 'branch_not_owned',
+      });
+      assert.equal(branchExists(repo, intent.branchName!), true);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a foreign exact-path worktree created after provisioning intent', async () => {
+    const repo = await initRepo();
+    let intent!: WorktreeCreateIntent;
+    try {
+      const planned = planWorktreeTarget({
+        cwd: repo,
+        scope: 'team',
+        mode: { enabled: true, detached: true, name: null },
+        teamName: 'foreign-path-race',
+        workerName: 'worker-1',
+      });
+      if (!planned.enabled) throw new Error('worktree plan not enabled');
+      await assert.rejects(
+        ensureWorktreeWithProvisioningIntent(planned, async (candidate) => {
+          intent = candidate;
+          await mkdir(dirname(candidate.worktreePath), { recursive: true });
+          execFileSync('git', ['worktree', 'add', '--detach', candidate.worktreePath, candidate.baseRef], {
+            cwd: repo,
+            stdio: 'ignore',
+          });
+        }),
+        /already exists|worktree_add_failed/,
+      );
+
+      const outcome = await recoverProvisionedWorktree({ ...intent, created: null }, 'foreign-path-race');
+      assert.deepEqual(outcome, {
+        status: 'ownership_conflict',
+        worktreePath: intent.worktreePath,
+        reason: 'worktree_not_owned',
+      });
+      assert.equal(existsSync(intent.worktreePath), true);
+    } finally {
+      if (intent?.worktreePath && existsSync(intent.worktreePath)) {
+        execFileSync('git', ['worktree', 'remove', '--force', intent.worktreePath], { cwd: repo, stdio: 'ignore' });
+      }
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('removes owned named worktrees without misclassifying their branch identity', async () => {
+    const repo = await initRepo();
+    let intent!: WorktreeCreateIntent;
+    try {
+      const planned = planWorktreeTarget({
+        cwd: repo,
+        scope: 'team',
+        mode: { enabled: true, detached: false, name: 'recovery-branch' },
+        teamName: 'recovery-team',
+        workerName: 'worker-1',
+      });
+      if (!planned.enabled) throw new Error('worktree plan not enabled');
+      const ensured = await ensureWorktreeWithProvisioningIntent(planned, async (candidate) => {
+        intent = candidate;
+      });
+      assert.equal(ensured.enabled, true);
+      if (!ensured.enabled) throw new Error('worktree not enabled');
+
+      const outcome = await recoverProvisionedWorktree({ ...intent, created: true }, 'named-recovery-test');
+      assert.equal(outcome.status, 'removed');
+      assert.equal(existsSync(ensured.worktreePath), false);
+      assert.equal(branchExists(repo, 'recovery-branch/worker-1'), false);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('worktree parser', () => {
   it('parses detached mode from --worktree', () => {
