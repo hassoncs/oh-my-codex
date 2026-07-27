@@ -735,11 +735,11 @@ async function readSessionDetailTransitionModes(
   }
 
   const deepInterviewPath = join(sessionStateDir, 'deep-interview-state.json');
-  if (!existsSync(deepInterviewPath)) return undefined;
+  if (!existsSync(deepInterviewPath)) return [];
 
   try {
     const state = JSON.parse(await readFile(deepInterviewPath, 'utf-8')) as Record<string, unknown>;
-    return isActiveDetailWorkflowState(state) ? ['deep-interview'] : undefined;
+    return isActiveDetailWorkflowState(state) ? ['deep-interview'] : [];
   } catch {
     return undefined;
   }
