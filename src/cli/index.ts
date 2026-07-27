@@ -4632,6 +4632,18 @@ interface PostLaunchModeCleanupDependencies {
   now?: () => Date;
 }
 
+async function readPostLaunchStateDirectory(
+  path: string,
+  readdir: typeof import("fs/promises").readdir,
+): Promise<string[]> {
+  try {
+    return await readdir(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+}
+
 type PostLaunchModeStateReadResult =
   | { kind: "ok"; state: Record<string, unknown> }
   | { kind: "missing" | "recoverable" }
@@ -4851,7 +4863,7 @@ async function cleanupPostLaunchModeStateFilesLocked(
     const targetSessionId = stateDir === sessionStateDir
       ? sessionId
       : undefined;
-    const files = scopedFiles?.get(stateDir) ?? await readdir(stateDir).catch(() => [] as string[]);
+    const files = scopedFiles?.get(stateDir) ?? await readPostLaunchStateDirectory(stateDir, readdir);
     const autopilotPath = join(stateDir, "autopilot-state.json");
     const autopilotPrecheck = files.includes("autopilot-state.json")
       ? await readPostLaunchModeStateFile(autopilotPath, dependencies)
@@ -5032,7 +5044,7 @@ export async function cleanupPostLaunchModeStateFiles(
           : [canonicalBaseStateDir];
         const scopedFiles = new Map<string, string[]>();
         for (const stateDir of stateDirs) {
-          const files = await readdir(stateDir).catch(() => [] as string[]);
+          const files = await readPostLaunchStateDirectory(stateDir, readdir);
           scopedFiles.set(stateDir, files);
           await Promise.all(files
             .filter((file) => file.endsWith("-state.json") && file !== "session.json")

@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir as fsReaddir, realpath, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -1168,6 +1168,44 @@ describe('state operations directory initialization', () => {
         (active.payload as { active_modes?: string[] }).active_modes?.includes('team'),
         true,
       );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('treats a missing all_sessions directory as empty', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-clear-all-missing-'));
+    try {
+      const missing = Object.assign(new Error('sessions missing'), { code: 'ENOENT' });
+      const response = await executeStateOperation('state_clear', {
+        workingDirectory: wd,
+        mode: 'team',
+        all_sessions: true,
+      }, {
+        readdir: (async () => { throw missing; }) as typeof fsReaddir,
+      });
+
+      assert.equal(response.isError, undefined);
+      assert.equal((response.payload as { cleared?: boolean }).cleared, true);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails all_sessions clear when directory inventory hits an I/O error', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-clear-all-eio-'));
+    try {
+      const failure = Object.assign(new Error('session inventory failed'), { code: 'EIO' });
+      const response = await executeStateOperation('state_clear', {
+        workingDirectory: wd,
+        mode: 'team',
+        all_sessions: true,
+      }, {
+        readdir: (async () => { throw failure; }) as typeof fsReaddir,
+      });
+
+      assert.equal(response.isError, true);
+      assert.match(String((response.payload as { error?: string }).error), /session inventory failed/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

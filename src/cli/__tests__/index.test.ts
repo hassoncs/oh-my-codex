@@ -972,6 +972,35 @@ describe("reapPostLaunchOrphanedMcpProcesses", () => {
 });
 
 describe("cleanupPostLaunchModeStateFiles", () => {
+  it("treats a missing session state directory as empty", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-postlaunch-mode-missing-"));
+    const missing = Object.assign(new Error("session state missing"), { code: "ENOENT" });
+
+    try {
+      await cleanupPostLaunchModeStateFiles(wd, "sess-postlaunch-missing", {
+        readdir: (async () => { throw missing; }) as typeof fsReaddir,
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("fails when session state inventory hits an I/O error", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-postlaunch-mode-eio-"));
+    const failure = Object.assign(new Error("postLaunch inventory failed"), { code: "EIO" });
+
+    try {
+      await assert.rejects(
+        () => cleanupPostLaunchModeStateFiles(wd, "sess-postlaunch-eio", {
+          readdir: (async () => { throw failure; }) as typeof fsReaddir,
+        }),
+        /postLaunch inventory failed/,
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it("repairs empty or truncated mode state files and still cancels valid siblings", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-postlaunch-mode-cleanup-"));
     const sessionId = "sess-postlaunch-cleanup";

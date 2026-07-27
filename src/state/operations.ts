@@ -133,6 +133,7 @@ export interface StateOperationResponse {
 const stateWriteQueues = new Map<string, Promise<void>>();
 
 export interface StateOperationDependencies {
+  readdir?: typeof readdir;
   workflowLock?: WorkflowStateLockDependencies;
   transaction?: WorkflowStateTransactionDependencies;
   onMutationCommitted?: (
@@ -1099,11 +1100,16 @@ export async function executeStateOperation(
           const lockedBaseStateDir = lockLease.baseStateDir;
           await initializeStateEnvironment(cwd, effectiveSessionId, rootSource, lockedBaseStateDir);
           const sessionRoot = join(lockedBaseStateDir, 'sessions');
-          const sessionDirs = allSessions
-            ? (await readdir(sessionRoot, { withFileTypes: true }).catch(() => []))
-              .filter((entry) => entry.isDirectory())
-              .map((entry) => join(sessionRoot, entry.name))
-            : [];
+          let sessionDirs: string[] = [];
+          if (allSessions) {
+            try {
+              sessionDirs = (await (dependencies.readdir ?? readdir)(sessionRoot, { withFileTypes: true }))
+                .filter((entry) => entry.isDirectory())
+                .map((entry) => join(sessionRoot, entry.name));
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+            }
+          }
           const scopedDirs = allSessions ? [lockedBaseStateDir, ...sessionDirs] : [];
           const paths = allSessions
             ? scopedDirs.map((dir) => join(dir, `${mode}-state.json`))
