@@ -1,5 +1,1 @@
-export {
-  writeAtomic,
-  setWriteAtomicRenameForTests,
-  resetWriteAtomicRenameForTests,
-} from '../state.js';
+export { writeAtomic } from '../state.js';

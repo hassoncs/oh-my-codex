@@ -15,10 +15,12 @@ import {
   readWorkerStatus,
   writeWorkerStatus,
   withScalingLock,
-  setWriteAtomicRenameForTests,
-  resetWriteAtomicRenameForTests,
   DEFAULT_MAX_WORKERS,
 } from '../state.js';
+import {
+  setWriteAtomicRenameForTests,
+  resetWriteAtomicRenameForTests,
+} from '../../testing/state-fault-injection.js';
 import { isScalingEnabled, scaleUp, scaleDown } from '../scaling.js';
 import { executeTeamApiOperation } from '../api-interop.js';
 import { resolveCanonicalTeamStateRoot } from '../state-root.js';

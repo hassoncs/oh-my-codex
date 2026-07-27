@@ -1,4 +1,4 @@
-import { appendFile, readFile, writeFile, mkdir, rm, rename, readdir } from 'fs/promises';
+import { appendFile, readFile, writeFile, mkdir, rm, readdir } from 'fs/promises';
 import { basename, join, dirname, resolve, sep } from 'path';
 import { existsSync } from 'fs';
 import { randomUUID } from 'crypto';
@@ -70,6 +70,7 @@ import type { TeamReminderIntent } from './reminder-intents.js';
 import type { WorktreeMode } from './worktree.js';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
 import { normalizeTeamTaskCoordinationPlanForStorage } from './coordination-protocol.js';
+import { renameAtomicForState } from './state-internal.js';
 import { startMode, updateModeState } from '../modes/base.js';
 import { reconcilePhaseStateForMonitor } from './phase-controller.js';
 import { getBaseStateDir, resolveStateScope } from '../mcp/state-paths.js';
@@ -434,15 +435,6 @@ function parseStateJson(raw: string, path: string): unknown {
   }
 }
 
-let renameForAtomicWrite: typeof rename = rename;
-
-export function setWriteAtomicRenameForTests(fn: typeof rename): void {
-  renameForAtomicWrite = fn;
-}
-
-export function resetWriteAtomicRenameForTests(): void {
-  renameForAtomicWrite = rename;
-}
 export type TaskReadiness =
   | { ready: true }
   | { ready: false; reason: 'blocked_dependency'; dependencies: string[] };
@@ -883,7 +875,7 @@ export async function writeAtomic(filePath: string, data: string): Promise<void>
   await writeFile(tmpPath, data, 'utf8');
 
   try {
-    await renameForAtomicWrite(tmpPath, filePath);
+    await renameAtomicForState(tmpPath, filePath);
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
     if (err.code === 'ENOENT' && existsSync(filePath)) {

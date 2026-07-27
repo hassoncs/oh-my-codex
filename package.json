@@ -6,7 +6,10 @@
   "main": "dist/index.js",
   "exports": {
     ".": "./dist/index.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./dist/testing/*": null,
+    "./dist/team/state-internal.js": null,
+    "./dist/*": "./dist/*"
   },
   "bin": {
     "omx": "dist/cli/omx.js"

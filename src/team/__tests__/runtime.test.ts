@@ -30,9 +30,11 @@ import {
   readTeamManifestV2,
   readTeamPhase,
   writeTeamManifestV2,
+} from '../state.js';
+import {
   setWriteAtomicRenameForTests,
   resetWriteAtomicRenameForTests,
-} from '../state.js';
+} from '../../testing/state-fault-injection.js';
 import {
   monitorTeam,
   shutdownTeam,

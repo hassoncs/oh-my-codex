@@ -37,8 +37,6 @@ import {
   updateTask,
   updateWorkerHeartbeat,
   writeAtomic,
-  setWriteAtomicRenameForTests,
-  resetWriteAtomicRenameForTests,
   writeWorkerInbox,
   enqueueDispatchRequest,
   listDispatchRequests,
@@ -54,6 +52,10 @@ import {
   writeTeamManifestV2,
   type TeamTaskV2,
 } from '../state.js';
+import {
+  setWriteAtomicRenameForTests,
+  resetWriteAtomicRenameForTests,
+} from '../../testing/state-fault-injection.js';
 import { normalizeDispatchRequest } from '../state/dispatch.js';
 import { readModeState, startMode, updateModeState } from '../../modes/base.js';
 import { listActiveSkills, readVisibleSkillActiveState } from '../../state/skill-active.js';

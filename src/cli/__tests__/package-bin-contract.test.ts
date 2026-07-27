@@ -12,7 +12,7 @@ import { OMX_FIRST_PARTY_MCP_PLUGIN_TARGETS } from '../../config/omx-first-party
 type PackageJson = {
   files?: string[];
   bin?: string | Record<string, string>;
-  exports?: Record<string, string>;
+  exports?: Record<string, string | null>;
   scripts?: Record<string, string>;
 };
 
@@ -42,6 +42,9 @@ describe('package bin contract', () => {
     assert.deepEqual(pkg.exports, {
       '.': './dist/index.js',
       './package.json': './package.json',
+      './dist/testing/*': null,
+      './dist/team/state-internal.js': null,
+      './dist/*': './dist/*',
     });
     assert.equal(pkg.scripts?.build, 'node src/scripts/build.js');
     assert.equal(pkg.scripts?.['build:explore'], 'cargo build -p omx-explore-harness');
@@ -354,7 +357,17 @@ describe('package bin contract', () => {
         'dist/state/workflow-state-transaction.js',
         'dist/state/operations.js',
         'dist/state/skill-active.js',
+      ]) {
+        const legacyImport = spawnSync(
+          process.execPath,
+          ['--input-type=module', '--eval', `await import('oh-my-codex/${subpath}')`],
+          { cwd: consumerRoot, encoding: 'utf-8' },
+        );
+        assert.equal(legacyImport.status, 0, legacyImport.stderr || legacyImport.stdout);
+      }
+      for (const subpath of [
         'dist/testing/state-fault-injection.js',
+        'dist/team/state-internal.js',
       ]) {
         const blockedImport = spawnSync(
           process.execPath,
@@ -367,6 +380,14 @@ describe('package bin contract', () => {
           /ERR_PACKAGE_PATH_NOT_EXPORTED/,
           `expected exports fence for ${subpath}`,
         );
+      }
+      for (const subpath of ['dist/team/state.js', 'dist/team/state/io.js']) {
+        const stateImport = spawnSync(
+          process.execPath,
+          ['--input-type=module', '--eval', `const state = await import('oh-my-codex/${subpath}'); if ('setWriteAtomicRenameForTests' in state || 'resetWriteAtomicRenameForTests' in state) process.exit(1)`],
+          { cwd: consumerRoot, encoding: 'utf-8' },
+        );
+        assert.equal(stateImport.status, 0, stateImport.stderr || stateImport.stdout);
       }
     } finally {
       rmSync(consumerRoot, { recursive: true, force: true });
