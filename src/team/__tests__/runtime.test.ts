@@ -6302,6 +6302,48 @@ exec "${realGit}" "$@"
     }
   });
 
+  it('shutdownTeam retains team state when ignored bytes preserve a provisioned worktree', async () => {
+    const repo = await initRepo();
+    const teamName = 'team-shutdown-ignored-worktree';
+    const workerPath = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-ignored-worktree-'));
+    try {
+      await writeFile(join(repo, '.gitignore'), 'ignored.bin\n', 'utf-8');
+      execFileSync('git', ['add', '.gitignore'], { cwd: repo, stdio: 'ignore' });
+      execFileSync('git', ['commit', '-m', 'ignore worker artifact'], { cwd: repo, stdio: 'ignore' });
+      const baseRef = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf-8' }).trim();
+      execFileSync('git', ['worktree', 'add', '--detach', workerPath, baseRef], { cwd: repo, stdio: 'ignore' });
+      await writeFile(join(workerPath, 'ignored.bin'), 'must survive shutdown\n', 'utf-8');
+
+      await initTeamState(teamName, 'shutdown ignored worktree recovery test', 'executor', 1, repo);
+      const config = await readTeamConfig(teamName, repo);
+      assert.ok(config);
+      if (!config) throw new Error('missing config');
+      config.workers[0] = {
+        ...config.workers[0],
+        worktree_repo_root: repo,
+        worktree_path: workerPath,
+        worktree_base_ref: baseRef,
+        worktree_detached: true,
+        worktree_created: true,
+      };
+      await saveTeamConfig(config, repo);
+
+      await assert.rejects(
+        () => shutdownTeam(teamName, repo, { force: true }),
+        new RegExp(`shutdown_worktree_preserved:${escapeRegExp(workerPath)}`),
+      );
+
+      assert.equal(existsSync(teamStateTestPath(repo, 'team', teamName)), true);
+      assert.equal((await readTeamConfig(teamName, repo))?.workers[0]?.worktree_path, workerPath);
+      assert.equal(await readFile(join(workerPath, 'ignored.bin'), 'utf-8'), 'must survive shutdown\n');
+    } finally {
+      if (existsSync(workerPath)) {
+        execFileSync('git', ['worktree', 'remove', '--force', workerPath], { cwd: repo, stdio: 'ignore' });
+      }
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
   it('shutdownTeam clean fast path ignores worker shutdown ack files', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-clean-fast-'));
     try {

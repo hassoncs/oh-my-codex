@@ -4355,28 +4355,38 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   }
 
   const provisionedWorktrees = collectProvisionedShutdownWorktrees(config, shutdownReports);
+  let worktreeRecoveryError: string | null = null;
   if (provisionedWorktrees.length > 0) {
     try {
-      await rollbackProvisionedWorktrees(provisionedWorktrees, {
+      const outcomes = await rollbackProvisionedWorktrees(provisionedWorktrees, {
         skipBranchDeletion: false,
       });
+      const preserved = outcomes.filter((outcome) => !outcome.removed);
+      if (preserved.length > 0) {
+        worktreeRecoveryError = `shutdown_worktree_preserved:${preserved.map((outcome) => outcome.worktreePath).join(',')}`;
+      }
     } catch (err) {
-      cleanupErrors.push(`rollbackProvisionedWorktrees: ${String(err)}`);
+      worktreeRecoveryError = `shutdown_worktree_cleanup_failed:${String(err)}`;
     }
   }
 
   // 7. Cleanup state
   let teamStateCleaned = false;
-  try {
-    await cleanupTeamState(sanitized, cwd);
-    teamStateCleaned = true;
-  } catch (err) {
-    cleanupErrors.push(`cleanupTeamState: ${String(err)}`);
+  if (!worktreeRecoveryError) {
+    try {
+      await cleanupTeamState(sanitized, cwd);
+      teamStateCleaned = true;
+    } catch (err) {
+      cleanupErrors.push(`cleanupTeamState: ${String(err)}`);
+    }
   }
   if (teamStateCleaned) {
     await syncTeamModeStateOnShutdown(sanitized, cwd, leaderSessionId);
   }
 
+  if (worktreeRecoveryError) {
+    cleanupErrors.unshift(worktreeRecoveryError);
+  }
   if (cleanupErrors.length > 0) {
     throw new Error(cleanupErrors.join(' | '));
   }
