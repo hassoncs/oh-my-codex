@@ -9,7 +9,8 @@
     "./package.json": "./package.json",
     "./dist/testing/*": null,
     "./dist/team/state-internal.js": null,
-    "./dist/*": "./dist/*"
+    "./dist/*": "./dist/*",
+    "./*": "./*"
   },
   "bin": {
     "omx": "dist/cli/omx.js"

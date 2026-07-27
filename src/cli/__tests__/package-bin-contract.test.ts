@@ -1,8 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { arch, platform, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { getInstallableNativeAgentNames } from '../../agents/policy.js';
 import { getSetupInstallableSkillNames } from '../../catalog/installable.js';
@@ -45,6 +46,7 @@ describe('package bin contract', () => {
       './dist/testing/*': null,
       './dist/team/state-internal.js': null,
       './dist/*': './dist/*',
+      './*': './*',
     });
     assert.equal(pkg.scripts?.build, 'node src/scripts/build.js');
     assert.equal(pkg.scripts?.['build:explore'], 'cargo build -p omx-explore-harness');
@@ -340,12 +342,33 @@ describe('package bin contract', () => {
     const consumerRoot = mkdtempSync(join(tmpdir(), 'omx-package-exports-'));
     try {
       const packagePath = join(consumerRoot, 'node_modules', 'oh-my-codex');
-      mkdirSync(join(consumerRoot, 'node_modules'), { recursive: true });
+      for (const file of results[0]?.files ?? []) {
+        const target = join(packagePath, file.path);
+        mkdirSync(dirname(target), { recursive: true });
+        copyFileSync(join(process.cwd(), file.path), target);
+      }
       symlinkSync(
-        process.cwd(),
-        packagePath,
+        join(process.cwd(), 'node_modules'),
+        join(packagePath, 'node_modules'),
         process.platform === 'win32' ? 'junction' : 'dir',
       );
+      const consumerRequire = createRequire(join(consumerRoot, 'consumer.cjs'));
+      for (const subpath of [
+        'Cargo.toml',
+        'Cargo.lock',
+        'crates/omx-explore/Cargo.toml',
+        'skills/ralph/SKILL.md',
+        'plugins/oh-my-codex/.codex-plugin/plugin.json',
+        'prompts/executor.md',
+        'templates/AGENTS.md',
+        'src/scripts/dist-lock.js',
+        '.agents/plugins/marketplace.json',
+      ]) {
+        assert.doesNotThrow(
+          () => consumerRequire.resolve(`oh-my-codex/${subpath}`),
+          `expected packed consumer to resolve legacy asset subpath: ${subpath}`,
+        );
+      }
       const rootImport = spawnSync(
         process.execPath,
         ['--input-type=module', '--eval', "await import('oh-my-codex')"],
