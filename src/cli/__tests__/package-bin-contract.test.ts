@@ -308,6 +308,10 @@ describe('package bin contract', () => {
     assert.ok(traceServerEntry, 'expected npm pack output to include dist/mcp/trace-server.js for omx mcp-serve');
     assert.ok(wikiServerEntry, 'expected npm pack output to include dist/mcp/wiki-server.js for omx mcp-serve');
     const packedFilePaths = new Set((results[0]?.files ?? []).map((file) => file.path));
+    const packedTestPaths = [...packedFilePaths].filter(
+      (path) => path.includes('/__tests__/') || /\.test\.(?:js|ts)$/.test(path),
+    );
+    assert.deepEqual(packedTestPaths, [], 'did not expect test artifacts in npm pack output');
     assert.equal(
       [...packedFilePaths].some((path) => path.startsWith('dist/testing/')),
       false,

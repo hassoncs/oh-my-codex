@@ -73,6 +73,8 @@
     "Cargo.toml",
     "Cargo.lock",
     "dist/",
+    "!dist/**/__tests__/",
+    "!dist/**/*.test.js",
     "!dist/testing/",
     "crates/",
     "!crates/**/.omx/**",
@@ -80,6 +82,8 @@
     "prompts/",
     "templates/",
     "src/scripts/",
+    "!src/scripts/**/__tests__/",
+    "!src/scripts/**/*.test.ts",
     "plugins/",
     ".agents/plugins/marketplace.json"
   ],
