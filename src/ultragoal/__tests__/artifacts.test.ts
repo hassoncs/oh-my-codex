@@ -20,6 +20,7 @@ import {
   type UltragoalPlan,
   type UltragoalSteeringProposal,
 } from '../artifacts.js';
+import { legacyRunIdForPlan, ultragoalRunDir } from '../registry.js';
 import { LEADER_CONDUCTOR_BLOCK, buildUnsupportedNativeSubagentGuidance } from '../../leader/contract.js';
 import { steeringFixtures, type SteeringFixtureProposal } from './steering-fixtures.js';
 
@@ -782,6 +783,57 @@ describe('ultragoal artifacts', () => {
       const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
       assert.equal(ledger.slice(0, historicalLedger.length), historicalLedger);
       assert.match(ledger.slice(historicalLedger.length), /"event":"plan_created"/);
+    });
+  });
+
+  it('archives a flat completed legacy registry with canonical status before starting a new namespace', async () => {
+    await withTempRepo(async (cwd) => {
+      const createdAt = '2026-05-04T10:00:00.000Z';
+      const completedAt = '2026-05-04T10:00:30.000Z';
+      const historicalLedger = '{"ts":"2026-05-04T10:00:15.000Z","event":"goal_started","goalId":"G001-complete","status":"in_progress"}\n';
+      const legacyPlan = {
+        version: 1,
+        createdAt,
+        updatedAt: completedAt,
+        briefPath: '.omx/ultragoal/brief.md',
+        goalsPath: '.omx/ultragoal/goals.json',
+        ledgerPath: '.omx/ultragoal/ledger.jsonl',
+        goals: [{
+          id: 'G001-complete',
+          title: 'Completed legacy goal',
+          objective: 'Preserve completed legacy work.',
+          status: 'completed',
+          attempt: 1,
+          createdAt,
+          updatedAt: completedAt,
+          completedAt,
+          evidence: 'legacy completion evidence',
+        }],
+      };
+      await mkdir(join(cwd, '.omx/ultragoal'), { recursive: true });
+      await writeFile(join(cwd, '.omx/ultragoal/brief.md'), 'legacy migration brief\n');
+      await writeFile(join(cwd, '.omx/ultragoal/goals.json'), `${JSON.stringify(legacyPlan, null, 2)}\n`);
+      await writeFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), historicalLedger);
+
+      const fresh = await createUltragoalPlan(cwd, {
+        brief: 'fresh namespace brief',
+        goals: [{ title: 'Fresh goal', objective: 'Start independent new work.' }],
+        newNamespace: true,
+        now: new Date('2026-05-04T10:03:00.000Z'),
+      });
+      const archivedDir = ultragoalRunDir(cwd, legacyRunIdForPlan(legacyPlan));
+      const archived = JSON.parse(await readFile(join(archivedDir, 'goals.json'), 'utf-8')) as UltragoalPlan;
+      const archivedLedger = await readFile(join(archivedDir, 'ledger.jsonl'), 'utf-8');
+
+      assert.equal(archived.goals[0]?.status, 'complete');
+      assert.equal(archived.goals[0]?.completedAt, completedAt);
+      assert.equal(archived.goals[0]?.evidence, 'legacy completion evidence');
+      assert.equal(archived.goals[0]?.createdAt, createdAt);
+      assert.equal(archived.goals[0]?.updatedAt, completedAt);
+      assert.equal(archivedLedger.slice(0, historicalLedger.length), historicalLedger);
+      assert.match(archivedLedger.slice(historicalLedger.length), /"event":"plan_migrated"/);
+      assert.equal(fresh.goals[0]?.status, 'pending');
+      assert.notEqual(fresh.runId, archived.runId);
     });
   });
 

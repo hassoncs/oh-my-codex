@@ -914,6 +914,14 @@ function normalizeLegacyGoalStatuses(plan: UltragoalPlan): number {
   }
   return migrated;
 }
+async function appendLegacyStatusMigration(cwd: string, migratedStatuses: number, now: string): Promise<void> {
+  if (migratedStatuses === 0) return;
+  await appendLedger(cwd, {
+    ts: now,
+    event: 'plan_migrated',
+    message: `Normalized ${migratedStatuses} legacy completed goal status${migratedStatuses === 1 ? '' : 'es'} to complete.`,
+  });
+}
 
 export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
   const path = ultragoalGoalsPath(cwd);
@@ -957,13 +965,7 @@ export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
     }
     parsed.updatedAt = now;
     await writePlan(cwd, parsed);
-    if (migratedStatuses > 0) {
-      await appendLedger(cwd, {
-        ts: now,
-        event: 'plan_migrated',
-        message: `Normalized ${migratedStatuses} legacy completed goal status${migratedStatuses === 1 ? '' : 'es'} to complete.`,
-      });
-    }
+    await appendLegacyStatusMigration(cwd, migratedStatuses, now);
     if (objectiveMigrated) {
       await appendLedger(cwd, {
         ts: now,
@@ -999,13 +1001,17 @@ async function writePlan(cwd: string, plan: UltragoalPlan): Promise<void> {
 }
 
 
-async function readExistingPlanForConflictCheck(cwd: string): Promise<UltragoalPlan | null> {
+interface ExistingUltragoalPlan {
+  plan: UltragoalPlan;
+  migratedStatuses: number;
+}
+
+async function readExistingPlanForConflictCheck(cwd: string): Promise<ExistingUltragoalPlan | null> {
   if (!existsSync(ultragoalGoalsPath(cwd))) return null;
   try {
     const plan = JSON.parse(await readFile(ultragoalGoalsPath(cwd), 'utf-8')) as UltragoalPlan;
     if (!Array.isArray(plan.goals)) return null;
-    normalizeLegacyGoalStatuses(plan);
-    return plan;
+    return { plan, migratedStatuses: normalizeLegacyGoalStatuses(plan) };
   } catch {
     return null;
   }
@@ -1020,9 +1026,10 @@ async function resolveRegistryDisposition(
   cwd: string,
   briefHash: string,
   options: CreateUltragoalOptions,
-): Promise<{ adopt: UltragoalPlan | null; archivedTo: string | null }> {
-  const existing = await readExistingPlanForConflictCheck(cwd);
-  if (!existing) return { adopt: null, archivedTo: null };
+): Promise<{ adopt: ExistingUltragoalPlan | null; archivedTo: string | null }> {
+  const loaded = await readExistingPlanForConflictCheck(cwd);
+  if (!loaded) return { adopt: null, archivedTo: null };
+  const { plan: existing, migratedStatuses } = loaded;
 
   const pointer = await readActiveRunPointer(cwd);
   const existingOrigin = existing.origin ?? pointer?.origin;
@@ -1039,9 +1046,9 @@ async function resolveRegistryDisposition(
   const archive = options.archiveExisting || options.force;
   if (!conflict && !options.newNamespace && !archive) {
     // Same brief, same worktree: this is a resume of the same run.
-    return { adopt: existing, archivedTo: null };
+    return { adopt: loaded, archivedTo: null };
   }
-  if (options.adoptExisting) return { adopt: existing, archivedTo: null };
+  if (options.adoptExisting) return { adopt: loaded, archivedTo: null };
   if (!archive && !options.newNamespace && conflict) {
     throw new UltragoalRegistryConflictError(conflict.message, {
       reason: conflict.reason,
@@ -1053,6 +1060,8 @@ async function resolveRegistryDisposition(
   // Creating a new run overwrites the flat files and truncates the flat ledger.
   // Archive first, on every path that reaches here: a pre-namespacing registry
   // has no run directory behind those files, so skipping this destroys it.
+  await writeJsonAtomic(ultragoalGoalsPath(cwd), existing);
+  await appendLegacyStatusMigration(cwd, migratedStatuses, iso(options.now));
   const archivedTo = await archiveFlatRegistry(cwd, existing.runId ?? legacyRunIdForPlan(existing));
   return { adopt: null, archivedTo };
 }
@@ -1062,7 +1071,7 @@ export async function createUltragoalPlan(cwd: string, options: CreateUltragoalO
   const briefHash = computeUltragoalBriefHash(options.brief);
   const disposition = await resolveRegistryDisposition(cwd, briefHash, options);
   if (disposition.adopt) {
-    const adopted = await adoptExistingPlanForRun(cwd, disposition.adopt, briefHash, options);
+    const adopted = await adoptExistingPlanForRun(cwd, disposition.adopt.plan, disposition.adopt.migratedStatuses, briefHash, options);
     return adopted;
   }
   const now = iso(options.now);
@@ -1129,10 +1138,11 @@ export async function adoptUltragoalRun(cwd: string, options: { now?: Date } = {
     if (!existsSync(ultragoalGoalsPath(cwd))) {
       throw new UltragoalError(`No ultragoal registry found at ${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS} to adopt.`);
     }
-    const existing = await readExistingPlanForConflictCheck(cwd);
-    if (!existing) {
+    const loaded = await readExistingPlanForConflictCheck(cwd);
+    if (!loaded) {
       throw new UltragoalError(`Invalid ultragoal registry at ${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS}.`);
     }
+    const { plan: existing, migratedStatuses } = loaded;
     const now = iso(options.now);
     const runId = existing.runId ?? legacyRunIdForPlan(existing);
     const origin: UltragoalRunOrigin = existing.origin ?? { worktreePath: cwd, createdAt: existing.createdAt };
@@ -1146,6 +1156,7 @@ export async function adoptUltragoalRun(cwd: string, options: { now?: Date } = {
       origin,
     });
     await writePlan(cwd, adopted);
+    await appendLegacyStatusMigration(cwd, migratedStatuses, now);
     await appendLedger(cwd, {
       ts: now,
       event: 'plan_created',
@@ -1163,6 +1174,7 @@ export async function adoptUltragoalRun(cwd: string, options: { now?: Date } = {
 async function adoptExistingPlanForRun(
   cwd: string,
   existing: UltragoalPlan,
+  migratedStatuses: number,
   briefHash: string,
   options: CreateUltragoalOptions,
 ): Promise<UltragoalPlan> {
@@ -1187,6 +1199,7 @@ async function adoptExistingPlanForRun(
     origin,
   });
   await writePlan(cwd, adopted);
+  await appendLegacyStatusMigration(cwd, migratedStatuses, now);
   await appendLedger(cwd, {
     ts: now,
     event: 'plan_created',
