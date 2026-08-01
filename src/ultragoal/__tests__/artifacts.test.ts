@@ -691,6 +691,99 @@ describe('ultragoal artifacts', () => {
       assert.match(ledger, /"event":"goal_added"/);
     });
   });
+  it('adopts flat legacy status registries without rewriting protected state or ledger history', async () => {
+    await withTempRepo(async (cwd) => {
+      const createdAt = '2026-05-04T10:00:00.000Z';
+      const activeStartedAt = '2026-05-04T10:01:00.000Z';
+      const activeUpdatedAt = '2026-05-04T10:02:00.000Z';
+      const historicalLedger = '{"ts":"2026-05-04T10:00:30.000Z","event":"goal_started","goalId":"G002-active","status":"in_progress"}\n';
+      await mkdir(join(cwd, '.omx/ultragoal'), { recursive: true });
+      await writeFile(join(cwd, '.omx/ultragoal/brief.md'), 'legacy migration brief\n');
+      await writeFile(join(cwd, '.omx/ultragoal/goals.json'), `${JSON.stringify({
+        version: 1,
+        createdAt,
+        updatedAt: activeUpdatedAt,
+        briefPath: '.omx/ultragoal/brief.md',
+        goalsPath: '.omx/ultragoal/goals.json',
+        ledgerPath: '.omx/ultragoal/ledger.jsonl',
+        activeGoalId: 'G002-active',
+        goals: [
+          {
+            id: 'G001-complete',
+            title: 'Completed goal',
+            objective: 'Preserve completed legacy work.',
+            status: 'completed',
+            attempt: 1,
+            createdAt,
+            updatedAt: createdAt,
+            completedAt: '2026-05-04T10:00:30.000Z',
+            evidence: 'legacy completion evidence',
+          },
+          {
+            id: 'G002-active',
+            title: 'Active goal',
+            objective: 'Resume active legacy work.',
+            status: 'in_progress',
+            attempt: 2,
+            createdAt,
+            updatedAt: activeUpdatedAt,
+            startedAt: activeStartedAt,
+            evidence: 'active evidence',
+          },
+          {
+            id: 'G003-pending',
+            title: 'Pending goal',
+            objective: 'Keep pending legacy work queued.',
+            status: 'pending',
+            attempt: 0,
+            createdAt,
+            updatedAt: createdAt,
+          },
+        ],
+      }, null, 2)}\n`);
+      await writeFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), historicalLedger);
+
+      const adopted = await createUltragoalPlan(cwd, {
+        brief: 'legacy migration brief',
+        adoptExisting: true,
+        now: new Date('2026-05-04T10:03:00.000Z'),
+      });
+      const completed = adopted.goals.find((goal) => goal.id === 'G001-complete');
+      const active = adopted.goals.find((goal) => goal.id === 'G002-active');
+      const pending = adopted.goals.find((goal) => goal.id === 'G003-pending');
+
+      assert.equal(completed?.status, 'complete');
+      assert.equal(completed?.completedAt, '2026-05-04T10:00:30.000Z');
+      assert.equal(completed?.evidence, 'legacy completion evidence');
+      assert.equal(completed?.updatedAt, createdAt);
+      assert.equal(completed?.attempt, 1);
+      assert.equal(active?.attempt, 2);
+      assert.equal(pending?.attempt, 0);
+      assert.equal(active?.status, 'in_progress');
+      assert.equal(active?.startedAt, activeStartedAt);
+      assert.equal(active?.updatedAt, activeUpdatedAt);
+      assert.equal(active?.evidence, 'active evidence');
+      assert.equal(pending?.status, 'pending');
+      assert.equal(adopted.activeGoalId, 'G002-active');
+      assert.match(adopted.runId ?? '', /^legacy-/);
+
+      const summary = summarizeUltragoalPlan(adopted);
+      assert.equal(summary.total, 3);
+      assert.equal(summary.complete, 1);
+      assert.equal(summary.activeGoalId, 'G002-active');
+      assert.equal(isUltragoalDone(adopted), false);
+
+      const resumed = await startNextUltragoal(cwd, { now: new Date('2026-05-04T10:04:00.000Z') });
+      assert.equal(resumed.goal?.id, 'G002-active');
+      assert.equal(resumed.resumed, true);
+      assert.equal(resumed.done, false);
+      assert.equal(isFinalRunCompletionCandidate(resumed.plan, resumed.goal!), false);
+
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal(ledger.slice(0, historicalLedger.length), historicalLedger);
+      assert.match(ledger.slice(historicalLedger.length), /"event":"plan_created"/);
+    });
+  });
 
   it('migrates legacy enumerated aggregate objectives to the pointer contract', async () => {
     await withTempRepo(async (cwd) => {

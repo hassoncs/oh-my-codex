@@ -216,6 +216,7 @@ export interface UltragoalLedgerEntry {
   ts: string;
   event:
     | 'plan_created'
+    | 'plan_migrated'
     | 'goal_started'
     | 'goal_resumed'
     | 'goal_completed'
@@ -904,6 +905,16 @@ async function appendLedger(cwd: string, entry: UltragoalLedgerEntry): Promise<v
   await appendFile(join(runDir, ULTRAGOAL_LEDGER), line);
 }
 
+function normalizeLegacyGoalStatuses(plan: UltragoalPlan): number {
+  let migrated = 0;
+  for (const goal of plan.goals) {
+    if ((goal.status as string) !== 'completed') continue;
+    goal.status = 'complete';
+    migrated += 1;
+  }
+  return migrated;
+}
+
 export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
   const path = ultragoalGoalsPath(cwd);
   let raw: string;
@@ -935,20 +946,33 @@ export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
       },
     );
   }
-  if (codexGoalMode(parsed) === 'aggregate' && isLegacyEnumeratedAggregateObjective(parsed.codexObjective)) {
+  const migratedStatuses = normalizeLegacyGoalStatuses(parsed);
+  const objectiveMigrated = codexGoalMode(parsed) === 'aggregate' && isLegacyEnumeratedAggregateObjective(parsed.codexObjective);
+  if (migratedStatuses > 0 || objectiveMigrated) {
     const previousObjective = parsed.codexObjective;
     const now = iso();
-    parsed.codexObjective = aggregateCodexObjective(parsed.goals);
-    parsed.codexObjectiveAliases = Array.from(new Set([...(parsed.codexObjectiveAliases ?? []), previousObjective].filter((value): value is string => typeof value === 'string' && value.length > 0)));
+    if (objectiveMigrated) {
+      parsed.codexObjective = aggregateCodexObjective(parsed.goals);
+      parsed.codexObjectiveAliases = Array.from(new Set([...(parsed.codexObjectiveAliases ?? []), previousObjective].filter((value): value is string => typeof value === 'string' && value.length > 0)));
+    }
     parsed.updatedAt = now;
     await writePlan(cwd, parsed);
-    await appendLedger(cwd, {
-      ts: now,
-      event: 'aggregate_objective_migrated',
-      message: 'Migrated legacy enumerated aggregate Codex objective to the stable pointer objective.',
-      before: { codexObjective: previousObjective },
-      after: { codexObjective: parsed.codexObjective },
-    });
+    if (migratedStatuses > 0) {
+      await appendLedger(cwd, {
+        ts: now,
+        event: 'plan_migrated',
+        message: `Normalized ${migratedStatuses} legacy completed goal status${migratedStatuses === 1 ? '' : 'es'} to complete.`,
+      });
+    }
+    if (objectiveMigrated) {
+      await appendLedger(cwd, {
+        ts: now,
+        event: 'aggregate_objective_migrated',
+        message: 'Migrated legacy enumerated aggregate Codex objective to the stable pointer objective.',
+        before: { codexObjective: previousObjective },
+        after: { codexObjective: parsed.codexObjective },
+      });
+    }
   }
   return parsed;
 }
@@ -974,10 +998,14 @@ async function writePlan(cwd: string, plan: UltragoalPlan): Promise<void> {
   await writeJsonAtomic(ultragoalGoalsPath(cwd), plan);
 }
 
+
 async function readExistingPlanForConflictCheck(cwd: string): Promise<UltragoalPlan | null> {
   if (!existsSync(ultragoalGoalsPath(cwd))) return null;
   try {
-    return JSON.parse(await readFile(ultragoalGoalsPath(cwd), 'utf-8')) as UltragoalPlan;
+    const plan = JSON.parse(await readFile(ultragoalGoalsPath(cwd), 'utf-8')) as UltragoalPlan;
+    if (!Array.isArray(plan.goals)) return null;
+    normalizeLegacyGoalStatuses(plan);
+    return plan;
   } catch {
     return null;
   }
@@ -1098,9 +1126,12 @@ export async function createUltragoalPlan(cwd: string, options: CreateUltragoalO
  */
 export async function adoptUltragoalRun(cwd: string, options: { now?: Date } = {}): Promise<UltragoalPlan> {
   return withUltragoalMutationLock(cwd, async () => {
+    if (!existsSync(ultragoalGoalsPath(cwd))) {
+      throw new UltragoalError(`No ultragoal registry found at ${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS} to adopt.`);
+    }
     const existing = await readExistingPlanForConflictCheck(cwd);
     if (!existing) {
-      throw new UltragoalError(`No ultragoal registry found at ${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS} to adopt.`);
+      throw new UltragoalError(`Invalid ultragoal registry at ${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS}.`);
     }
     const now = iso(options.now);
     const runId = existing.runId ?? legacyRunIdForPlan(existing);
