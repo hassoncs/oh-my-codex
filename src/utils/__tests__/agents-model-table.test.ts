@@ -96,7 +96,7 @@ describe('agents model table', () => {
     assert.match(table, /\| `architect` \| `gpt-5\.6-sol` \| xhigh \| System design, boundaries, interfaces, long-horizon tradeoffs \(frontier-orchestrator, frontier\) \|/);
     assert.doesNotMatch(table, /\| `security-reviewer` \|/);
     assert.doesNotMatch(table, /\| `build-fixer` \|/);
-    assert.match(table, /\| `code-reviewer` \| `gpt-frontier` \| high \| Comprehensive review across all concerns \(frontier-orchestrator, frontier\) \|/);
+    assert.match(table, /\| `code-reviewer` \| `gpt-frontier` \| xhigh \| Comprehensive review across all concerns \(frontier-orchestrator, frontier\) \|/);
     assert.match(table, /\| `critic` \| `gpt-frontier` \| high \| Plan\/design critical challenge and review \(frontier-orchestrator, frontier\) \|/);
     assert.match(table, /\| `writer` \| `gpt-standard` \| high \| Documentation, migration notes, user guidance \(fast-lane, standard\) \|/);
     assert.match(table, /\| `executor` \| `gpt-frontier` \| medium \| Code implementation, refactoring, feature work \(deep-worker, standard\) \|/);

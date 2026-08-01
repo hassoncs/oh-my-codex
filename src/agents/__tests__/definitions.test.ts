@@ -114,4 +114,10 @@ describe('agents/definitions', () => {
     assert.equal(AGENT_DEFINITIONS.critic.reasoningEffort, 'high');
     assert.equal(AGENT_DEFINITIONS.critic.modelClass, 'frontier');
   });
+
+  it('uses the launch-compatible xhigh effort for the code-reviewer role', () => {
+    assert.equal(AGENT_DEFINITIONS['code-reviewer'].reasoningEffort, 'xhigh');
+    assert.equal(AGENT_DEFINITIONS['code-reviewer'].modelClass, 'frontier');
+    assert.equal(AGENT_DEFINITIONS['code-reviewer'].tools, 'read-only');
+  });
 });

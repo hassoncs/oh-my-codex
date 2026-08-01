@@ -170,7 +170,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
   'code-reviewer': {
     name: 'code-reviewer',
     description: 'Comprehensive review across all concerns',
-    reasoningEffort: 'high',
+    reasoningEffort: 'xhigh',
     posture: 'frontier-orchestrator',
     modelClass: 'frontier',
     routingRole: 'leader',

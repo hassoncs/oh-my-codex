@@ -4,6 +4,9 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Native code-reviewer launch compatibility** - generated `code-reviewer` agent configs use `xhigh` reasoning so the role can launch when the resolved frontier model is `gpt-5.6-luna`.
 
 ## [0.20.1] - 2026-07-12
 

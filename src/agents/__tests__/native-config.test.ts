@@ -230,6 +230,17 @@ describe("agents/native-config", () => {
     }
   });
 
+  it("generates a launch-compatible Luna code-reviewer config", () => {
+    const toml = generateAgentToml(
+      AGENT_DEFINITIONS["code-reviewer"],
+      "code-reviewer prompt",
+      { configTomlContent: 'model = "gpt-5.6-luna"\n' },
+    );
+
+    assert.match(toml, /model = "gpt-5\.6-luna"/);
+    assert.match(toml, /model_reasoning_effort = "xhigh"/);
+  });
+
   it("applies exact-model Terra guidance only for resolved gpt-5.6-terra standard roles", () => {
     const agent: AgentDefinition = {
       name: "debugger",
