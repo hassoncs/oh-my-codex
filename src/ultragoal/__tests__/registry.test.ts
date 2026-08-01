@@ -258,4 +258,76 @@ describe('ultragoal registries inherited by CoW clones', () => {
       assert.ok(hud, 'adopted registry is visible to the HUD again');
     });
   });
+
+  it('adopt-run normalizes a namespaced legacy run and restores byte-identical ledger projections', async () => {
+    await withTempRepo(async (cwd) => {
+      const runId = 'legacy-b4108a96';
+      const createdAt = '2026-07-29T12:21:00.000Z';
+      const dir = join(cwd, '.omx', 'ultragoal');
+      const runDir = ultragoalRunDir(cwd, runId);
+      const plan: UltragoalPlan = {
+        version: 1,
+        createdAt,
+        updatedAt: createdAt,
+        runId,
+        briefHash: 'fca15e24895b9216',
+        origin: { worktreePath: '/prior/tree', createdAt },
+        briefPath: '.omx/ultragoal/brief.md',
+        goalsPath: '.omx/ultragoal/goals.json',
+        ledgerPath: '.omx/ultragoal/ledger.jsonl',
+        codexGoalMode: 'aggregate',
+        activeGoalId: 'G002-active',
+        goals: [
+          {
+            id: 'G001-complete',
+            title: 'Complete',
+            objective: 'Preserve completed work.',
+            status: 'completed' as never,
+            attempt: 1,
+            createdAt,
+            updatedAt: createdAt,
+            completedAt: createdAt,
+          },
+          {
+            id: 'G002-active',
+            title: 'Active',
+            objective: 'Continue active work.',
+            status: 'in_progress',
+            attempt: 1,
+            createdAt,
+            updatedAt: createdAt,
+            startedAt: createdAt,
+          },
+        ],
+      };
+      const historical = `${JSON.stringify({ ts: createdAt, event: 'goal_completed', goalId: 'G001-complete', status: 'completed' })}\n`;
+      const projected = `${historical}${JSON.stringify({ ts: createdAt, event: 'plan_created', message: 'legacy run adopted' })}\n`;
+
+      await mkdir(runDir, { recursive: true });
+      await writeFile(join(dir, 'goals.json'), `${JSON.stringify(plan, null, 2)}\n`);
+      await writeFile(join(runDir, 'goals.json'), `${JSON.stringify(plan, null, 2)}\n`);
+      await writeFile(join(dir, 'ledger.jsonl'), projected);
+      await writeFile(join(runDir, 'ledger.jsonl'), projected.slice(historical.length));
+      await writeFile(join(dir, 'active-run.json'), `${JSON.stringify({
+        version: 1,
+        runId,
+        briefHash: plan.briefHash,
+        updatedAt: createdAt,
+        origin: plan.origin,
+      }, null, 2)}\n`);
+
+      const adopted = await adoptUltragoalRun(cwd, { now: new Date('2026-08-01T13:07:45.705Z') });
+      const flatGoals = await readFile(join(dir, 'goals.json'), 'utf-8');
+      const runGoals = await readFile(join(runDir, 'goals.json'), 'utf-8');
+      const flatLedger = await readFile(join(dir, 'ledger.jsonl'), 'utf-8');
+      const runLedger = await readFile(join(runDir, 'ledger.jsonl'), 'utf-8');
+
+      assert.equal(adopted.goals[0]?.status, 'complete');
+      assert.equal(flatGoals, runGoals);
+      assert.equal(flatLedger, runLedger);
+      assert.ok(flatLedger.startsWith(projected));
+      assert.match(flatLedger, /"event":"plan_migrated"/);
+      assert.match(flatLedger, /"event":"plan_created"/);
+    });
+  });
 });

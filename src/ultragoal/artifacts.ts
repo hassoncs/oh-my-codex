@@ -897,12 +897,32 @@ async function withUltragoalMutationLock<T>(cwd: string, operation: () => Promis
 async function appendLedger(cwd: string, entry: UltragoalLedgerEntry): Promise<void> {
   await mkdir(ultragoalDir(cwd), { recursive: true });
   const line = `${JSON.stringify(entry)}\n`;
-  await appendFile(ultragoalLedgerPath(cwd), line);
   const pointer = await readActiveRunPointer(cwd);
-  if (!pointer) return;
+  if (!pointer) {
+    await appendFile(ultragoalLedgerPath(cwd), line);
+    return;
+  }
   const runDir = ultragoalRunDir(cwd, pointer.runId);
   await mkdir(runDir, { recursive: true });
-  await appendFile(join(runDir, ULTRAGOAL_LEDGER), line);
+  const flatPath = ultragoalLedgerPath(cwd);
+  const runPath = join(runDir, ULTRAGOAL_LEDGER);
+  const flat = existsSync(flatPath) ? await readFile(flatPath, 'utf-8') : '';
+  const run = existsSync(runPath) ? await readFile(runPath, 'utf-8') : '';
+  const base = flat === run
+    ? flat
+    : flat.startsWith(run) || flat.endsWith(run)
+      ? flat
+      : run.startsWith(flat) || run.endsWith(flat)
+        ? run
+        : null;
+  if (base === null) {
+    throw new UltragoalError(
+      `Refusing to append divergent ultragoal ledgers at ${repoRelative(cwd, flatPath)} and ${repoRelative(cwd, runPath)}.`,
+    );
+  }
+  const next = `${base}${line}`;
+  await writeJsonlAtomic(runPath, next);
+  await writeJsonlAtomic(flatPath, next);
 }
 
 function normalizeLegacyGoalStatuses(plan: UltragoalPlan): number {
@@ -982,6 +1002,12 @@ export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
   const tmpPath = `${path}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`);
+  await rename(tmpPath, path);
+}
+
+async function writeJsonlAtomic(path: string, value: string): Promise<void> {
+  const tmpPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tmpPath, value);
   await rename(tmpPath, path);
 }
 
