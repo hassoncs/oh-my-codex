@@ -1,11 +1,13 @@
+import { createHash } from 'node:crypto';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
+  addUltragoalGoal,
   adoptUltragoalRun,
   createUltragoalPlan,
   readUltragoalPlan,
@@ -173,6 +175,31 @@ describe('ultragoal run namespacing', () => {
     });
   });
 
+  it('--new-namespace preserves a same-second run with the same brief', async () => {
+    await withTempRepo(async (cwd) => {
+      const now = new Date('2026-08-01T13:38:12.000Z');
+      const first = await createUltragoalPlan(cwd, { brief: BRIEF_A, now });
+      const firstDir = ultragoalRunDir(cwd, first.runId as string);
+      const firstGoals = await readFile(join(firstDir, 'goals.json'), 'utf-8');
+      const firstLedger = await readFile(join(firstDir, 'ledger.jsonl'), 'utf-8');
+
+      const second = await createUltragoalPlan(cwd, {
+        brief: BRIEF_A,
+        goals: [{ title: 'Replacement', objective: 'Start a distinct replacement run.' }],
+        newNamespace: true,
+        now,
+      });
+
+      assert.equal(second.runId, `${first.runId}-2`);
+      assert.equal(await readFile(join(firstDir, 'goals.json'), 'utf-8'), firstGoals);
+      assert.equal(await readFile(join(firstDir, 'ledger.jsonl'), 'utf-8'), firstLedger);
+      assert.equal(
+        await readFile(join(cwd, '.omx', 'ultragoal', 'ledger.jsonl'), 'utf-8'),
+        await readFile(join(ultragoalRunDir(cwd, second.runId as string), 'ledger.jsonl'), 'utf-8'),
+      );
+    });
+  });
+
   it('--adopt-existing continues the existing registry as this run', async () => {
     await withTempRepo(async (cwd) => {
       await seedStaleFlatRegistry(cwd);
@@ -308,6 +335,8 @@ describe('ultragoal registries inherited by CoW clones', () => {
       await writeFile(join(runDir, 'goals.json'), `${JSON.stringify(plan, null, 2)}\n`);
       await writeFile(join(dir, 'ledger.jsonl'), projected);
       await writeFile(join(runDir, 'ledger.jsonl'), projected.slice(historical.length));
+      await chmod(join(dir, 'ledger.jsonl'), 0o600);
+      await chmod(join(runDir, 'ledger.jsonl'), 0o600);
       await writeFile(join(dir, 'active-run.json'), `${JSON.stringify({
         version: 1,
         runId,
@@ -325,9 +354,87 @@ describe('ultragoal registries inherited by CoW clones', () => {
       assert.equal(adopted.goals[0]?.status, 'complete');
       assert.equal(flatGoals, runGoals);
       assert.equal(flatLedger, runLedger);
+      assert.equal((await stat(join(dir, 'ledger.jsonl'))).mode & 0o777, 0o600);
+      assert.equal((await stat(join(runDir, 'ledger.jsonl'))).mode & 0o777, 0o600);
       assert.ok(flatLedger.startsWith(projected));
       assert.match(flatLedger, /"event":"plan_migrated"/);
       assert.match(flatLedger, /"event":"plan_created"/);
+    });
+  });
+
+  it('recovers an interrupted ledger append without duplicating or losing the event', async () => {
+    await withTempRepo(async (cwd) => {
+      const plan = await createUltragoalPlan(cwd, { brief: BRIEF_A });
+      const dir = join(cwd, '.omx', 'ultragoal');
+      const runDir = ultragoalRunDir(cwd, plan.runId as string);
+      const flatPath = join(dir, 'ledger.jsonl');
+      const runPath = join(runDir, 'ledger.jsonl');
+      const base = await readFile(runPath, 'utf-8');
+      assert.equal(await readFile(flatPath, 'utf-8'), base);
+      const line = `${JSON.stringify({ ts: '2026-08-01T13:30:00.000Z', event: 'plan_migrated', message: 'recover exactly once' })}\n`;
+      const digest = (value: string) => createHash('sha256').update(value, 'utf-8').digest('hex');
+
+      await writeFile(runPath, `${base}${line}`);
+      await writeFile(join(dir, '.ledger-transaction.json'), `${JSON.stringify({
+        version: 1,
+        runId: plan.runId,
+        line,
+        baseSha256: digest(base),
+        nextSha256: digest(`${base}${line}`),
+      }, null, 2)}\n`, { mode: 0o600 });
+
+      await readUltragoalPlan(cwd);
+
+      const flat = await readFile(flatPath, 'utf-8');
+      const run = await readFile(runPath, 'utf-8');
+      assert.equal(flat, run);
+      assert.equal(flat.split('recover exactly once').length - 1, 1);
+      assert.equal(existsSync(join(dir, '.ledger-transaction.json')), false);
+    });
+  });
+
+  it('serializes concurrent mutations without losing ledger entries', async () => {
+    await withTempRepo(async (cwd) => {
+      const plan = await createUltragoalPlan(cwd, { brief: BRIEF_A });
+
+      await Promise.all([
+        addUltragoalGoal(cwd, { title: 'Concurrent A', objective: 'Preserve mutation A.' }),
+        addUltragoalGoal(cwd, { title: 'Concurrent B', objective: 'Preserve mutation B.' }),
+      ]);
+
+      const reread = await readUltragoalPlan(cwd);
+      assert.ok(reread.goals.some((goal) => goal.title === 'Concurrent A'));
+      assert.ok(reread.goals.some((goal) => goal.title === 'Concurrent B'));
+      const runDir = ultragoalRunDir(cwd, plan.runId as string);
+      const flat = await readFile(join(cwd, '.omx', 'ultragoal', 'ledger.jsonl'), 'utf-8');
+      const run = await readFile(join(runDir, 'ledger.jsonl'), 'utf-8');
+      assert.equal(flat, run);
+      assert.equal(flat.match(/"event":"goal_added"/g)?.length, 2);
+    });
+  });
+
+  it('fails closed before adoption when a containing ledger is malformed', async () => {
+    await withTempRepo(async (cwd) => {
+      const plan = await createUltragoalPlan(cwd, { brief: BRIEF_A });
+      const dir = join(cwd, '.omx', 'ultragoal');
+      const runDir = ultragoalRunDir(cwd, plan.runId as string);
+      const goalsPath = join(dir, 'goals.json');
+      const runGoalsPath = join(runDir, 'goals.json');
+      const stored = JSON.parse(await readFile(goalsPath, 'utf-8')) as UltragoalPlan;
+      stored.goals[0]!.status = 'completed' as never;
+      const goalsBefore = `${JSON.stringify(stored, null, 2)}\n`;
+      await writeFile(goalsPath, goalsBefore);
+      await writeFile(runGoalsPath, goalsBefore);
+      const runLedger = await readFile(join(runDir, 'ledger.jsonl'), 'utf-8');
+      await writeFile(join(dir, 'ledger.jsonl'), `${runLedger}{"ts":`);
+
+      await assert.rejects(
+        () => adoptUltragoalRun(cwd),
+        /Invalid ultragoal ledger/,
+      );
+
+      assert.equal(await readFile(goalsPath, 'utf-8'), goalsBefore);
+      assert.equal(await readFile(runGoalsPath, 'utf-8'), goalsBefore);
     });
   });
 });

@@ -29,9 +29,25 @@ projection** so every existing reader (HUD, shutdown gates, `omx state`) keeps
 working unchanged; they are written by the same writer, in the same operation,
 never independently.
 
+Ledger appends use a private `.ledger-transaction.json` journal. The journal
+records the active run, exact appended line, and before/after digests before
+either ledger changes. The canonical run ledger appends first, then the flat
+projection; every governed read or mutation recovers an interrupted append
+idempotently before continuing. Recovery accepts only the recorded before or
+after digest and valid newline-terminated JSONL, so it cannot guess through
+unrelated or malformed divergence. The mutation lock serializes migrations and
+normal mutations.
+
+Explicit legacy adoption may repair the earlier bug shape where the flat ledger
+contains valid historical lines followed by the shorter namespaced ledger. It
+promotes that lossless superset into the canonical run once, preserves existing
+file permissions, then resumes journaled appends with byte-identical ledgers.
+
 `runId` is `run-<UTC timestamp>-<first 8 of the brief hash>`. The brief hash is a
 SHA-256 of the whitespace-normalized brief, so the same brief re-entering the
 same tree resumes its own run instead of creating a second one.
+An explicitly fresh namespace created in the same second uses the first free
+numeric suffix (`-2`, `-3`, ...) so it cannot overwrite the archived run.
 
 ## Identity and refusal
 

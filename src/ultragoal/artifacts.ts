@@ -1,5 +1,6 @@
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { appendFile, mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import {
   formatCodexGoalReconciliation,
@@ -43,6 +44,7 @@ export {
   ultragoalDir,
 };
 const ULTRAGOAL_MUTATION_LOCK = '.mutation.lock';
+const ULTRAGOAL_LEDGER_TRANSACTION = '.ledger-transaction.json';
 
 export type UltragoalStatus = 'pending' | 'in_progress' | 'complete' | 'failed' | 'review_blocked' | 'needs_user_decision';
 export type UltragoalCodexGoalMode = 'aggregate' | 'per_story';
@@ -894,6 +896,99 @@ async function withUltragoalMutationLock<T>(cwd: string, operation: () => Promis
   }
 }
 
+interface UltragoalLedgerTransaction {
+  version: 1;
+  runId: string;
+  line: string;
+  baseSha256: string;
+  nextSha256: string;
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value, 'utf-8').digest('hex');
+}
+
+function assertValidLedgerJsonl(value: string, path: string): void {
+  if (value && !value.endsWith('\n')) {
+    throw new UltragoalError(`Invalid ultragoal ledger at ${path}: missing final newline.`);
+  }
+  for (const line of value.split('\n')) {
+    if (!line) continue;
+    try {
+      const parsed = JSON.parse(line);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('entry is not an object');
+    } catch {
+      throw new UltragoalError(`Invalid ultragoal ledger JSONL at ${path}.`);
+    }
+  }
+}
+
+function ledgerTransactionPath(cwd: string): string {
+  return join(ultragoalDir(cwd), ULTRAGOAL_LEDGER_TRANSACTION);
+}
+
+async function readLedger(path: string): Promise<string> {
+  return existsSync(path) ? readFile(path, 'utf-8') : '';
+}
+
+async function recoverLedgerTransaction(cwd: string): Promise<void> {
+  const path = ledgerTransactionPath(cwd);
+  if (!existsSync(path)) return;
+  const transaction = JSON.parse(await readFile(path, 'utf-8')) as UltragoalLedgerTransaction;
+  const pointer = await readActiveRunPointer(cwd);
+  if (
+    transaction.version !== 1
+    || !transaction.runId
+    || !transaction.line.endsWith('\n')
+    || pointer?.runId !== transaction.runId
+  ) {
+    throw new UltragoalError(`Invalid ultragoal ledger transaction at ${repoRelative(cwd, path)}.`);
+  }
+  assertValidLedgerJsonl(transaction.line, repoRelative(cwd, path));
+  const runPath = join(ultragoalRunDir(cwd, transaction.runId), ULTRAGOAL_LEDGER);
+  const flatPath = ultragoalLedgerPath(cwd);
+  for (const target of [runPath, flatPath]) {
+    const current = await readLedger(target);
+    assertValidLedgerJsonl(current, repoRelative(cwd, target));
+    const currentSha = sha256(current);
+    if (currentSha === transaction.nextSha256) continue;
+    if (currentSha !== transaction.baseSha256) {
+      throw new UltragoalError(`Refusing to recover divergent ultragoal ledger transaction at ${repoRelative(cwd, target)}.`);
+    }
+    await appendFile(target, transaction.line);
+  }
+  const run = await readLedger(runPath);
+  const flat = await readLedger(flatPath);
+  if (run !== flat || sha256(run) !== transaction.nextSha256) {
+    throw new UltragoalError(`Ultragoal ledger transaction did not converge ${repoRelative(cwd, runPath)} and ${repoRelative(cwd, flatPath)}.`);
+  }
+  await rm(path, { force: true });
+}
+
+async function reconcileLegacyLedgerProjection(cwd: string, runId: string): Promise<void> {
+  await recoverLedgerTransaction(cwd);
+  const runDir = ultragoalRunDir(cwd, runId);
+  await mkdir(runDir, { recursive: true });
+  const runPath = join(runDir, ULTRAGOAL_LEDGER);
+  const flatPath = ultragoalLedgerPath(cwd);
+  const run = await readLedger(runPath);
+  const flat = await readLedger(flatPath);
+  assertValidLedgerJsonl(run, repoRelative(cwd, runPath));
+  assertValidLedgerJsonl(flat, repoRelative(cwd, flatPath));
+  if (run === flat) return;
+  if (!run || flat.startsWith(run) || flat.endsWith(run)) {
+    await writeJsonlAtomic(runPath, flat);
+    return;
+  }
+  if (!flat || run.startsWith(flat) || run.endsWith(flat)) {
+    await writeJsonlAtomic(flatPath, run);
+    return;
+  }
+  throw new UltragoalError(
+    `Refusing to reconcile unrelated ultragoal ledgers at ${repoRelative(cwd, flatPath)} and ${repoRelative(cwd, runPath)}.`,
+  );
+}
+
 async function appendLedger(cwd: string, entry: UltragoalLedgerEntry): Promise<void> {
   await mkdir(ultragoalDir(cwd), { recursive: true });
   const line = `${JSON.stringify(entry)}\n`;
@@ -902,27 +997,31 @@ async function appendLedger(cwd: string, entry: UltragoalLedgerEntry): Promise<v
     await appendFile(ultragoalLedgerPath(cwd), line);
     return;
   }
+  await recoverLedgerTransaction(cwd);
   const runDir = ultragoalRunDir(cwd, pointer.runId);
   await mkdir(runDir, { recursive: true });
   const flatPath = ultragoalLedgerPath(cwd);
   const runPath = join(runDir, ULTRAGOAL_LEDGER);
-  const flat = existsSync(flatPath) ? await readFile(flatPath, 'utf-8') : '';
-  const run = existsSync(runPath) ? await readFile(runPath, 'utf-8') : '';
-  const base = flat === run
-    ? flat
-    : flat.startsWith(run) || flat.endsWith(run)
-      ? flat
-      : run.startsWith(flat) || run.endsWith(flat)
-        ? run
-        : null;
-  if (base === null) {
+  const flat = await readLedger(flatPath);
+  const run = await readLedger(runPath);
+  assertValidLedgerJsonl(flat, repoRelative(cwd, flatPath));
+  assertValidLedgerJsonl(run, repoRelative(cwd, runPath));
+  if (flat !== run) {
     throw new UltragoalError(
       `Refusing to append divergent ultragoal ledgers at ${repoRelative(cwd, flatPath)} and ${repoRelative(cwd, runPath)}.`,
     );
   }
-  const next = `${base}${line}`;
-  await writeJsonlAtomic(runPath, next);
-  await writeJsonlAtomic(flatPath, next);
+  const transaction: UltragoalLedgerTransaction = {
+    version: 1,
+    runId: pointer.runId,
+    line,
+    baseSha256: sha256(run),
+    nextSha256: sha256(`${run}${line}`),
+  };
+  await writePrivateJsonAtomic(ledgerTransactionPath(cwd), transaction);
+  await appendFile(runPath, line);
+  await appendFile(flatPath, line);
+  await recoverLedgerTransaction(cwd);
 }
 
 function normalizeLegacyGoalStatuses(plan: UltragoalPlan): number {
@@ -943,7 +1042,8 @@ async function appendLegacyStatusMigration(cwd: string, migratedStatuses: number
   });
 }
 
-export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
+async function readUltragoalPlanUnlocked(cwd: string): Promise<UltragoalPlan> {
+  await recoverLedgerTransaction(cwd);
   const path = ultragoalGoalsPath(cwd);
   let raw: string;
   try {
@@ -984,6 +1084,9 @@ export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
       parsed.codexObjectiveAliases = Array.from(new Set([...(parsed.codexObjectiveAliases ?? []), previousObjective].filter((value): value is string => typeof value === 'string' && value.length > 0)));
     }
     parsed.updatedAt = now;
+    if (migratedStatuses > 0 && parsed.runId) {
+      await reconcileLegacyLedgerProjection(cwd, parsed.runId);
+    }
     await writePlan(cwd, parsed);
     await appendLegacyStatusMigration(cwd, migratedStatuses, now);
     if (objectiveMigrated) {
@@ -999,16 +1102,28 @@ export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
   return parsed;
 }
 
+export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
+  return withUltragoalMutationLock(cwd, () => readUltragoalPlanUnlocked(cwd));
+}
+
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
   const tmpPath = `${path}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`);
   await rename(tmpPath, path);
 }
 
+async function writePrivateJsonAtomic(path: string, value: unknown): Promise<void> {
+  const tmpPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  await rename(tmpPath, path);
+}
+
 async function writeJsonlAtomic(path: string, value: string): Promise<void> {
   const tmpPath = `${path}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(tmpPath, value);
+  const mode = existsSync(path) ? (await stat(path)).mode & 0o777 : 0o600;
+  await writeFile(tmpPath, value, { mode });
   await rename(tmpPath, path);
+  await chmod(path, mode);
 }
 
 /**
@@ -1024,6 +1139,15 @@ async function writePlan(cwd: string, plan: UltragoalPlan): Promise<void> {
     await writeJsonAtomic(join(runDir, ULTRAGOAL_GOALS), plan);
   }
   await writeJsonAtomic(ultragoalGoalsPath(cwd), plan);
+}
+
+function availableRunId(cwd: string, briefHash: string, now: Date): string {
+  const base = buildUltragoalRunId(briefHash, now);
+  if (!existsSync(ultragoalRunDir(cwd, base))) return base;
+  for (let suffix = 2; ; suffix += 1) {
+    const candidate = `${base}-${suffix}`;
+    if (!existsSync(ultragoalRunDir(cwd, candidate))) return candidate;
+  }
 }
 
 
@@ -1116,7 +1240,7 @@ export async function createUltragoalPlan(cwd: string, options: CreateUltragoalO
       updatedAt: now,
     }));
 
-  const runId = buildUltragoalRunId(briefHash, options.now ?? new Date());
+  const runId = availableRunId(cwd, briefHash, options.now ?? new Date());
   const plan: UltragoalPlan = {
     version: 1,
     createdAt: now,
@@ -1133,8 +1257,10 @@ export async function createUltragoalPlan(cwd: string, options: CreateUltragoalO
   if (plan.codexGoalMode === 'aggregate') plan.codexObjective = aggregateCodexObjective(candidates);
 
   await mkdir(ultragoalDir(cwd), { recursive: true });
+  await mkdir(ultragoalRunDir(cwd, runId), { recursive: true });
   await writeFile(ultragoalBriefPath(cwd), options.brief.endsWith('\n') ? options.brief : `${options.brief}\n`);
-  await writeFile(ultragoalLedgerPath(cwd), '');
+  await writeJsonlAtomic(ultragoalLedgerPath(cwd), '');
+  await writeJsonlAtomic(join(ultragoalRunDir(cwd, runId), ULTRAGOAL_LEDGER), '');
   await writeActiveRunPointer(cwd, {
     version: 1,
     runId,
@@ -1174,6 +1300,7 @@ export async function adoptUltragoalRun(cwd: string, options: { now?: Date } = {
     const origin: UltragoalRunOrigin = existing.origin ?? { worktreePath: cwd, createdAt: existing.createdAt };
     origin.adoptedWorktreePaths = Array.from(new Set([...(origin.adoptedWorktreePaths ?? []), cwd]));
     const adopted: UltragoalPlan = { ...existing, runId, origin, updatedAt: now };
+    await reconcileLegacyLedgerProjection(cwd, runId);
     await writeActiveRunPointer(cwd, {
       version: 1,
       runId,
@@ -1217,6 +1344,7 @@ async function adoptExistingPlanForRun(
     origin,
     updatedAt: now,
   };
+  await reconcileLegacyLedgerProjection(cwd, runId);
   await writeActiveRunPointer(cwd, {
     version: 1,
     runId,
@@ -1304,7 +1432,7 @@ function appendGoalToPlan(plan: UltragoalPlan, options: AddUltragoalGoalOptions 
 
 export async function addUltragoalGoal(cwd: string, options: AddUltragoalGoalOptions): Promise<{ plan: UltragoalPlan; goal: UltragoalItem }> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const plan = await readUltragoalPlanUnlocked(cwd);
   const now = iso(options.now);
   const goal = appendGoalToPlan(plan, options);
   await writePlan(cwd, plan);
@@ -1590,7 +1718,7 @@ function applySteeringMutation(plan: UltragoalPlan, proposal: UltragoalSteeringP
 
 export async function steerUltragoal(cwd: string, proposal: UltragoalSteeringProposal, options: { now?: Date; directiveText?: string } = {}): Promise<SteerUltragoalResult> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const plan = await readUltragoalPlanUnlocked(cwd);
   const existing = proposal.idempotencyKey
     ? (await readSteeringLedgerEntries(cwd)).find((entry) => entry.event === 'steering_accepted' && (entry.idempotencyKey === proposal.idempotencyKey || entry.steering?.idempotencyKey === proposal.idempotencyKey) && entry.steering)
     : undefined;
@@ -1863,7 +1991,7 @@ function validateQualityGate(value: unknown, requiredInvariants: readonly Requir
 
 export async function startNextUltragoal(cwd: string, options: StartNextOptions = {}): Promise<{ plan: UltragoalPlan; goal: UltragoalItem | null; resumed: boolean; done: boolean }> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const plan = await readUltragoalPlanUnlocked(cwd);
   const now = iso(options.now);
   if (plan.aggregateCompletion?.status === 'complete') return { plan, goal: null, resumed: false, done: true };
   const existing = plan.goals.find((goal) => goal.status === 'in_progress' && isScheduleEligibleGoal(goal));
@@ -1896,7 +2024,7 @@ export async function startNextUltragoal(cwd: string, options: StartNextOptions 
 
 export async function checkpointUltragoal(cwd: string, options: CheckpointOptions): Promise<UltragoalPlan> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const plan = await readUltragoalPlanUnlocked(cwd);
   const goal = plan.goals.find((candidate) => candidate.id === options.goalId);
   if (!goal) throw new UltragoalError(`Unknown ultragoal id: ${options.goalId}`);
   const now = iso(options.now);
@@ -2163,7 +2291,7 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
 
 export async function recordFinalReviewBlockers(cwd: string, options: RecordFinalReviewBlockersOptions): Promise<{ plan: UltragoalPlan; blockedGoal: UltragoalItem; addedGoal: UltragoalItem }> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const plan = await readUltragoalPlanUnlocked(cwd);
   const goal = plan.goals.find((candidate) => candidate.id === options.goalId);
   if (!goal) throw new UltragoalError(`Unknown ultragoal id: ${options.goalId}`);
   assertNonEmpty(options.evidence, '--evidence');
