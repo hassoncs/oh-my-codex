@@ -13,6 +13,7 @@ import {
   checkpointUltragoal,
   createUltragoalPlan,
   readUltragoalPlan,
+  reconcileUltragoalRootGoal,
   recordFinalReviewBlockers,
   startNextUltragoal,
   steerUltragoal,
@@ -34,6 +35,7 @@ export const ULTRAGOAL_HELP = `omx ultragoal - Durable repo-native multi-goal wo
 Usage:
   omx ultragoal create-goals [--brief <text> | --brief-file <path> | --from-stdin] [--goal <title::objective>] [--codex-goal-mode <aggregate|per-story>] [--archive-existing | --adopt-existing | --new-namespace] [--force] [--json]
   omx ultragoal adopt-run [--json]
+  omx ultragoal reconcile-root-goal --codex-goal-json <active-json-or-path> --evidence <text> --expected-revision <n> [--expected-current-thread-id <id>] [--expected-flat-ledger-sha256 <digest> --expected-namespaced-ledger-sha256 <digest>] [--json]
   omx ultragoal complete-goals [--retry-failed] [--json]
   omx ultragoal add-goal --title <title> --objective <text> [--evidence <text>] [--json]
   omx ultragoal steer --kind <mutation-kind> --evidence <text> --rationale <text> [--target-goal-id <id> | --target-goal-ids <id1,id2,...>] [--title <title>] [--objective <text>] [--json]
@@ -124,7 +126,7 @@ async function readStdin(): Promise<string> {
 }
 
 function positionalText(args: readonly string[]): string {
-  const valueTaking = new Set(['--brief', '--brief-file', '--goal', '--goal-id', '--target-goal-id', '--status', '--evidence', '--codex-goal-json', '--codex-goal-mode', '--title', '--objective', '--rationale', '--kind', '--source', '--after-json', '--directive-json', '--directive-file', '--idempotency-key', '--quality-gate-json']);
+  const valueTaking = new Set(['--brief', '--brief-file', '--goal', '--goal-id', '--target-goal-id', '--status', '--evidence', '--codex-goal-json', '--codex-goal-mode', '--title', '--objective', '--rationale', '--kind', '--source', '--after-json', '--directive-json', '--directive-file', '--idempotency-key', '--quality-gate-json', '--expected-revision', '--expected-current-thread-id', '--expected-flat-ledger-sha256', '--expected-namespaced-ledger-sha256']);
   const words: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -144,6 +146,13 @@ function normalizeCodexGoalMode(raw: string | undefined): 'aggregate' | 'per_sto
   if (raw === 'aggregate') return 'aggregate';
   if (raw === 'per-story' || raw === 'per_story') return 'per_story';
   throw new UltragoalError('Invalid --codex-goal-mode; expected aggregate or per-story.');
+}
+
+function nonNegativeInteger(raw: string | undefined, label: string): number {
+  if (!raw || !/^\d+$/.test(raw)) throw new UltragoalError(`${label} must be a non-negative safe integer.`);
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value)) throw new UltragoalError(`${label} must be a non-negative safe integer.`);
+  return value;
 }
 
 function printStatus(plan: Awaited<ReturnType<typeof readUltragoalPlan>>): void {
@@ -319,6 +328,7 @@ const ULTRAGOAL_MUTATING_COMMANDS = new Set([
   'create',
   'create-goals',
   'adopt-run',
+  'reconcile-root-goal',
   'add-goal',
   'steer',
   'record-review-blockers',
@@ -393,12 +403,15 @@ export async function ultragoalCommand(args: string[]): Promise<void> {
       const snapshot = await readCodexGoalSnapshotInput(readValue(rest, '--codex-goal-json'), cwd);
       const activeGoal = plan.goals.find((goal) => goal.id === plan.activeGoalId || goal.status === 'in_progress');
       const expectedObjective = plan.codexGoalMode === 'aggregate'
-        ? plan.codexObjective
+        ? (plan.codexRootBinding?.objective ?? plan.codexObjective)
         : activeGoal?.objective;
       const reconciliation = activeGoal || snapshot
         ? reconcileCodexGoalSnapshot(snapshot, {
           expectedObjective: expectedObjective ?? plan.codexObjective ?? '',
-          acceptedObjectives: plan.codexGoalMode === 'aggregate' ? plan.codexObjectiveAliases : undefined,
+          expectedThreadId: plan.codexGoalMode === 'aggregate' ? plan.codexRootBinding?.threadId : undefined,
+          acceptedObjectives: plan.codexGoalMode === 'aggregate' && !plan.codexRootBinding
+            ? plan.codexObjectiveAliases
+            : undefined,
           allowedStatuses: activeGoal && plan.codexGoalMode === 'aggregate' ? ['active'] : ['active', 'complete'],
           requireSnapshot: false,
         })
@@ -426,6 +439,24 @@ export async function ultragoalCommand(args: string[]): Promise<void> {
       else {
         console.log(`ultragoal run adopted: ${plan.runId ?? 'unnamespaced'} (origin ${plan.origin?.worktreePath ?? 'unknown'})`);
         printStatus(plan);
+      }
+      return;
+    }
+
+    if (command === 'reconcile-root-goal') {
+      const codexGoal = await parseCodexGoalJson(readValue(rest, '--codex-goal-json'));
+      const result = await reconcileUltragoalRootGoal(cwd, {
+        codexGoal,
+        evidence: readValue(rest, '--evidence') ?? '',
+        expectedRevision: nonNegativeInteger(readValue(rest, '--expected-revision'), '--expected-revision'),
+        expectedCurrentThreadId: readValue(rest, '--expected-current-thread-id'),
+        expectedFlatLedgerDigest: readValue(rest, '--expected-flat-ledger-sha256'),
+        expectedNamespacedLedgerDigest: readValue(rest, '--expected-namespaced-ledger-sha256'),
+      });
+      if (json) printJson({ ok: true, ...result, summary: summarizeUltragoalPlan(result.plan) });
+      else {
+        console.log(`ultragoal root goal reconciled: ${result.after.threadId} (revision ${result.after.revision}${result.deduped ? ', deduped' : ''})`);
+        printStatus(result.plan);
       }
       return;
     }

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
@@ -194,6 +194,10 @@ async function main() {
     if (!childLockProbe && !childIdentityFailureProbe) rmSync(join(cwd, 'dist'), { recursive: true, force: true });
     await runBuildChild(token);
     if (childLockProbe || childIdentityFailureProbe) return;
+    copyFileSync(
+      join(cwd, 'src', 'scripts', 'dist-lock.js'),
+      join(cwd, 'dist', 'scripts', 'dist-lock.js'),
+    );
     chmodSync(join(cwd, 'dist', 'cli', 'omx.js'), 0o755);
   } finally {
     releaseOwnedLock(buildLock, token);

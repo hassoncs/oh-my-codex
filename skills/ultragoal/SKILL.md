@@ -68,6 +68,37 @@ Loop until `omx ultragoal status` reports all goals complete:
    `omx ultragoal checkpoint --goal-id <id> --status blocked --evidence "<completed legacy Codex goal blocks create_goal in this thread>" --codex-goal-json <get_goal-json-or-path>`
 11. Resume failed goals with `omx ultragoal complete-goals --retry-failed`.
 
+## Reconcile a reset active Codex goal
+
+When the user explicitly resets the active Codex goal while preserving an
+unfinished aggregate Ultragoal run, bind the new live identity through the
+supported mutation instead of editing artifacts:
+
+```sh
+omx ultragoal reconcile-root-goal \
+  --codex-goal-json '<fresh get_goal JSON or path>' \
+  --evidence '<explicit reset authority and source>' \
+  --expected-revision 0 \
+  --expected-flat-ledger-sha256 '<exact flat ledger sha256 when ledgers differ>' \
+  --expected-namespaced-ledger-sha256 '<exact namespaced ledger sha256 when ledgers differ>' \
+  --json
+```
+
+- `get_goal` input is operator-attested unless Codex supplies signed capture
+  metadata; do not claim independent freshness.
+- The command binds exact active `threadId` plus objective in a revisioned
+  `codexRootBinding`. It does not mutate the canonical aggregate
+  `codexObjective`, create/clear/complete a Codex goal, or infer ambient state.
+- Pass the current binding revision. Use `--expected-current-thread-id` for a
+  later revision to attest the current binding, not the successor snapshot.
+- If flat and namespaced ledgers differ, pass both exact SHA-256 digests. The
+  command accepts only an exact prefix/suffix relationship with a
+  `plan_created` anchor for the active run.
+- Exact retries repair flat/namespaced plan and ledger projections from the
+  canonical receipt without adding another reconciliation event.
+- Same-thread objective drift, stale revisions, completed goals, unowned runs,
+  malformed snapshots, and pre-namespaced runs fail loud.
+
 ## Dynamic steering
 
 Use `omx ultragoal steer` when real findings or blockers prove the current story decomposition should change while the aggregate objective and constraints stay fixed. Steering is explicit-only and evidence-backed; broad natural-language requests are rejected instead of guessed.

@@ -1,7 +1,8 @@
 import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ultragoalCommand, ULTRAGOAL_HELP } from '../ultragoal.js';
@@ -40,6 +41,10 @@ function cleanQualityGate(): string {
   });
 }
 
+function sha256(value: string): string {
+  return createHash('sha256').update(value, 'utf-8').digest('hex');
+}
+
 async function capture(run: () => Promise<void>): Promise<{ stdout: string[]; stderr: string[]; exitCode: string | number | undefined }> {
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -62,6 +67,7 @@ describe('cli/ultragoal', () => {
     const mutators: string[][] = [
       ['create-goals', '--brief', 'worker must not create'],
       ['create', '--brief', 'worker must not create'],
+      ['reconcile-root-goal', '--codex-goal-json', '{"goal":{"threadId":"successor","objective":"x","status":"active"}}', '--evidence', 'worker must not reconcile', '--expected-revision', '0'],
       ['add-goal', '--title', 'Worker goal', '--objective', 'Do not add'],
       ['steer', '--kind', 'add_subgoal', '--title', 'Worker steer', '--objective', 'Do not steer', '--evidence', 'worker evidence', '--rationale', 'worker rationale'],
       ['record-review-blockers', '--goal-id', 'G001-first', '--title', 'Blocker', '--objective', 'Do not record', '--evidence', 'worker evidence', '--codex-goal-json', JSON.stringify({ goal: { objective: 'x', status: 'active' } })],
@@ -129,6 +135,10 @@ describe('cli/ultragoal', () => {
   it('prints help with artifact and goal-mode constraints', async () => {
     assert.match(ULTRAGOAL_HELP, /create-goals/);
     assert.match(ULTRAGOAL_HELP, /complete-goals/);
+    assert.match(ULTRAGOAL_HELP, /reconcile-root-goal/);
+    assert.match(ULTRAGOAL_HELP, /expected-current-thread-id/);
+    assert.match(ULTRAGOAL_HELP, /expected-flat-ledger-sha256/);
+    assert.match(ULTRAGOAL_HELP, /expected-namespaced-ledger-sha256/);
     assert.match(ULTRAGOAL_HELP, /aggregate mode/);
     assert.match(ULTRAGOAL_HELP, /blocked/);
     assert.doesNotMatch(ULTRAGOAL_HELP, /fresh (?:Codex )?(?:thread|session)s?/i);
@@ -163,6 +173,95 @@ describe('cli/ultragoal', () => {
       assert.match(goals.codexObjective ?? '', /Complete the durable ultragoal plan/);
       assert.match(goals.codexObjective ?? '', /including later accepted\/appended stories/);
       assert.doesNotMatch(goals.codexObjective ?? '', /G001-first-milestone/);
+    });
+  });
+
+  it('reconciles an explicit active successor root goal through the command surface', async () => {
+    await withCwd(async (cwd) => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
+      const plan = JSON.parse(
+        await readFile(join(cwd, '.omx/ultragoal/goals.json'), 'utf-8'),
+      ) as { runId: string };
+      const flatLedgerPath = join(cwd, '.omx/ultragoal/ledger.jsonl');
+      const namespacedLedgerPath = join(cwd, '.omx/ultragoal/runs', plan.runId, 'ledger.jsonl');
+      const namespacedLedger = await readFile(namespacedLedgerPath, 'utf-8');
+      const flatLedger = `{"ts":"2026-08-02T00:00:00.000Z","event":"goal_reset","message":"preserved legacy history"}\n${namespacedLedger}`;
+      await writeFile(flatLedgerPath, flatLedger);
+      const result = await capture(() => ultragoalCommand([
+        'reconcile-root-goal',
+        '--codex-goal-json', '{"goal":{"threadId":"successor-goal","objective":"Reset aggregate objective","status":"active"}}',
+        '--evidence', 'Chris explicitly reset the active aggregate goal.',
+        '--expected-revision', '0',
+        '--expected-flat-ledger-sha256', sha256(flatLedger),
+        '--expected-namespaced-ledger-sha256', sha256(namespacedLedger),
+        '--json',
+      ]));
+
+      assert.equal(result.exitCode, undefined);
+      const output = JSON.parse(result.stdout.join('\n')) as {
+        ok: boolean;
+        deduped: boolean;
+        plan: { codexRootBinding?: { threadId: string; objective: string; revision: number } };
+      };
+      assert.equal(output.ok, true);
+      assert.equal(output.deduped, false);
+      assert.deepEqual(output.plan.codexRootBinding, {
+        threadId: 'successor-goal',
+        objective: 'Reset aggregate objective',
+        revision: 1,
+      });
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.match(ledger, /"event":"root_goal_reconciled"/);
+    });
+  });
+
+  it('does not accept legacy objective aliases after binding an explicit Codex root', async () => {
+    await withCwd(async (cwd) => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
+      const flatPlanPath = join(cwd, '.omx/ultragoal/goals.json');
+      const plan = JSON.parse(await readFile(flatPlanPath, 'utf-8')) as {
+        runId: string;
+        codexObjective: string;
+      };
+      const namespacedPlanPath = join(cwd, '.omx/ultragoal/runs', plan.runId, 'goals.json');
+      const legacyObjective = 'Complete all ultragoal stories in .omx/ultragoal/goals.json: G001-first-milestone First milestone';
+      const legacyPlan = { ...plan, codexObjective: legacyObjective };
+      await writeFile(flatPlanPath, `${JSON.stringify(legacyPlan, null, 2)}\n`);
+      await writeFile(namespacedPlanPath, `${JSON.stringify(legacyPlan, null, 2)}\n`);
+
+      const snapshot = {
+        goal: {
+          threadId: 'successor-goal',
+          objective: 'Reset aggregate objective',
+          status: 'active',
+        },
+      };
+      const reconciled = await capture(() => ultragoalCommand([
+        'reconcile-root-goal',
+        '--codex-goal-json', JSON.stringify(snapshot),
+        '--evidence', 'Chris explicitly reset the active aggregate goal.',
+        '--expected-revision', '0',
+        '--json',
+      ]));
+      assert.equal(reconciled.exitCode, undefined);
+
+      const status = await capture(() => ultragoalCommand([
+        'status',
+        '--codex-goal-json', JSON.stringify({
+          goal: {
+            threadId: 'successor-goal',
+            objective: legacyObjective,
+            status: 'active',
+          },
+        }),
+        '--json',
+      ]));
+      assert.equal(status.exitCode, undefined);
+      const output = JSON.parse(status.stdout.join('\n')) as {
+        reconciliation: { ok: boolean; errors: string[] };
+      };
+      assert.equal(output.reconciliation.ok, false);
+      assert.match(output.reconciliation.errors.join('\n'), /objective mismatch/);
     });
   });
 

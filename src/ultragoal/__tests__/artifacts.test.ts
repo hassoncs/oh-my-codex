@@ -1,5 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -11,18 +13,187 @@ import {
   isFinalRunCompletionCandidate,
   isUltragoalDone,
   readUltragoalPlan,
+  reconcileUltragoalRootGoal,
   recordFinalReviewBlockers,
   steerUltragoal,
   startNextUltragoal,
   summarizeUltragoalPlan,
   ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE,
   validateUltragoalSteeringProposal,
+  type UltragoalCodexRootBinding,
+  type UltragoalLedgerEntry,
+  type UltragoalLedgerAncestry,
   type UltragoalPlan,
+  type UltragoalRootGoalReconciliation,
   type UltragoalSteeringProposal,
 } from '../artifacts.js';
 import { legacyRunIdForPlan, ultragoalRunDir } from '../registry.js';
 import { LEADER_CONDUCTOR_BLOCK, buildUnsupportedNativeSubagentGuidance } from '../../leader/contract.js';
 import { steeringFixtures, type SteeringFixtureProposal } from './steering-fixtures.js';
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value, 'utf-8').digest('hex');
+}
+
+async function createRootReconciliationTamperFixture(cwd: string, withBefore = false) {
+  const created = await createUltragoalPlan(cwd, {
+    brief: 'brief',
+    goals: [
+      { title: 'First', objective: 'Complete first milestone with tests.' },
+      { title: 'Second', objective: 'Keep the durable run unfinished.' },
+    ],
+    now: new Date('2026-08-02T03:00:00.000Z'),
+  });
+  const flatPlanPath = join(cwd, '.omx/ultragoal/goals.json');
+  const runDir = ultragoalRunDir(cwd, created.runId!);
+  const namespacedPlanPath = join(runDir, 'goals.json');
+  const flatLedgerPath = join(cwd, '.omx/ultragoal/ledger.jsonl');
+  const namespacedLedgerPath = join(runDir, 'ledger.jsonl');
+  const legacyObjective = 'Complete all ultragoal stories in .omx/ultragoal/goals.json: G001-first First';
+  const legacyPlan = {
+    ...created,
+    codexObjective: legacyObjective,
+    rootGoalId: 'legacy-root',
+    codexThreadId: 'legacy-thread',
+    goals: created.goals.map((goal, index) => (
+      index === 0 ? { ...goal, status: 'completed' } : goal
+    )),
+  };
+  const legacyPlanRaw = `${JSON.stringify(legacyPlan, null, 2)}\n`;
+  await writeFile(flatPlanPath, legacyPlanRaw);
+  await writeFile(namespacedPlanPath, legacyPlanRaw);
+
+  const namespacedBefore = await readFile(namespacedLedgerPath, 'utf-8');
+  const flatBefore = `{"ts":"2026-08-01T23:59:00.000Z","event":"preserved_prefix","message":"legacy"}\n${namespacedBefore}`;
+  await writeFile(flatLedgerPath, flatBefore);
+  const firstSnapshot = {
+    goal: {
+      threadId: 'successor',
+      objective: 'Current successor',
+      status: 'active',
+    },
+  };
+  await reconcileUltragoalRootGoal(cwd, {
+    codexGoal: firstSnapshot,
+    evidence: 'Bind full immutable recovery envelope.',
+    expectedRevision: 0,
+    expectedFlatLedgerDigest: sha256(flatBefore),
+    expectedNamespacedLedgerDigest: sha256(namespacedBefore),
+    now: new Date('2026-08-02T03:01:00.000Z'),
+  });
+
+  const snapshot = withBefore
+    ? {
+      goal: {
+        threadId: 'next-successor',
+        objective: 'Next current successor',
+        status: 'active',
+      },
+    }
+    : firstSnapshot;
+  if (withBefore) {
+    await reconcileUltragoalRootGoal(cwd, {
+      codexGoal: snapshot,
+      evidence: 'Advance the live successor binding.',
+      expectedRevision: 1,
+      expectedCurrentThreadId: 'successor',
+      now: new Date('2026-08-02T03:02:00.000Z'),
+    });
+  }
+
+  return {
+    created,
+    flatPlanPath,
+    namespacedPlanPath,
+    flatLedgerPath,
+    namespacedLedgerPath,
+    snapshot,
+  };
+}
+
+type MutableRootTransition = {
+  transitionVersion: number;
+  beforePlanDigest: string;
+  ledgerAncestry: UltragoalLedgerAncestry;
+  normalization?: NonNullable<UltragoalRootGoalReconciliation['normalization']>;
+  legacyBefore?: NonNullable<UltragoalRootGoalReconciliation['legacyBefore']>;
+  snapshotDigest: string;
+  evidence: string;
+  evidenceDigest: string;
+  reconciledAt?: string;
+  ts?: string;
+  before?: UltragoalCodexRootBinding;
+  after: UltragoalCodexRootBinding;
+};
+
+const ROOT_TRANSITION_TAMPER_CASES = [
+  ['transition version', false],
+  ['predecessor plan digest', false],
+  ['ledger relation', false],
+  ['selected ledger digest', false],
+  ['run anchor digest', false],
+  ['run anchor line', false],
+  ['normalization', false],
+  ['legacy predecessor', false],
+  ['snapshot digest', false],
+  ['evidence digest', false],
+  ['timestamp', false],
+  ['before binding', true],
+  ['after binding', false],
+] as const;
+
+function tamperRootTransitionField(target: MutableRootTransition, field: string): void {
+  switch (field) {
+    case 'transition version':
+      target.transitionVersion += 1;
+      return;
+    case 'predecessor plan digest':
+      target.beforePlanDigest = 'f'.repeat(64);
+      return;
+    case 'ledger relation':
+      target.ledgerAncestry.relation = 'flat_has_namespaced_prefix';
+      return;
+    case 'selected ledger digest':
+      target.ledgerAncestry.selectedDigest = 'f'.repeat(64);
+      return;
+    case 'run anchor digest':
+      target.ledgerAncestry.runAnchorDigest = 'f'.repeat(64);
+      return;
+    case 'run anchor line':
+      target.ledgerAncestry.runAnchorLine = Number(target.ledgerAncestry.runAnchorLine) + 1;
+      return;
+    case 'normalization':
+      target.normalization!.migratedStatuses += 1;
+      return;
+    case 'legacy predecessor':
+      target.legacyBefore!.rootGoalId = 'forged-legacy-root';
+      return;
+    case 'snapshot digest':
+      target.snapshotDigest = 'f'.repeat(64);
+      return;
+    case 'evidence digest':
+      target.evidence = `${target.evidence} forged`;
+      target.evidenceDigest = sha256(JSON.stringify(target.evidence));
+      return;
+    case 'timestamp':
+      if (target.reconciledAt) target.reconciledAt = '2026-08-02T03:09:00.000Z';
+      if (target.ts) target.ts = '2026-08-02T03:09:00.000Z';
+      return;
+    case 'before binding':
+      target.before!.threadId = 'forged-before';
+      return;
+    case 'after binding':
+      target.after.objective = 'Forged successor objective';
+      target.snapshotDigest = sha256(JSON.stringify({
+        threadId: target.after.threadId,
+        objective: target.after.objective,
+        status: 'active',
+      }));
+      return;
+    default:
+      assert.fail(`Unknown root transition tamper field: ${field}`);
+  }
+}
 
 async function withTempRepo<T>(run: (cwd: string) => Promise<T>): Promise<T> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-ultragoal-'));
@@ -897,6 +1068,850 @@ describe('ultragoal artifacts', () => {
       assert.equal(checkpointed.goals[0]?.status, 'complete');
       assert.equal(checkpointed.codexObjective, ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE);
       assert.deepEqual(checkpointed.codexObjectiveAliases, [legacyObjective]);
+    });
+  });
+
+  it('reconciles an explicit active successor Codex goal once across flat and namespaced state', async () => {
+    await withTempRepo(async (cwd) => {
+      const created = await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+        now: new Date('2026-08-02T03:00:00.000Z'),
+      });
+      const previousObjective = created.codexObjective;
+      const ledgerPath = join(cwd, '.omx/ultragoal/ledger.jsonl');
+      const namespacedLedgerPath = join(ultragoalRunDir(cwd, created.runId!), 'ledger.jsonl');
+      const runLedgerBefore = await readFile(namespacedLedgerPath, 'utf-8');
+      const legacyPrefix = '{"ts":"2026-07-01T00:00:00.000Z","event":"goal_reset","message":"preserved legacy history"}\n\n';
+      await writeFile(ledgerPath, `${legacyPrefix}${runLedgerBefore}`);
+      const ledgerBefore = await readFile(ledgerPath, 'utf-8');
+      const snapshot = {
+        goal: {
+          threadId: '019fbae5-b750-7ab2-875f-e36bcdeb3981',
+          objective: 'Complete the reset aggregate goal with consuming proof.',
+          status: 'active',
+        },
+      };
+
+      const reconciled = await reconcileUltragoalRootGoal(cwd, {
+        codexGoal: snapshot,
+        evidence: 'Chris explicitly reset the active aggregate goal while preserving the durable run.',
+        expectedRevision: 0,
+        expectedFlatLedgerDigest: sha256(ledgerBefore),
+        expectedNamespacedLedgerDigest: sha256(runLedgerBefore),
+        now: new Date('2026-08-02T03:01:00.000Z'),
+      });
+
+      assert.equal(reconciled.deduped, false);
+      assert.deepEqual(reconciled.after, {
+        threadId: snapshot.goal.threadId,
+        objective: snapshot.goal.objective,
+        revision: 1,
+      });
+      assert.deepEqual(reconciled.plan.codexRootBinding, reconciled.after);
+      assert.equal(reconciled.plan.codexObjective, previousObjective);
+      assert.equal(reconciled.plan.codexObjectiveAliases, undefined);
+      const handoff = buildCodexGoalInstruction(reconciled.plan.goals[0]!, reconciled.plan);
+      assert.match(handoff, new RegExp(escapeRegExp(snapshot.goal.objective)));
+      assert.doesNotMatch(handoff, new RegExp(escapeRegExp(previousObjective!)));
+      const flat = JSON.parse(await readFile(join(cwd, '.omx/ultragoal/goals.json'), 'utf-8')) as UltragoalPlan;
+      const namespaced = JSON.parse(await readFile(join(ultragoalRunDir(cwd, created.runId!), 'goals.json'), 'utf-8')) as UltragoalPlan;
+      assert.deepEqual(flat, namespaced);
+
+      const ledgerAfter = await readFile(ledgerPath, 'utf-8');
+      assert.equal(ledgerAfter.slice(0, ledgerBefore.length), ledgerBefore);
+      assert.equal(await readFile(namespacedLedgerPath, 'utf-8'), ledgerAfter);
+      assert.equal((ledgerAfter.match(/"event":"root_goal_reconciled"/g) ?? []).length, 1);
+      assert.match(ledgerAfter, new RegExp(snapshot.goal.threadId));
+      const rootEntry = ledgerAfter
+        .trimEnd()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as UltragoalLedgerEntry)
+        .find((entry) => entry.event === 'root_goal_reconciled');
+      const receipt = reconciled.plan.rootGoalReconciliation!;
+      assert.ok(rootEntry);
+      assert.deepEqual({
+        transitionVersion: rootEntry.transitionVersion,
+        beforePlanDigest: rootEntry.beforePlanDigest,
+        ledgerAncestry: rootEntry.ledgerAncestry,
+        normalization: rootEntry.normalization,
+        legacyBefore: rootEntry.legacyBefore,
+        before: rootEntry.before,
+        after: rootEntry.after,
+        snapshotDigest: rootEntry.snapshotDigest,
+        evidenceDigest: rootEntry.evidenceDigest,
+        reconciledAt: rootEntry.ts,
+      }, {
+        transitionVersion: receipt.transitionVersion,
+        beforePlanDigest: receipt.beforePlanDigest,
+        ledgerAncestry: receipt.ledgerAncestry,
+        normalization: receipt.normalization,
+        legacyBefore: receipt.legacyBefore,
+        before: receipt.before,
+        after: receipt.after,
+        snapshotDigest: receipt.snapshotDigest,
+        evidenceDigest: receipt.evidenceDigest,
+        reconciledAt: receipt.reconciledAt,
+      });
+
+      await writeFile(join(cwd, '.omx/ultragoal/goals.json'), `${JSON.stringify(created, null, 2)}\n`);
+      await writeFile(ledgerPath, ledgerBefore);
+      const replayed = await reconcileUltragoalRootGoal(cwd, {
+        codexGoal: snapshot,
+        evidence: 'Exact retry after an interrupted caller response.',
+        expectedRevision: 0,
+        now: new Date('2026-08-02T03:02:00.000Z'),
+      });
+      assert.equal(replayed.deduped, true);
+      assert.equal(replayed.eventId, reconciled.eventId);
+      assert.deepEqual(replayed.plan, reconciled.plan);
+      assert.deepEqual(replayed.repairedProjections.sort(), ['flat goals', 'flat ledger']);
+      assert.equal(await readFile(ledgerPath, 'utf-8'), ledgerAfter);
+    });
+  });
+
+  it('rejects unsafe root goal reconciliation snapshots without mutating the plan', async () => {
+    await withTempRepo(async (cwd) => {
+      const created = await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+      });
+      const planPath = join(cwd, '.omx/ultragoal/goals.json');
+
+      await assert.rejects(
+        () => reconcileUltragoalRootGoal(cwd, {
+          codexGoal: { goal: { objective: 'Missing identity', status: 'active' } },
+          evidence: 'Must fail.',
+          expectedRevision: 0,
+        }),
+        /threadId/,
+      );
+      await assert.rejects(
+        () => reconcileUltragoalRootGoal(cwd, {
+          codexGoal: { goal: { threadId: 'successor', objective: 'Completed successor', status: 'complete' } },
+          evidence: 'Must fail.',
+          expectedRevision: 0,
+        }),
+        /must be active/,
+      );
+
+      await reconcileUltragoalRootGoal(cwd, {
+        codexGoal: { goal: { threadId: 'successor', objective: 'Current successor', status: 'active' } },
+        evidence: 'Valid explicit successor.',
+        expectedRevision: 0,
+      });
+      await assert.rejects(
+        () => reconcileUltragoalRootGoal(cwd, {
+          codexGoal: { goal: { threadId: 'successor', objective: 'Drifted objective', status: 'active' } },
+          evidence: 'Must fail.',
+          expectedRevision: 1,
+          expectedCurrentThreadId: 'successor',
+        }),
+        /objective drift/,
+      );
+
+      const persisted = JSON.parse(await readFile(planPath, 'utf-8')) as UltragoalPlan;
+      assert.deepEqual(persisted.codexRootBinding, {
+        threadId: 'successor',
+        objective: 'Current successor',
+        revision: 1,
+      });
+      assert.equal(persisted.goals[0]?.id, created.goals[0]?.id);
+
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: created.goals[0]!.id,
+          status: 'complete',
+          evidence: 'Must fail.',
+          codexGoal: {
+            goal: {
+              threadId: 'successor',
+              objective: created.codexObjective,
+              status: 'active',
+            },
+          },
+        }),
+        /objective mismatch/,
+      );
+    });
+  });
+
+  it('rejects legacy completed aggregate runs before normalizing or binding them', async () => {
+    await withTempRepo(async (cwd) => {
+      const created = await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+      });
+      const flatPlanPath = join(cwd, '.omx/ultragoal/goals.json');
+      const namespacedPlanPath = join(ultragoalRunDir(cwd, created.runId!), 'goals.json');
+      const legacyCompletePlan = {
+        ...created,
+        goals: created.goals.map((goal) => ({ ...goal, status: 'completed' })),
+      };
+      const raw = `${JSON.stringify(legacyCompletePlan, null, 2)}\n`;
+      await writeFile(flatPlanPath, raw);
+      await writeFile(namespacedPlanPath, raw);
+      const before = await Promise.all([
+        readFile(flatPlanPath, 'utf-8'),
+        readFile(namespacedPlanPath, 'utf-8'),
+        readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8'),
+        readFile(join(ultragoalRunDir(cwd, created.runId!), 'ledger.jsonl'), 'utf-8'),
+      ]);
+
+      await assert.rejects(
+        () => reconcileUltragoalRootGoal(cwd, {
+          codexGoal: { goal: { threadId: 'successor', objective: 'Current successor', status: 'active' } },
+          evidence: 'Completed legacy runs must remain terminal.',
+          expectedRevision: 0,
+        }),
+        /run is complete/,
+      );
+      assert.deepEqual(await Promise.all([
+        readFile(flatPlanPath, 'utf-8'),
+        readFile(namespacedPlanPath, 'utf-8'),
+        readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8'),
+        readFile(join(ultragoalRunDir(cwd, created.runId!), 'ledger.jsonl'), 'utf-8'),
+      ]), before);
+    });
+  });
+
+  it('fails loud instead of repairing corrupt root goal reconciliation ledger state', async () => {
+    await withTempRepo(async (cwd) => {
+      const created = await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+      });
+      const snapshot = {
+        goal: {
+          threadId: 'successor',
+          objective: 'Current successor',
+          status: 'active',
+        },
+      };
+      await reconcileUltragoalRootGoal(cwd, {
+        codexGoal: snapshot,
+        evidence: 'Valid explicit successor.',
+        expectedRevision: 0,
+      });
+
+      const flatLedgerPath = join(cwd, '.omx/ultragoal/ledger.jsonl');
+      const namespacedLedgerPath = join(ultragoalRunDir(cwd, created.runId!), 'ledger.jsonl');
+      const flatLedger = await readFile(flatLedgerPath, 'utf-8');
+      await writeFile(flatLedgerPath, flatLedger.slice(0, -1));
+      await assert.rejects(
+        () => reconcileUltragoalRootGoal(cwd, {
+          codexGoal: snapshot,
+          evidence: 'Exact retry.',
+          expectedRevision: 0,
+        }),
+        /truncated Ultragoal ledger/,
+      );
+
+      await writeFile(flatLedgerPath, flatLedger);
+      const namespacedEntries = (await readFile(namespacedLedgerPath, 'utf-8'))
+        .trimEnd()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const reconciliation = namespacedEntries.find((entry) => entry.event === 'root_goal_reconciled');
+      assert.ok(reconciliation);
+      reconciliation.message = 'Conflicting authored event.';
+      await writeFile(namespacedLedgerPath, `${namespacedEntries.map((entry) => JSON.stringify(entry)).join('\n')}\n`);
+
+      await assert.rejects(
+        () => reconcileUltragoalRootGoal(cwd, {
+          codexGoal: snapshot,
+          evidence: 'Exact retry.',
+          expectedRevision: 0,
+        }),
+        /Conflicting root goal reconciliation transition/,
+      );
+
+      await writeFile(flatLedgerPath, '{"ts":"2026-08-02T00:00:00.000Z","event":"flat_only","message":"flat"}\n');
+      await writeFile(namespacedLedgerPath, '{"ts":"2026-08-02T00:00:00.000Z","event":"run_only","message":"run"}\n');
+      await assert.rejects(
+        () => reconcileUltragoalRootGoal(cwd, {
+          codexGoal: snapshot,
+          evidence: 'Exact retry.',
+          expectedRevision: 0,
+        }),
+        /divergent Ultragoal ledgers/,
+      );
+    });
+  });
+
+  it('does not bind a root goal before divergent ledgers fail validation', async () => {
+    await withTempRepo(async (cwd) => {
+      const created = await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+      });
+      const flatPlanPath = join(cwd, '.omx/ultragoal/goals.json');
+      const namespacedPlanPath = join(ultragoalRunDir(cwd, created.runId!), 'goals.json');
+      const flatLedgerPath = join(cwd, '.omx/ultragoal/ledger.jsonl');
+      const namespacedLedgerPath = join(ultragoalRunDir(cwd, created.runId!), 'ledger.jsonl');
+      await writeFile(flatLedgerPath, '{"ts":"2026-08-02T00:00:00.000Z","event":"flat_only","message":"flat"}\n');
+      await writeFile(namespacedLedgerPath, '{"ts":"2026-08-02T00:00:00.000Z","event":"run_only","message":"run"}\n');
+      const flatLedger = await readFile(flatLedgerPath, 'utf-8');
+      const namespacedLedger = await readFile(namespacedLedgerPath, 'utf-8');
+      const before = await Promise.all([
+        readFile(flatPlanPath, 'utf-8'),
+        readFile(namespacedPlanPath, 'utf-8'),
+        readFile(flatLedgerPath, 'utf-8'),
+        readFile(namespacedLedgerPath, 'utf-8'),
+      ]);
+
+      await assert.rejects(
+        () => reconcileUltragoalRootGoal(cwd, {
+          codexGoal: { goal: { threadId: 'successor', objective: 'Current successor', status: 'active' } },
+          evidence: 'Must fail without binding.',
+          expectedRevision: 0,
+          expectedFlatLedgerDigest: sha256(flatLedger),
+          expectedNamespacedLedgerDigest: sha256(namespacedLedger),
+        }),
+        /divergent Ultragoal ledgers/,
+      );
+
+      assert.deepEqual(await Promise.all([
+        readFile(flatPlanPath, 'utf-8'),
+        readFile(namespacedPlanPath, 'utf-8'),
+        readFile(flatLedgerPath, 'utf-8'),
+        readFile(namespacedLedgerPath, 'utf-8'),
+      ]), before);
+    });
+  });
+
+  it('preserves an exact 53/7 legacy ledger ancestry while adding one v1 root event', async () => {
+    await withTempRepo(async (cwd) => {
+      const created = await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+        now: new Date('2026-08-02T03:00:00.000Z'),
+      });
+      const flatPlanPath = join(cwd, '.omx/ultragoal/goals.json');
+      const runDir = ultragoalRunDir(cwd, created.runId!);
+      const namespacedPlanPath = join(runDir, 'goals.json');
+      const flatLedgerPath = join(cwd, '.omx/ultragoal/ledger.jsonl');
+      const namespacedLedgerPath = join(runDir, 'ledger.jsonl');
+      const legacyPlan = {
+        ...created,
+        codexObjective: 'Complete Enterprise GenUI Multiplayer G001-G013 end to end.',
+        rootGoalId: 'obsolete-root',
+        codexThreadId: 'obsolete-root',
+      };
+      const legacyPlanRaw = `${JSON.stringify(legacyPlan, null, 2)}\n`;
+      await writeFile(flatPlanPath, legacyPlanRaw);
+      await writeFile(namespacedPlanPath, legacyPlanRaw);
+
+      const prefixEntries = Array.from({ length: 46 }, (_, index) => JSON.stringify({
+        ts: `2026-08-01T00:${String(index).padStart(2, '0')}:00.000Z`,
+        event: 'goal_checkpoint',
+        message: `preserved flat history ${index + 1}`,
+      }));
+      const runEntries = [
+        {
+          ts: '2026-08-01T12:00:00.000Z',
+          event: 'plan_created',
+          message: `adopted existing ultragoal registry as run ${created.runId} (1 goal(s))`,
+        },
+        ...Array.from({ length: 5 }, (_, index) => ({
+          ts: `2026-08-01T13:0${index}:00.000Z`,
+          event: 'goal_checkpoint',
+          message: `preserved run history ${index + 1}`,
+        })),
+        {
+          ts: '2026-08-02T02:30:28.000Z',
+          event: 'root_goal_reconciled',
+          runId: created.runId,
+          rootGoalId: 'obsolete-root',
+          codexThreadId: 'obsolete-root',
+          message: 'Historical unversioned successor reconciliation.',
+          evidence: 'Preserve this historical event byte-for-byte.',
+        },
+      ].map((entry) => JSON.stringify(entry));
+      const namespacedBefore = `${runEntries.join('\n')}\n`;
+      const flatBefore = `${prefixEntries.join('\n')}\n${namespacedBefore}`;
+      assert.equal(flatBefore.trimEnd().split('\n').length, 53);
+      assert.equal(namespacedBefore.trimEnd().split('\n').length, 7);
+      await writeFile(flatLedgerPath, flatBefore);
+      await writeFile(namespacedLedgerPath, namespacedBefore);
+
+      const result = await reconcileUltragoalRootGoal(cwd, {
+        codexGoal: {
+          goal: {
+            threadId: '019fbae5-b750-7ab2-875f-e36bcdeb3981',
+            objective: 'Complete Enterprise GenUI Multiplayer G001-G013 end to end.',
+            status: 'active',
+          },
+        },
+        evidence: 'Chris reset the live root while preserving the 53/7 durable history.',
+        expectedRevision: 0,
+        expectedFlatLedgerDigest: sha256(flatBefore),
+        expectedNamespacedLedgerDigest: sha256(namespacedBefore),
+        now: new Date('2026-08-02T03:01:00.000Z'),
+      });
+
+      const after = await readFile(flatLedgerPath, 'utf-8');
+      assert.equal(after.slice(0, flatBefore.length), flatBefore);
+      assert.equal(await readFile(namespacedLedgerPath, 'utf-8'), after);
+      assert.equal((after.match(/"event":"root_goal_reconciled"/g) ?? []).length, 2);
+      assert.equal((after.match(/"eventVersion":1/g) ?? []).length, 1);
+      assert.equal(result.plan.rootGoalReconciliation?.ledgerAncestry.relation, 'flat_has_namespaced_suffix');
+      assert.ok(result.plan.rootGoalReconciliation?.ledgerAncestry.runAnchorDigest);
+      assert.equal(result.plan.rootGoalReconciliation?.ledgerAncestry.runAnchorLine, 47);
+      assert.equal((result.plan as UltragoalPlan & { rootGoalId?: string }).rootGoalId, undefined);
+      assert.equal((result.plan as UltragoalPlan & { codexThreadId?: string }).codexThreadId, undefined);
+    });
+  });
+
+  it('rejects wrong hashes and unanchored prefix/suffix ledgers without mutation', async () => {
+    await withTempRepo(async (cwd) => {
+      const created = await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+      });
+      const flatPlanPath = join(cwd, '.omx/ultragoal/goals.json');
+      const namespacedPlanPath = join(ultragoalRunDir(cwd, created.runId!), 'goals.json');
+      const flatLedgerPath = join(cwd, '.omx/ultragoal/ledger.jsonl');
+      const namespacedLedgerPath = join(ultragoalRunDir(cwd, created.runId!), 'ledger.jsonl');
+      const namespacedLedger = await readFile(namespacedLedgerPath, 'utf-8');
+      const flatLedger = `{"ts":"2026-08-01T00:00:00.000Z","event":"goal_checkpoint","message":"prefix"}\n${namespacedLedger}`;
+      await writeFile(flatLedgerPath, flatLedger);
+      const before = await Promise.all([
+        readFile(flatPlanPath, 'utf-8'),
+        readFile(namespacedPlanPath, 'utf-8'),
+        readFile(flatLedgerPath, 'utf-8'),
+        readFile(namespacedLedgerPath, 'utf-8'),
+      ]);
+
+      await assert.rejects(
+        () => reconcileUltragoalRootGoal(cwd, {
+          codexGoal: { goal: { threadId: 'successor', objective: 'Current successor', status: 'active' } },
+          evidence: 'Wrong digest must fail.',
+          expectedRevision: 0,
+          expectedFlatLedgerDigest: '0'.repeat(64),
+          expectedNamespacedLedgerDigest: sha256(namespacedLedger),
+        }),
+        /ancestry digest mismatch/,
+      );
+      await writeFile(namespacedLedgerPath, '{"ts":"2026-08-01T00:00:00.000Z","event":"goal_checkpoint","message":"no run anchor"}\n');
+      const unanchored = await readFile(namespacedLedgerPath, 'utf-8');
+      const unanchoredFlat = `{"ts":"2026-08-01T00:00:00.000Z","event":"goal_checkpoint","message":"prefix"}\n${unanchored}`;
+      await writeFile(flatLedgerPath, unanchoredFlat);
+      await assert.rejects(
+        () => reconcileUltragoalRootGoal(cwd, {
+          codexGoal: { goal: { threadId: 'successor', objective: 'Current successor', status: 'active' } },
+          evidence: 'Unanchored history must fail.',
+          expectedRevision: 0,
+          expectedFlatLedgerDigest: sha256(unanchoredFlat),
+          expectedNamespacedLedgerDigest: sha256(unanchored),
+        }),
+        /without a plan_created anchor/,
+      );
+
+      assert.deepEqual(await Promise.all([
+        readFile(flatPlanPath, 'utf-8'),
+        readFile(namespacedPlanPath, 'utf-8'),
+      ]), before.slice(0, 2));
+    });
+  });
+
+  it('repairs one missing ledger but rejects two absent histories', async () => {
+    await withTempRepo(async (cwd) => {
+      const created = await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+      });
+      const flatLedgerPath = join(cwd, '.omx/ultragoal/ledger.jsonl');
+      const namespacedLedgerPath = join(ultragoalRunDir(cwd, created.runId!), 'ledger.jsonl');
+      const namespacedBefore = await readFile(namespacedLedgerPath, 'utf-8');
+      await rm(flatLedgerPath);
+
+      await reconcileUltragoalRootGoal(cwd, {
+        codexGoal: { goal: { threadId: 'successor', objective: 'Current successor', status: 'active' } },
+        evidence: 'Repair the missing flat projection from canonical run history.',
+        expectedRevision: 0,
+      });
+      assert.match(await readFile(flatLedgerPath, 'utf-8'), /"event":"root_goal_reconciled"/);
+      assert.equal(await readFile(flatLedgerPath, 'utf-8'), await readFile(namespacedLedgerPath, 'utf-8'));
+
+      const second = await createUltragoalPlan(cwd, {
+        brief: 'different brief',
+        goals: [{ title: 'Second', objective: 'Complete second milestone with tests.' }],
+        newNamespace: true,
+      });
+      await rm(join(cwd, '.omx/ultragoal/ledger.jsonl'));
+      await rm(join(ultragoalRunDir(cwd, second.runId!), 'ledger.jsonl'));
+      await assert.rejects(
+        () => reconcileUltragoalRootGoal(cwd, {
+          codexGoal: { goal: { threadId: 'second-successor', objective: 'Second successor', status: 'active' } },
+          evidence: 'No durable history must fail.',
+          expectedRevision: 0,
+        }),
+        /neither ledger contains valid history/,
+      );
+      assert.ok(namespacedBefore);
+    });
+  });
+
+  it('rejects malformed JSONL values and malformed legacy root events', async () => {
+    await withTempRepo(async (cwd) => {
+      const created = await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+      });
+      const flatLedgerPath = join(cwd, '.omx/ultragoal/ledger.jsonl');
+      const namespacedLedgerPath = join(ultragoalRunDir(cwd, created.runId!), 'ledger.jsonl');
+      for (const malformed of [
+        'true\n',
+        '{"ts":"2026-08-02T00:00:00.000Z","event":"root_goal_reconciled","runId":"run","message":"missing fields"}\n',
+      ]) {
+        await writeFile(flatLedgerPath, malformed);
+        await assert.rejects(
+          () => reconcileUltragoalRootGoal(cwd, {
+            codexGoal: { goal: { threadId: 'successor', objective: 'Current successor', status: 'active' } },
+            evidence: 'Malformed history must fail.',
+            expectedRevision: 0,
+          }),
+          /invalid ledger entry|Malformed legacy root goal reconciliation/,
+        );
+      }
+      assert.match(await readFile(namespacedLedgerPath, 'utf-8'), /"event":"plan_created"/);
+    });
+  });
+
+  it('recovers a stale mutation lock and serializes identical and competing successors', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+      });
+      await writeFile(
+        join(cwd, '.omx/ultragoal/.mutation.lock'),
+        JSON.stringify({ pid: 99999999, token: 'stale-owner', created_at: '2026-08-01T00:00:00.000Z' }),
+      );
+      const snapshot = { goal: { threadId: 'successor', objective: 'Current successor', status: 'active' } };
+      const [first, second] = await Promise.all([
+        reconcileUltragoalRootGoal(cwd, {
+          codexGoal: snapshot,
+          evidence: 'First identical caller.',
+          expectedRevision: 0,
+        }),
+        reconcileUltragoalRootGoal(cwd, {
+          codexGoal: snapshot,
+          evidence: 'Second identical caller.',
+          expectedRevision: 0,
+        }),
+      ]);
+      assert.equal([first, second].filter((result) => result.deduped).length, 1);
+      assert.equal(first.eventId, second.eventId);
+      assert.equal(existsSync(join(cwd, '.omx/ultragoal/.mutation.lock')), false);
+
+      const outcomes = await Promise.allSettled([
+        reconcileUltragoalRootGoal(cwd, {
+          codexGoal: { goal: { threadId: 'next-a', objective: 'Next A', status: 'active' } },
+          evidence: 'Competing successor A.',
+          expectedRevision: 1,
+          expectedCurrentThreadId: 'successor',
+        }),
+        reconcileUltragoalRootGoal(cwd, {
+          codexGoal: { goal: { threadId: 'next-b', objective: 'Next B', status: 'active' } },
+          evidence: 'Competing successor B.',
+          expectedRevision: 1,
+          expectedCurrentThreadId: 'successor',
+        }),
+      ]);
+      assert.equal(outcomes.filter((result) => result.status === 'fulfilled').length, 1);
+      assert.equal(outcomes.filter((result) => result.status === 'rejected').length, 1);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"eventVersion":1/g) ?? []).length, 2);
+    });
+  });
+
+  it('rejects forged committed receipts without repairing any projection', async () => {
+    await withTempRepo(async (cwd) => {
+      const created = await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+      });
+      const snapshot = { goal: { threadId: 'successor', objective: 'Current successor', status: 'active' } };
+      await reconcileUltragoalRootGoal(cwd, {
+        codexGoal: snapshot,
+        evidence: 'Valid first reconciliation.',
+        expectedRevision: 0,
+      });
+      const flatPlanPath = join(cwd, '.omx/ultragoal/goals.json');
+      const namespacedPlanPath = join(ultragoalRunDir(cwd, created.runId!), 'goals.json');
+      const canonical = JSON.parse(await readFile(namespacedPlanPath, 'utf-8')) as UltragoalPlan;
+      canonical.rootGoalReconciliation!.eventId = '0'.repeat(64);
+      await writeFile(namespacedPlanPath, `${JSON.stringify(canonical, null, 2)}\n`);
+      const before = await Promise.all([
+        readFile(flatPlanPath, 'utf-8'),
+        readFile(namespacedPlanPath, 'utf-8'),
+        readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8'),
+        readFile(join(ultragoalRunDir(cwd, created.runId!), 'ledger.jsonl'), 'utf-8'),
+      ]);
+
+      await assert.rejects(
+        () => reconcileUltragoalRootGoal(cwd, {
+          codexGoal: snapshot,
+          evidence: 'Forged receipt must fail.',
+          expectedRevision: 0,
+        }),
+        /event id mismatch/,
+      );
+      assert.deepEqual(await Promise.all([
+        readFile(flatPlanPath, 'utf-8'),
+        readFile(namespacedPlanPath, 'utf-8'),
+        readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8'),
+        readFile(join(ultragoalRunDir(cwd, created.runId!), 'ledger.jsonl'), 'utf-8'),
+      ]), before);
+    });
+  });
+
+  it('rejects identical pre-event history tampering and broken reconciliation revision chains', async () => {
+    await withTempRepo(async (cwd) => {
+      const fixture = await createRootReconciliationTamperFixture(cwd);
+      for (const path of [fixture.flatLedgerPath, fixture.namespacedLedgerPath]) {
+        const raw = await readFile(path, 'utf-8');
+        assert.match(raw, /"message":"legacy"/);
+        await writeFile(path, raw.replace('"message":"legacy"', '"message":"forged"'));
+      }
+      const before = await Promise.all([
+        readFile(fixture.flatLedgerPath, 'utf-8'),
+        readFile(fixture.namespacedLedgerPath, 'utf-8'),
+      ]);
+
+      await assert.rejects(
+        () => reconcileUltragoalRootGoal(cwd, {
+          codexGoal: fixture.snapshot,
+          evidence: 'Identical predecessor tampering must fail.',
+          expectedRevision: 0,
+        }),
+        /ledger ancestry digest mismatch/,
+      );
+      assert.deepEqual(await Promise.all([
+        readFile(fixture.flatLedgerPath, 'utf-8'),
+        readFile(fixture.namespacedLedgerPath, 'utf-8'),
+      ]), before);
+    });
+
+    await withTempRepo(async (cwd) => {
+      const fixture = await createRootReconciliationTamperFixture(cwd, true);
+      for (const path of [fixture.flatLedgerPath, fixture.namespacedLedgerPath]) {
+        const entries = (await readFile(path, 'utf-8'))
+          .trimEnd()
+          .split('\n')
+          .map((line) => JSON.parse(line) as UltragoalLedgerEntry)
+          .filter((entry) => !(
+            entry.event === 'root_goal_reconciled'
+            && entry.eventVersion === 1
+            && entry.revision === 1
+          ));
+        await writeFile(path, `${entries.map((entry) => JSON.stringify(entry)).join('\n')}\n`);
+      }
+
+      await assert.rejects(
+        () => reconcileUltragoalRootGoal(cwd, {
+          codexGoal: fixture.snapshot,
+          evidence: 'A missing predecessor revision must fail.',
+          expectedRevision: 1,
+        }),
+        /Non-contiguous root goal reconciliation revision/,
+      );
+    });
+  });
+
+  it('dedupes a later-revision retry that repeats its predecessor thread guard', async () => {
+    await withTempRepo(async (cwd) => {
+      const fixture = await createRootReconciliationTamperFixture(cwd, true);
+      const replayed = await reconcileUltragoalRootGoal(cwd, {
+        codexGoal: fixture.snapshot,
+        evidence: 'Retry the committed second revision after losing the response.',
+        expectedRevision: 1,
+        expectedCurrentThreadId: 'successor',
+      });
+
+      assert.equal(replayed.deduped, true);
+      assert.equal(replayed.before?.threadId, 'successor');
+      assert.equal(replayed.after.threadId, 'next-successor');
+      assert.equal(replayed.after.revision, 2);
+    });
+  });
+
+  it('integrity-binds every immutable plan recovery field', async () => {
+    for (const [field, withBefore] of ROOT_TRANSITION_TAMPER_CASES) {
+      await withTempRepo(async (cwd) => {
+        const fixture = await createRootReconciliationTamperFixture(cwd, withBefore);
+        const plan = JSON.parse(
+          await readFile(fixture.namespacedPlanPath, 'utf-8'),
+        ) as UltragoalPlan;
+        const receipt = plan.rootGoalReconciliation!;
+        tamperRootTransitionField(receipt as MutableRootTransition, field);
+        if (field === 'after binding') plan.codexRootBinding = receipt.after;
+        await writeFile(fixture.namespacedPlanPath, `${JSON.stringify(plan, null, 2)}\n`);
+
+        await assert.rejects(
+          () => reconcileUltragoalRootGoal(cwd, {
+            codexGoal: fixture.snapshot,
+            evidence: `Reject forged ${field}.`,
+            expectedRevision: withBefore ? 1 : 0,
+          }),
+          /reconciliation/i,
+          field,
+        );
+      });
+    }
+  });
+
+  it('integrity-binds every immutable ledger recovery field', async () => {
+    for (const [field, withBefore] of ROOT_TRANSITION_TAMPER_CASES) {
+      await withTempRepo(async (cwd) => {
+        const fixture = await createRootReconciliationTamperFixture(cwd, withBefore);
+        for (const path of [fixture.flatLedgerPath, fixture.namespacedLedgerPath]) {
+          const entries = (await readFile(path, 'utf-8'))
+            .trimEnd()
+            .split('\n')
+            .map((line) => JSON.parse(line) as UltragoalLedgerEntry);
+          const entry = entries
+            .filter((candidate) => candidate.event === 'root_goal_reconciled' && candidate.eventVersion === 1)
+            .at(-1)!;
+          tamperRootTransitionField(entry as MutableRootTransition, field);
+          await writeFile(path, `${entries.map((candidate) => JSON.stringify(candidate)).join('\n')}\n`);
+        }
+
+        await assert.rejects(
+          () => reconcileUltragoalRootGoal(cwd, {
+            codexGoal: fixture.snapshot,
+            evidence: `Reject forged ledger ${field}.`,
+            expectedRevision: withBefore ? 1 : 0,
+          }),
+          /root goal reconciliation/i,
+          field,
+        );
+      });
+    }
+  });
+
+  it('replays each durable projection boundary without duplicating the root event', async () => {
+    for (const boundary of ['canonical-plan', 'both-plans', 'namespaced-ledger'] as const) {
+      await withTempRepo(async (cwd) => {
+        const created = await createUltragoalPlan(cwd, {
+          brief: 'brief',
+          goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+        });
+        const flatPlanPath = join(cwd, '.omx/ultragoal/goals.json');
+        const namespacedPlanPath = join(ultragoalRunDir(cwd, created.runId!), 'goals.json');
+        const flatLedgerPath = join(cwd, '.omx/ultragoal/ledger.jsonl');
+        const namespacedLedgerPath = join(ultragoalRunDir(cwd, created.runId!), 'ledger.jsonl');
+        const predecessorPlan = await readFile(namespacedPlanPath, 'utf-8');
+        const predecessorLedger = await readFile(namespacedLedgerPath, 'utf-8');
+        const snapshot = { goal: { threadId: 'successor', objective: 'Current successor', status: 'active' } };
+        await reconcileUltragoalRootGoal(cwd, {
+          codexGoal: snapshot,
+          evidence: 'Commit a reconciliation for boundary replay.',
+          expectedRevision: 0,
+        });
+        const committedPlan = await readFile(namespacedPlanPath, 'utf-8');
+        const committedLedger = await readFile(namespacedLedgerPath, 'utf-8');
+
+        if (boundary === 'canonical-plan') {
+          await writeFile(flatPlanPath, predecessorPlan);
+          await writeFile(namespacedLedgerPath, predecessorLedger);
+          await writeFile(flatLedgerPath, predecessorLedger);
+        } else if (boundary === 'both-plans') {
+          await writeFile(namespacedLedgerPath, predecessorLedger);
+          await writeFile(flatLedgerPath, predecessorLedger);
+        } else {
+          await writeFile(flatLedgerPath, predecessorLedger);
+        }
+
+        const replayed = await reconcileUltragoalRootGoal(cwd, {
+          codexGoal: snapshot,
+          evidence: `Replay after ${boundary}.`,
+          expectedRevision: 0,
+        });
+        assert.equal(replayed.deduped, true, boundary);
+        assert.equal(await readFile(flatPlanPath, 'utf-8'), committedPlan, boundary);
+        assert.equal(await readFile(namespacedPlanPath, 'utf-8'), committedPlan, boundary);
+        assert.equal(await readFile(flatLedgerPath, 'utf-8'), committedLedger, boundary);
+        assert.equal(await readFile(namespacedLedgerPath, 'utf-8'), committedLedger, boundary);
+        assert.equal((committedLedger.match(/"eventVersion":1/g) ?? []).length, 1, boundary);
+      });
+    }
+  });
+
+  it('serializes legacy read migrations and records each migration once', async () => {
+    await withTempRepo(async (cwd) => {
+      await mkdir(join(cwd, '.omx/ultragoal'), { recursive: true });
+      const legacyObjective = 'Complete all ultragoal stories in .omx/ultragoal/goals.json: G001-first First';
+      await writeFile(join(cwd, '.omx/ultragoal/goals.json'), `${JSON.stringify({
+        version: 1,
+        createdAt: '2026-08-01T00:00:00.000Z',
+        updatedAt: '2026-08-01T00:00:00.000Z',
+        briefPath: '.omx/ultragoal/brief.md',
+        goalsPath: '.omx/ultragoal/goals.json',
+        ledgerPath: '.omx/ultragoal/ledger.jsonl',
+        codexGoalMode: 'aggregate',
+        codexObjective: legacyObjective,
+        goals: [{
+          id: 'G001-first',
+          title: 'First',
+          objective: 'Complete first.',
+          status: 'completed',
+          attempt: 1,
+          createdAt: '2026-08-01T00:00:00.000Z',
+          updatedAt: '2026-08-01T00:00:00.000Z',
+        }],
+      }, null, 2)}\n`);
+      await writeFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), '');
+
+      const [first, second] = await Promise.all([
+        readUltragoalPlan(cwd),
+        readUltragoalPlan(cwd),
+      ]);
+      assert.deepEqual(first, second);
+      assert.equal(first.goals[0]?.status, 'complete');
+      assert.equal(first.codexObjective, ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"plan_migrated"/g) ?? []).length, 1);
+      assert.equal((ledger.match(/"event":"aggregate_objective_migrated"/g) ?? []).length, 1);
+    });
+  });
+
+  it('rejects an unrelated flat plan before writing reconciliation artifacts', async () => {
+    await withTempRepo(async (cwd) => {
+      const created = await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+      });
+      const flatPlanPath = join(cwd, '.omx/ultragoal/goals.json');
+      const namespacedPlanPath = join(ultragoalRunDir(cwd, created.runId!), 'goals.json');
+      const flatLedgerPath = join(cwd, '.omx/ultragoal/ledger.jsonl');
+      const namespacedLedgerPath = join(ultragoalRunDir(cwd, created.runId!), 'ledger.jsonl');
+      const unrelated = { ...created, runId: 'unrelated-run' };
+      await writeFile(flatPlanPath, `${JSON.stringify(unrelated, null, 2)}\n`);
+      const before = await Promise.all([
+        readFile(flatPlanPath, 'utf-8'),
+        readFile(namespacedPlanPath, 'utf-8'),
+        readFile(flatLedgerPath, 'utf-8'),
+        readFile(namespacedLedgerPath, 'utf-8'),
+      ]);
+
+      await assert.rejects(
+        () => reconcileUltragoalRootGoal(cwd, {
+          codexGoal: { goal: { threadId: 'successor', objective: 'Current successor', status: 'active' } },
+          evidence: 'Wrong-run flat plan must fail.',
+          expectedRevision: 0,
+        }),
+        /Flat Ultragoal plan is neither/,
+      );
+      assert.deepEqual(await Promise.all([
+        readFile(flatPlanPath, 'utf-8'),
+        readFile(namespacedPlanPath, 'utf-8'),
+        readFile(flatLedgerPath, 'utf-8'),
+        readFile(namespacedLedgerPath, 'utf-8'),
+      ]), before);
     });
   });
 

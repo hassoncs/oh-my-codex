@@ -6,6 +6,7 @@ export type CodexGoalSnapshotStatus = 'active' | 'complete' | 'cancelled' | 'fai
 
 export interface CodexGoalSnapshot {
   available: boolean;
+  threadId?: string;
   objective?: string;
   status?: CodexGoalSnapshotStatus;
   tokenBudget?: number;
@@ -24,6 +25,7 @@ export interface CodexGoalReconciliation {
 
 export interface ReconcileCodexGoalOptions {
   expectedObjective: string;
+  expectedThreadId?: string;
   acceptedObjectives?: readonly string[];
   allowedStatuses?: readonly CodexGoalSnapshotStatus[];
   requireSnapshot?: boolean;
@@ -42,6 +44,25 @@ function safeString(value: unknown): string {
 
 function safeNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function boundedText(value: unknown, label: string, maxLength: number): string {
+  const text = safeString(value);
+  if (!text) return '';
+  if (text.length > maxLength) throw new CodexGoalSnapshotError(`${label} exceeds ${maxLength} characters.`);
+  if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(text)) {
+    throw new CodexGoalSnapshotError(`${label} contains invalid control characters.`);
+  }
+  return text;
+}
+
+function selectConsistentText(nested: unknown, root: unknown, label: string, maxLength: number): string {
+  const nestedText = boundedText(nested, `nested ${label}`, maxLength);
+  const rootText = boundedText(root, `root ${label}`, maxLength);
+  if (nestedText && rootText && nestedText !== rootText) {
+    throw new CodexGoalSnapshotError(`Conflicting nested and root ${label} values.`);
+  }
+  return nestedText || rootText;
 }
 
 function normalizeStatus(value: unknown): CodexGoalSnapshotStatus {
@@ -81,6 +102,10 @@ export function isCodexGoalDbSchemaContextError(message: string | undefined): bo
 }
 
 export function parseCodexGoalSnapshot(value: unknown): CodexGoalSnapshot {
+  const serialized = JSON.stringify(value) ?? '';
+  if (serialized.length > 131_072) {
+    throw new CodexGoalSnapshotError('Codex goal snapshot exceeds 131072 serialized characters.');
+  }
   const root = safeObject(value);
   const hasGoalProperty = Object.hasOwn(root, 'goal');
   const goalValue = hasGoalProperty ? root.goal : value;
@@ -108,13 +133,27 @@ export function parseCodexGoalSnapshot(value: unknown): CodexGoalSnapshot {
   }
 
   const goal = safeObject(goalValue);
-  const objective = safeString(
-    goal.objective
-    ?? goal.goal
-    ?? goal.description
-    ?? root.objective,
+  const threadId = selectConsistentText(
+    goal.threadId ?? goal.thread_id,
+    root.threadId ?? root.thread_id,
+    'threadId',
+    256,
   );
-  const status = normalizeStatus(goal.status ?? root.status);
+  if (threadId && /\s/.test(threadId)) {
+    throw new CodexGoalSnapshotError('Codex goal snapshot threadId must not contain whitespace.');
+  }
+  const objective = selectConsistentText(
+    goal.objective ?? goal.goal ?? goal.description,
+    root.objective,
+    'objective',
+    4_000,
+  );
+  const nestedStatus = normalizeStatus(goal.status);
+  const rootStatus = normalizeStatus(root.status);
+  if (nestedStatus !== 'unknown' && rootStatus !== 'unknown' && nestedStatus !== rootStatus) {
+    throw new CodexGoalSnapshotError('Conflicting nested and root status values.');
+  }
+  const status = nestedStatus !== 'unknown' ? nestedStatus : rootStatus;
   const tokenBudget = safeNumber(
     goal.token_budget
     ?? goal.tokenBudget
@@ -125,6 +164,7 @@ export function parseCodexGoalSnapshot(value: unknown): CodexGoalSnapshot {
 
   return {
     available: Boolean(objective || status !== 'unknown'),
+    ...(threadId ? { threadId } : {}),
     ...(objective ? { objective } : {}),
     status,
     ...(tokenBudget !== undefined ? { tokenBudget } : {}),
@@ -136,19 +176,23 @@ export function parseCodexGoalSnapshot(value: unknown): CodexGoalSnapshot {
 export async function readCodexGoalSnapshotInput(raw: string | undefined, cwd = process.cwd()): Promise<CodexGoalSnapshot | null> {
   if (!raw?.trim()) return null;
   const trimmed = raw.trim();
+  let inline: unknown;
   try {
-    return parseCodexGoalSnapshot(JSON.parse(trimmed));
+    inline = JSON.parse(trimmed);
   } catch {
     const path = resolve(cwd, trimmed);
     if (!existsSync(path)) {
       throw new CodexGoalSnapshotError(`Codex goal snapshot is neither valid JSON nor a readable path: ${trimmed}`);
     }
+    let fileValue: unknown;
     try {
-      return parseCodexGoalSnapshot(JSON.parse(await readFile(path, 'utf-8')));
+      fileValue = JSON.parse(await readFile(path, 'utf-8'));
     } catch (error) {
       throw new CodexGoalSnapshotError(`Codex goal snapshot path does not contain valid JSON: ${trimmed}${error instanceof Error ? ` (${error.message})` : ''}`);
     }
+    return parseCodexGoalSnapshot(fileValue);
   }
+  return parseCodexGoalSnapshot(inline);
 }
 
 export function reconcileCodexGoalSnapshot(
@@ -180,6 +224,15 @@ export function reconcileCodexGoalSnapshot(
     errors.push('Codex goal snapshot is missing objective text.');
   } else if (!accepted.has(actual)) {
     errors.push(`Codex goal objective mismatch: expected "${expected}", got "${actual}".`);
+  }
+
+  if (options.expectedThreadId) {
+    const actualThreadId = safeString(effectiveSnapshot.threadId);
+    if (!actualThreadId) {
+      errors.push('Codex goal snapshot is missing threadId.');
+    } else if (actualThreadId !== options.expectedThreadId) {
+      errors.push(`Codex goal threadId mismatch: expected "${options.expectedThreadId}", got "${actualThreadId}".`);
+    }
   }
 
   const allowed = options.allowedStatuses ?? (options.requireComplete ? ['complete'] : ['active', 'complete']);

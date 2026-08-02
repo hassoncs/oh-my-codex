@@ -246,9 +246,9 @@ describe('package bin contract', () => {
 
     const binEntry = results[0]?.files?.find((file) => file.path === 'dist/cli/omx.js');
     assert.ok(binEntry, 'expected npm pack output to include dist/cli/omx.js');
-    const distLockEntry = results[0]?.files?.find((file) => file.path === 'src/scripts/dist-lock.js');
+    const distLockEntry = results[0]?.files?.find((file) => file.path === 'dist/scripts/dist-lock.js');
     const distChildLeaseEntry = results[0]?.files?.find((file) => file.path === 'src/scripts/dist-lock-child-lease.js');
-    assert.ok(distLockEntry, 'expected npm pack output to include dist lock runtime');
+    assert.ok(distLockEntry, 'expected npm pack output to include compiled dist lock runtime');
     assert.ok(distChildLeaseEntry, 'expected npm pack output to include dist child lease gate');
 
     const packagedHarnessPath = process.platform === 'win32' ? 'bin/omx-explore-harness.exe' : 'bin/omx-explore-harness';

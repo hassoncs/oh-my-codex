@@ -20,6 +20,7 @@ test('packed install smoke stays limited to boot + core commands', () => {
   assert.deepEqual(PACKED_INSTALL_SMOKE_CORE_COMMANDS, [
     ['--help'],
     ['version'],
+    ['ultragoal', '--help'],
     ['api', '--help'],
     ['sparkshell', '--help'],
   ]);

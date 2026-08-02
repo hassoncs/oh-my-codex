@@ -22,7 +22,7 @@ All artifacts live under `.omx/ultragoal/`:
 
 - `brief.md` — original project/conversation brief.
 - `goals.json` — ordered durable plan with status, attempts, evidence, and the active goal id.
-- `ledger.jsonl` — append-only checkpoint and steering events (`plan_created`, `goal_started`, `goal_resumed`, `goal_completed`, `goal_blocked`, `goal_failed`, `goal_retried`, `aggregate_objective_migrated`, `goal_added`, `steering_accepted`, `steering_rejected`, `final_review_failed`, `goal_review_blocked`).
+- `ledger.jsonl` — append-only checkpoint and steering events (`plan_created`, `goal_started`, `goal_resumed`, `goal_completed`, `goal_blocked`, `goal_failed`, `goal_retried`, `aggregate_objective_migrated`, `root_goal_reconciled`, `goal_added`, `steering_accepted`, `steering_rejected`, `final_review_failed`, `goal_review_blocked`).
 
 In aggregate mode, `goals.json` also stores:
 
@@ -32,6 +32,30 @@ In aggregate mode, `goals.json` also stores:
 Existing aggregate plans with the legacy enumerated objective are migrated to this pointer objective when read; the migration is persisted to `goals.json`, the previous objective is retained in `codexObjectiveAliases` so an already-active hidden Codex goal can still reconcile, and the change is audited with an `aggregate_objective_migrated` ledger entry.
 
 ## Commands
+
+Reconcile an explicitly reset active Codex goal with an unfinished adopted aggregate run:
+
+```sh
+omx ultragoal reconcile-root-goal \
+  --codex-goal-json ./get-goal.json \
+  --evidence "Chris explicitly reset the active goal and preserved this run." \
+  --expected-revision 0 \
+  --expected-flat-ledger-sha256 <sha256> \
+  --expected-namespaced-ledger-sha256 <sha256> \
+  --json
+```
+
+This command requires a fresh active snapshot with exact thread identity, keeps
+the canonical aggregate `codexObjective` unchanged, records a revisioned
+`codexRootBinding`, and converges both projections with one deterministic
+`root_goal_reconciled` event. When flat and namespaced ledgers differ, pass both
+exact preflight SHA-256 digests; the command additionally requires an exact
+prefix/suffix relationship and a `plan_created` anchor for the active run before
+preserving the longer history. Use `--expected-current-thread-id` for a later
+revision to attest the currently bound identity, not the successor identity.
+Incompatible histories, wrong hashes, stale revisions, objective drift,
+completed goals, and unowned runs fail loud. Exact retries repair interrupted
+projection writes without appending another event.
 
 Create a plan:
 

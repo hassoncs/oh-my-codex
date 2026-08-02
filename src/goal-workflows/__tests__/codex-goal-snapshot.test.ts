@@ -13,11 +13,17 @@ import {
 describe('codex goal snapshot reconciliation', () => {
   it('normalizes get_goal JSON shape', () => {
     const snapshot = parseCodexGoalSnapshot({
-      goal: { objective: 'Ship the feature', status: 'completed', token_budget: 1000 },
+      goal: {
+        threadId: '019fbae5-b750-7ab2-875f-e36bcdeb3981',
+        objective: 'Ship the feature',
+        status: 'completed',
+        token_budget: 1000,
+      },
       remainingTokens: 25,
     });
 
     assert.equal(snapshot.available, true);
+    assert.equal(snapshot.threadId, '019fbae5-b750-7ab2-875f-e36bcdeb3981');
     assert.equal(snapshot.objective, 'Ship the feature');
     assert.equal(snapshot.status, 'complete');
     assert.equal(snapshot.tokenBudget, 1000);
@@ -40,6 +46,43 @@ describe('codex goal snapshot reconciliation', () => {
     assert.equal(normal.available, true);
     assert.equal(normal.objective, 'Ship despite noisy wrapper metadata');
     assert.equal(normal.unavailableReason, undefined);
+  });
+
+  it('accepts compatible root identity fields but rejects conflicting snapshot envelopes', () => {
+    const compatible = parseCodexGoalSnapshot({
+      threadId: 'same-thread',
+      objective: 'Same objective',
+      status: 'running',
+      goal: {
+        threadId: 'same-thread',
+        objective: 'Same objective',
+        status: 'active',
+      },
+    });
+    assert.equal(compatible.threadId, 'same-thread');
+    assert.equal(compatible.status, 'active');
+
+    assert.throws(
+      () => parseCodexGoalSnapshot({
+        threadId: 'root-thread',
+        goal: { threadId: 'nested-thread', objective: 'Same objective', status: 'active' },
+      }),
+      /Conflicting nested and root threadId/,
+    );
+    assert.throws(
+      () => parseCodexGoalSnapshot({
+        objective: 'Root objective',
+        goal: { threadId: 'same-thread', objective: 'Nested objective', status: 'active' },
+      }),
+      /Conflicting nested and root objective/,
+    );
+    assert.throws(
+      () => parseCodexGoalSnapshot({
+        status: 'complete',
+        goal: { threadId: 'same-thread', objective: 'Same objective', status: 'active' },
+      }),
+      /Conflicting nested and root status/,
+    );
   });
 
   it('reports absent snapshots as warnings unless required', () => {
@@ -96,6 +139,22 @@ describe('codex goal snapshot reconciliation', () => {
     assert.deepEqual(result.errors, []);
   });
 
+  it('requires the bound thread identity when requested', () => {
+    const result = reconcileCodexGoalSnapshot(
+      parseCodexGoalSnapshot({
+        goal: { threadId: 'wrong-thread', objective: 'Expected objective', status: 'active' },
+      }),
+      {
+        expectedObjective: 'Expected objective',
+        expectedThreadId: 'expected-thread',
+        requireSnapshot: true,
+      },
+    );
+
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join('\n'), /threadId mismatch/);
+  });
+
   it('reads inline JSON and path input but rejects malformed sources', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-codex-goal-snapshot-'));
     try {
@@ -106,6 +165,14 @@ describe('codex goal snapshot reconciliation', () => {
       const fromPath = await readCodexGoalSnapshotInput('goal.json', cwd);
       assert.equal(fromPath?.objective, 'B');
 
+      await writeFile(join(cwd, 'goal.json'), JSON.stringify({
+        threadId: 'root-thread',
+        goal: { threadId: 'nested-thread', objective: 'B', status: 'active' },
+      }));
+      await assert.rejects(
+        () => readCodexGoalSnapshotInput('goal.json', cwd),
+        /Conflicting nested and root threadId/,
+      );
       await assert.rejects(
         () => readCodexGoalSnapshotInput('{not-json}', cwd),
         CodexGoalSnapshotError,

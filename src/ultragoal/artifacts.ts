@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
 import { appendFile, mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { join, relative } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import {
   formatCodexGoalReconciliation,
   buildCompletedCodexGoalRemediation,
@@ -12,6 +13,11 @@ import {
   buildUnsupportedNativeSubagentGuidance,
   type NativeSubagentSupportEvidence,
 } from '../leader/contract.js';
+import {
+  recoverStaleOwnedLock,
+  releaseOwnedLock,
+  tryCreateOwnedLock,
+} from '../scripts/dist-lock.js';
 
 import {
   ULTRAGOAL_BRIEF,
@@ -180,6 +186,55 @@ export interface UltragoalAggregateCompletion {
   codexGoal?: unknown;
 }
 
+export interface UltragoalCodexRootBinding {
+  threadId: string;
+  objective: string;
+  revision: number;
+}
+
+export type UltragoalLedgerAncestryRelation =
+  | 'equal'
+  | 'flat_only'
+  | 'namespaced_only'
+  | 'flat_has_namespaced_prefix'
+  | 'flat_has_namespaced_suffix'
+  | 'namespaced_has_flat_prefix'
+  | 'namespaced_has_flat_suffix';
+
+export interface UltragoalLedgerAncestry {
+  relation: UltragoalLedgerAncestryRelation;
+  flatDigest?: string;
+  namespacedDigest?: string;
+  selectedDigest: string;
+  runAnchorDigest?: string;
+  runAnchorLine?: number;
+}
+
+export interface UltragoalRootGoalTransition {
+  transitionVersion: 1;
+  snapshotDigest: string;
+  evidenceDigest: string;
+  evidence: string;
+  reconciledAt: string;
+  beforePlanDigest: string;
+  ledgerAncestry: UltragoalLedgerAncestry;
+  normalization?: {
+    migratedStatuses: number;
+    previousObjective?: string;
+  };
+  before?: UltragoalCodexRootBinding;
+  legacyBefore?: {
+    rootGoalId?: string;
+    codexThreadId?: string;
+    codexObjective?: string;
+  };
+  after: UltragoalCodexRootBinding;
+}
+
+export interface UltragoalRootGoalReconciliation extends UltragoalRootGoalTransition {
+  eventId: string;
+}
+
 export interface UltragoalArchitectureInvariantEvidence {
   invariant: string;
   source: string;
@@ -207,6 +262,8 @@ export interface UltragoalPlan {
   codexGoalMode?: UltragoalCodexGoalMode;
   codexObjective?: string;
   codexObjectiveAliases?: string[];
+  codexRootBinding?: UltragoalCodexRootBinding;
+  rootGoalReconciliation?: UltragoalRootGoalReconciliation;
   aggregateCompletion?: UltragoalAggregateCompletion;
   activeGoalId?: string;
   goals: UltragoalItem[];
@@ -226,6 +283,7 @@ export interface UltragoalLedgerEntry {
     | 'goal_retried'
     | 'aggregate_completed'
     | 'aggregate_objective_migrated'
+    | 'root_goal_reconciled'
     | 'goal_added'
     | 'steering_accepted'
     | 'steering_rejected'
@@ -245,6 +303,17 @@ export interface UltragoalLedgerEntry {
   blockerSignature?: string;
   blockerOccurrenceCount?: number;
   requiredExternalDecision?: string;
+  eventId?: string;
+  eventVersion?: number;
+  transitionVersion?: number;
+  runId?: string;
+  revision?: number;
+  snapshotDigest?: string;
+  evidenceDigest?: string;
+  beforePlanDigest?: string;
+  ledgerAncestry?: UltragoalLedgerAncestry;
+  normalization?: UltragoalRootGoalTransition['normalization'];
+  legacyBefore?: UltragoalRootGoalTransition['legacyBefore'];
 }
 
 export interface CreateUltragoalOptions {
@@ -282,6 +351,25 @@ export interface AddUltragoalGoalOptions {
   objective: string;
   evidence?: string;
   now?: Date;
+}
+
+export interface ReconcileUltragoalRootGoalOptions {
+  codexGoal: unknown;
+  evidence: string;
+  expectedRevision: number;
+  expectedCurrentThreadId?: string;
+  expectedFlatLedgerDigest?: string;
+  expectedNamespacedLedgerDigest?: string;
+  now?: Date;
+}
+
+export interface ReconcileUltragoalRootGoalResult {
+  plan: UltragoalPlan;
+  deduped: boolean;
+  eventId: string;
+  before?: UltragoalCodexRootBinding;
+  after: UltragoalCodexRootBinding;
+  repairedProjections: string[];
 }
 
 export type UltragoalReviewBlockerClass = 'evidence_stale' | 'substantive';
@@ -750,13 +838,14 @@ function isLegacyEnumeratedAggregateObjective(objective: string | undefined): bo
 }
 
 function compatibleCodexObjectives(plan: UltragoalPlan): string[] {
+  if (plan.codexRootBinding) return [];
   return (plan.codexObjectiveAliases ?? [])
     .filter((objective) => isLegacyEnumeratedAggregateObjective(objective));
 }
 
 function expectedCodexObjective(plan: UltragoalPlan, goal: UltragoalItem): string {
   return codexGoalMode(plan) === 'aggregate'
-    ? (plan.codexObjective ?? aggregateCodexObjective(plan.goals))
+    ? (plan.codexRootBinding?.objective ?? plan.codexObjective ?? aggregateCodexObjective(plan.goals))
     : goal.objective;
 }
 
@@ -871,26 +960,37 @@ function sleep(ms: number): Promise<void> {
 async function withUltragoalMutationLock<T>(cwd: string, operation: () => Promise<T>): Promise<T> {
   await mkdir(ultragoalDir(cwd), { recursive: true });
   const lockPath = join(ultragoalDir(cwd), ULTRAGOAL_MUTATION_LOCK);
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  const token = `${process.pid}.${Date.now()}.${randomUUID()}`;
+  let acquired = false;
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    try {
-      handle = await open(lockPath, 'wx');
-      await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: iso() }));
+    if (tryCreateOwnedLock(lockPath, {
+      token,
+      pid: process.pid,
+      created_at: iso(),
+    })) {
+      acquired = true;
       break;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== 'EEXIST') throw error;
-      await sleep(Math.min(25 + attempt * 5, 250));
     }
+    recoverStaleOwnedLock(lockPath, 30_000);
+    await sleep(Math.min(25 + attempt * 5, 250));
   }
-  if (!handle) {
+  if (!acquired) {
     throw new UltragoalError(`Timed out waiting for ultragoal mutation lock at ${repoRelative(cwd, lockPath)}.`);
   }
+  let operationError: unknown;
   try {
     return await operation();
+  } catch (error) {
+    operationError = error;
+    throw error;
   } finally {
-    await handle.close().catch(() => undefined);
-    await rm(lockPath, { force: true }).catch(() => undefined);
+    if (!releaseOwnedLock(lockPath, token)) {
+      const releaseError = new UltragoalError(`Lost ownership of ultragoal mutation lock at ${repoRelative(cwd, lockPath)}.`);
+      if (operationError) {
+        throw new AggregateError([operationError, releaseError], releaseError.message);
+      }
+      throw releaseError;
+    }
   }
 }
 
@@ -923,7 +1023,7 @@ async function appendLegacyStatusMigration(cwd: string, migratedStatuses: number
   });
 }
 
-export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
+async function loadUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
   const path = ultragoalGoalsPath(cwd);
   let raw: string;
   try {
@@ -954,6 +1054,18 @@ export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
       },
     );
   }
+  return parsed;
+}
+
+function requiresLegacyPlanMigration(plan: UltragoalPlan): boolean {
+  return plan.goals.some((goal) => (goal.status as string) === 'completed')
+    || (
+      codexGoalMode(plan) === 'aggregate'
+      && isLegacyEnumeratedAggregateObjective(plan.codexObjective)
+    );
+}
+
+async function migrateUltragoalPlanUnderLock(cwd: string, parsed: UltragoalPlan): Promise<UltragoalPlan> {
   const migratedStatuses = normalizeLegacyGoalStatuses(parsed);
   const objectiveMigrated = codexGoalMode(parsed) === 'aggregate' && isLegacyEnumeratedAggregateObjective(parsed.codexObjective);
   if (migratedStatuses > 0 || objectiveMigrated) {
@@ -979,10 +1091,44 @@ export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
   return parsed;
 }
 
+async function readUltragoalPlanUnderLock(cwd: string): Promise<UltragoalPlan> {
+  return migrateUltragoalPlanUnderLock(cwd, await loadUltragoalPlan(cwd));
+}
+
+export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
+  const plan = await loadUltragoalPlan(cwd);
+  if (!requiresLegacyPlanMigration(plan)) return plan;
+  return withUltragoalMutationLock(cwd, () => readUltragoalPlanUnderLock(cwd));
+}
+
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
+  await writeTextAtomic(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function writeTextAtomic(path: string, value: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
   const tmpPath = `${path}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`);
-  await rename(tmpPath, path);
+  const handle = await open(tmpPath, 'w', 0o600);
+  try {
+    await handle.writeFile(value);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await rename(tmpPath, path);
+    if (process.platform !== 'win32') {
+      const directory = await open(dirname(path), 'r');
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
+    }
+  } catch (error) {
+    await rm(tmpPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 /**
@@ -1166,6 +1312,878 @@ export async function adoptUltragoalRun(cwd: string, options: { now?: Date } = {
   });
 }
 
+function digestJson(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(value), 'utf-8').digest('hex');
+}
+
+function digestText(value: string): string {
+  return createHash('sha256').update(value, 'utf-8').digest('hex');
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+}
+
+function isCodexRootBinding(value: unknown): value is UltragoalCodexRootBinding {
+  if (!isRecord(value)) return false;
+  return typeof value.threadId === 'string'
+    && value.threadId.length > 0
+    && !/\s/.test(value.threadId)
+    && typeof value.objective === 'string'
+    && value.objective.length > 0
+    && Number.isSafeInteger(value.revision)
+    && Number(value.revision) > 0;
+}
+
+function sameCodexRootBinding(
+  left: UltragoalCodexRootBinding | undefined,
+  right: UltragoalCodexRootBinding | undefined,
+): boolean {
+  if (!left || !right) return left === right;
+  return left.threadId === right.threadId
+    && left.objective === right.objective
+    && left.revision === right.revision;
+}
+
+interface CanonicalUltragoalPlan {
+  path: string;
+  raw: string;
+  plan: UltragoalPlan;
+}
+
+function rootGoalTransitionEnvelope(
+  runId: string,
+  transition: UltragoalRootGoalTransition,
+): Record<string, unknown> {
+  return {
+    contract: 'root-goal-reconcile-transition/v1',
+    transitionVersion: transition.transitionVersion,
+    runId,
+    reconciledAt: transition.reconciledAt,
+    beforePlanDigest: transition.beforePlanDigest,
+    ledgerAncestry: transition.ledgerAncestry,
+    snapshotDigest: transition.snapshotDigest,
+    evidenceDigest: transition.evidenceDigest,
+    ...(transition.normalization ? { normalization: transition.normalization } : {}),
+    ...(transition.before ? { before: transition.before } : {}),
+    ...(transition.legacyBefore ? { legacyBefore: transition.legacyBefore } : {}),
+    after: transition.after,
+  };
+}
+
+function expectedRootGoalEventId(
+  runId: string,
+  transition: UltragoalRootGoalTransition,
+): string {
+  return digestJson(rootGoalTransitionEnvelope(runId, transition));
+}
+
+function assertRootGoalTransition(
+  value: unknown,
+  label: string,
+): asserts value is UltragoalRootGoalTransition {
+  if (!isRecord(value)) {
+    throw new UltragoalError(`${label} is malformed.`);
+  }
+  const transition = value as unknown as UltragoalRootGoalTransition;
+  if (
+    transition.transitionVersion !== 1
+    || typeof transition.evidence !== 'string'
+    || transition.evidence.length === 0
+    || typeof transition.reconciledAt !== 'string'
+    || transition.reconciledAt.length === 0
+    || !isSha256(transition.beforePlanDigest)
+    || !isSha256(transition.snapshotDigest)
+    || !isSha256(transition.evidenceDigest)
+    || !isRecord(transition.ledgerAncestry)
+    || !isSha256(transition.ledgerAncestry.selectedDigest)
+    || !isCodexRootBinding(transition.after)
+  ) {
+    throw new UltragoalError(`${label} is malformed.`);
+  }
+  if (transition.before !== undefined && !isCodexRootBinding(transition.before)) {
+    throw new UltragoalError(`${label} before binding is malformed.`);
+  }
+  const expectedRevision = (transition.before?.revision ?? 0) + 1;
+  if (transition.after.revision !== expectedRevision) {
+    throw new UltragoalError(`${label} revision continuity is invalid.`);
+  }
+  if (
+    transition.ledgerAncestry.flatDigest !== undefined
+    && !isSha256(transition.ledgerAncestry.flatDigest)
+  ) {
+    throw new UltragoalError(`${label} flat ledger ancestry digest is malformed.`);
+  }
+  if (
+    transition.ledgerAncestry.namespacedDigest !== undefined
+    && !isSha256(transition.ledgerAncestry.namespacedDigest)
+  ) {
+    throw new UltragoalError(`${label} namespaced ledger ancestry digest is malformed.`);
+  }
+  const ancestryRequiresAnchor = transition.ledgerAncestry.relation !== 'equal'
+    && transition.ledgerAncestry.relation !== 'flat_only'
+    && transition.ledgerAncestry.relation !== 'namespaced_only';
+  if (
+    ancestryRequiresAnchor
+    && (
+      !isSha256(transition.ledgerAncestry.runAnchorDigest)
+      || !Number.isSafeInteger(transition.ledgerAncestry.runAnchorLine)
+      || Number(transition.ledgerAncestry.runAnchorLine) <= 0
+    )
+  ) {
+    throw new UltragoalError(`${label} divergent ledger ancestry lacks a valid run anchor.`);
+  }
+  const relations: readonly UltragoalLedgerAncestryRelation[] = [
+    'equal',
+    'flat_only',
+    'namespaced_only',
+    'flat_has_namespaced_prefix',
+    'flat_has_namespaced_suffix',
+    'namespaced_has_flat_prefix',
+    'namespaced_has_flat_suffix',
+  ];
+  if (!relations.includes(transition.ledgerAncestry.relation)) {
+    throw new UltragoalError(`${label} ledger ancestry relation is malformed.`);
+  }
+  if (transition.evidenceDigest !== digestJson(transition.evidence)) {
+    throw new UltragoalError(`${label} evidence digest mismatch.`);
+  }
+  if (transition.snapshotDigest !== digestJson({
+    threadId: transition.after.threadId,
+    objective: transition.after.objective,
+    status: 'active',
+  })) {
+    throw new UltragoalError(`${label} snapshot digest mismatch.`);
+  }
+  if (transition.normalization) {
+    if (
+      !Number.isSafeInteger(transition.normalization.migratedStatuses)
+      || transition.normalization.migratedStatuses < 0
+      || (
+        transition.normalization.previousObjective !== undefined
+        && (
+          typeof transition.normalization.previousObjective !== 'string'
+          || transition.normalization.previousObjective.length === 0
+        )
+      )
+    ) {
+      throw new UltragoalError(`${label} normalization receipt is malformed.`);
+    }
+  }
+  if (transition.legacyBefore !== undefined) {
+    if (
+      !isRecord(transition.legacyBefore)
+      || Object.keys(transition.legacyBefore).length === 0
+      || Object.values(transition.legacyBefore).some((entry) => (
+        typeof entry !== 'string' || entry.length === 0
+      ))
+    ) {
+      throw new UltragoalError(`${label} legacy predecessor is malformed.`);
+    }
+  }
+}
+
+function assertRootGoalReconciliationReceipt(plan: UltragoalPlan): void {
+  const binding = plan.codexRootBinding;
+  const receipt = plan.rootGoalReconciliation;
+  if (!binding && !receipt) return;
+  if (!binding || !receipt) {
+    throw new UltragoalError('Canonical Codex root binding and reconciliation receipt must exist together.');
+  }
+  if (!isCodexRootBinding(binding)) {
+    throw new UltragoalError('Canonical Codex root binding is malformed.');
+  }
+  assertRootGoalTransition(receipt, 'Canonical Codex root reconciliation receipt');
+  if (!sameCodexRootBinding(binding, receipt.after)) {
+    throw new UltragoalError('Canonical Codex root binding does not match its reconciliation receipt.');
+  }
+  if (!plan.runId || receipt.eventId !== expectedRootGoalEventId(plan.runId, receipt)) {
+    throw new UltragoalError('Canonical Codex root reconciliation event id mismatch.');
+  }
+}
+
+async function readCanonicalUltragoalPlan(cwd: string): Promise<CanonicalUltragoalPlan> {
+  const pointer = await readActiveRunPointer(cwd);
+  if (!pointer) {
+    throw new UltragoalError('Root goal reconciliation requires an active namespaced run; run `omx ultragoal adopt-run` first.');
+  }
+  const path = join(ultragoalRunDir(cwd, pointer.runId), ULTRAGOAL_GOALS);
+  let plan: UltragoalPlan;
+  let raw: string;
+  try {
+    raw = await readFile(path, 'utf-8');
+    plan = JSON.parse(raw) as UltragoalPlan;
+  } catch (error) {
+    throw new UltragoalError(`Cannot read canonical Ultragoal plan at ${repoRelative(cwd, path)}${error instanceof Error ? `: ${error.message}` : ''}.`);
+  }
+  if (plan.version !== 1 || !Array.isArray(plan.goals) || plan.runId !== pointer.runId) {
+    throw new UltragoalError(`Canonical Ultragoal plan does not match active run ${pointer.runId}.`);
+  }
+  if (await isUnownedInheritedRegistry(plan.origin, cwd)) {
+    throw new UltragoalError('Refusing root goal reconciliation for an Ultragoal run not adopted by this worktree.');
+  }
+  if (pointer.briefHash !== plan.briefHash || digestJson(pointer.origin) !== digestJson(plan.origin)) {
+    throw new UltragoalError('Active Ultragoal pointer metadata does not match the canonical run.');
+  }
+  assertRootGoalReconciliationReceipt(plan);
+  return { path, raw, plan };
+}
+
+function rootGoalLedgerEntry(plan: UltragoalPlan, receipt: UltragoalRootGoalReconciliation): UltragoalLedgerEntry {
+  return {
+    ts: receipt.reconciledAt,
+    event: 'root_goal_reconciled',
+    eventVersion: 1,
+    transitionVersion: receipt.transitionVersion,
+    eventId: receipt.eventId,
+    runId: plan.runId,
+    revision: receipt.after.revision,
+    snapshotDigest: receipt.snapshotDigest,
+    evidence: receipt.evidence,
+    evidenceDigest: receipt.evidenceDigest,
+    beforePlanDigest: receipt.beforePlanDigest,
+    ledgerAncestry: receipt.ledgerAncestry,
+    normalization: receipt.normalization,
+    legacyBefore: receipt.legacyBefore,
+    message: `Reconciled aggregate Ultragoal run ${plan.runId} to active Codex thread ${receipt.after.threadId}.`,
+    before: receipt.before,
+    after: receipt.after,
+  };
+}
+
+interface ValidatedLedger {
+  state: 'missing' | 'empty' | 'present';
+  raw: string;
+  entries: UltragoalLedgerEntry[];
+  digest?: string;
+}
+
+function assertRootGoalLedgerEntry(entry: UltragoalLedgerEntry, path: string, line: number): void {
+  if (
+    entry.eventVersion !== 1
+    || entry.transitionVersion !== 1
+    || !isSha256(entry.eventId)
+    || typeof entry.runId !== 'string'
+    || entry.runId.length === 0
+    || !Number.isSafeInteger(entry.revision)
+    || Number(entry.revision) <= 0
+    || !isSha256(entry.snapshotDigest)
+    || !isSha256(entry.evidenceDigest)
+    || !isSha256(entry.beforePlanDigest)
+    || !isRecord(entry.ledgerAncestry)
+    || typeof entry.evidence !== 'string'
+    || entry.evidence.length === 0
+    || !isCodexRootBinding(entry.after)
+  ) {
+    throw new UltragoalError(`Malformed root goal reconciliation ledger entry at ${path}:${line}.`);
+  }
+  const transition: UltragoalRootGoalTransition = {
+    transitionVersion: 1,
+    snapshotDigest: entry.snapshotDigest,
+    evidenceDigest: entry.evidenceDigest,
+    evidence: entry.evidence,
+    reconciledAt: entry.ts,
+    beforePlanDigest: entry.beforePlanDigest,
+    ledgerAncestry: entry.ledgerAncestry as UltragoalLedgerAncestry,
+    ...(entry.normalization ? { normalization: entry.normalization } : {}),
+    ...(entry.before ? { before: entry.before as UltragoalCodexRootBinding } : {}),
+    ...(entry.legacyBefore ? { legacyBefore: entry.legacyBefore } : {}),
+    after: entry.after,
+  };
+  assertRootGoalTransition(
+    transition,
+    `Root goal reconciliation ledger transition at ${path}:${line}`,
+  );
+  if (entry.revision !== entry.after.revision) {
+    throw new UltragoalError(`Invalid root goal reconciliation revision at ${path}:${line}.`);
+  }
+  if (entry.eventId !== expectedRootGoalEventId(entry.runId, transition)) {
+    throw new UltragoalError(`Invalid root goal reconciliation event id at ${path}:${line}.`);
+  }
+}
+
+function assertLegacyRootGoalLedgerEntry(entry: Record<string, unknown>, path: string, line: number): void {
+  if (
+    typeof entry.runId !== 'string'
+    || entry.runId.length === 0
+    || typeof entry.message !== 'string'
+    || entry.message.length === 0
+    || typeof entry.evidence !== 'string'
+    || entry.evidence.length === 0
+    || typeof entry.rootGoalId !== 'string'
+    || entry.rootGoalId.length === 0
+    || typeof entry.codexThreadId !== 'string'
+    || entry.codexThreadId.length === 0
+  ) {
+    throw new UltragoalError(`Malformed legacy root goal reconciliation ledger entry at ${path}:${line}.`);
+  }
+}
+
+async function readValidatedLedger(path: string): Promise<ValidatedLedger> {
+  let raw: string;
+  try {
+    raw = await readFile(path, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { state: 'missing', raw: '', entries: [] };
+    }
+    throw error;
+  }
+  if (raw && !raw.endsWith('\n')) {
+    throw new UltragoalError(`Refusing to repair truncated Ultragoal ledger at ${path}.`);
+  }
+  const entries: UltragoalLedgerEntry[] = [];
+  const logicalRootEvents = new Set<string>();
+  const lastRootEventByRun = new Map<string, UltragoalLedgerEntry>();
+  for (const [index, line] of raw.split('\n').entries()) {
+    if (!line) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      throw new UltragoalError(`Refusing to repair malformed ledger line ${index + 1} at ${path}.`);
+    }
+    if (
+      !isRecord(parsed)
+      || typeof parsed.ts !== 'string'
+      || parsed.ts.length === 0
+      || typeof parsed.event !== 'string'
+      || parsed.event.length === 0
+    ) {
+      throw new UltragoalError(`Refusing to repair invalid ledger entry ${index + 1} at ${path}.`);
+    }
+    const entry = parsed as unknown as UltragoalLedgerEntry;
+    if (entry.event === 'root_goal_reconciled') {
+      if (entry.eventVersion === undefined) {
+        assertLegacyRootGoalLedgerEntry(parsed, path, index + 1);
+      } else {
+        assertRootGoalLedgerEntry(entry, path, index + 1);
+        const logicalKey = `${entry.runId}\0${entry.revision}`;
+        if (logicalRootEvents.has(logicalKey)) {
+          throw new UltragoalError(`Duplicate logical root goal reconciliation transition at ${path}:${index + 1}.`);
+        }
+        const previous = lastRootEventByRun.get(entry.runId!);
+        const expectedRevision = (previous?.revision ?? 0) + 1;
+        if (entry.revision !== expectedRevision) {
+          throw new UltragoalError(`Non-contiguous root goal reconciliation revision at ${path}:${index + 1}.`);
+        }
+        if (previous) {
+          if (!sameCodexRootBinding(
+            previous.after as UltragoalCodexRootBinding,
+            entry.before as UltragoalCodexRootBinding | undefined,
+          )) {
+            throw new UltragoalError(`Broken root goal reconciliation binding chain at ${path}:${index + 1}.`);
+          }
+        } else if (entry.before !== undefined) {
+          throw new UltragoalError(`First root goal reconciliation revision has an unexpected predecessor at ${path}:${index + 1}.`);
+        }
+        logicalRootEvents.add(logicalKey);
+        lastRootEventByRun.set(entry.runId!, entry);
+      }
+    }
+    entries.push(entry);
+  }
+  if (entries.length === 0) return { state: 'empty', raw, entries, digest: digestText(raw) };
+  return { state: 'present', raw, entries, digest: digestText(raw) };
+}
+
+function rootGoalEvents(ledger: ValidatedLedger): UltragoalLedgerEntry[] {
+  return ledger.entries.filter((entry) => (
+    entry.event === 'root_goal_reconciled' && entry.eventVersion === 1
+  ));
+}
+
+function matchingRootGoalEvent(ledger: ValidatedLedger, entry: UltragoalLedgerEntry): boolean {
+  const sameTransition = rootGoalEvents(ledger).filter((candidate) => (
+    candidate.runId === entry.runId && candidate.revision === entry.revision
+  ));
+  if (sameTransition.length > 1) {
+    throw new UltragoalError(`Duplicate root goal reconciliation transition ${entry.runId}:${entry.revision}.`);
+  }
+  if (sameTransition.length === 0) return false;
+  if (digestJson(sameTransition[0]) !== digestJson(entry)) {
+    throw new UltragoalError(`Conflicting root goal reconciliation transition ${entry.runId}:${entry.revision}.`);
+  }
+  return true;
+}
+
+function requireLedgerDigest(value: string | undefined, label: string): string {
+  if (!isSha256(value)) throw new UltragoalError(`${label} must be an exact lowercase SHA-256 digest.`);
+  return value;
+}
+
+function runAnchor(
+  ledger: ValidatedLedger,
+  plan: UltragoalPlan,
+): { digest: string; line: number } {
+  const candidates = ledger.raw
+    .split('\n')
+    .map((line, index) => {
+      if (!line) return null;
+      const entry = JSON.parse(line) as UltragoalLedgerEntry;
+      return { entry, line: index + 1 };
+    })
+    .filter((candidate): candidate is { entry: UltragoalLedgerEntry; line: number } => (
+      candidate !== null
+      && candidate.entry.event === 'plan_created'
+      && typeof candidate.entry.message === 'string'
+      && candidate.entry.message.includes(`run ${plan.runId}`)
+    ));
+  const anchor = candidates.at(-1);
+  if (!anchor) {
+    throw new UltragoalError(`Refusing to reconcile divergent Ultragoal ledgers without a plan_created anchor for run ${plan.runId}.`);
+  }
+  return {
+    digest: digestJson(anchor.entry),
+    line: anchor.line,
+  };
+}
+
+function initialLedgerAncestry(
+  plan: UltragoalPlan,
+  flat: ValidatedLedger,
+  namespaced: ValidatedLedger,
+  options: ReconcileUltragoalRootGoalOptions,
+): { ancestry: UltragoalLedgerAncestry; selected: string } {
+  const flatAvailable = flat.state === 'present';
+  const namespacedAvailable = namespaced.state === 'present';
+  if (!flatAvailable && !namespacedAvailable) {
+    throw new UltragoalError('Refusing root goal reconciliation because neither ledger contains valid history.');
+  }
+  if (flatAvailable && !namespacedAvailable) {
+    return {
+      ancestry: {
+        relation: 'flat_only',
+        flatDigest: flat.digest,
+        selectedDigest: flat.digest!,
+      },
+      selected: flat.raw,
+    };
+  }
+  if (!flatAvailable && namespacedAvailable) {
+    return {
+      ancestry: {
+        relation: 'namespaced_only',
+        namespacedDigest: namespaced.digest,
+        selectedDigest: namespaced.digest!,
+      },
+      selected: namespaced.raw,
+    };
+  }
+  if (flat.raw === namespaced.raw) {
+    return {
+      ancestry: {
+        relation: 'equal',
+        flatDigest: flat.digest,
+        namespacedDigest: namespaced.digest,
+        selectedDigest: flat.digest!,
+      },
+      selected: flat.raw,
+    };
+  }
+  const expectedFlat = requireLedgerDigest(
+    options.expectedFlatLedgerDigest,
+    '--expected-flat-ledger-sha256',
+  );
+  const expectedNamespaced = requireLedgerDigest(
+    options.expectedNamespacedLedgerDigest,
+    '--expected-namespaced-ledger-sha256',
+  );
+  if (flat.digest !== expectedFlat || namespaced.digest !== expectedNamespaced) {
+    throw new UltragoalError('Ultragoal ledger ancestry digest mismatch.');
+  }
+  let relation: UltragoalLedgerAncestryRelation;
+  let selected: ValidatedLedger;
+  if (flat.raw.startsWith(namespaced.raw)) {
+    relation = 'flat_has_namespaced_prefix';
+    selected = flat;
+  } else if (flat.raw.endsWith(namespaced.raw)) {
+    relation = 'flat_has_namespaced_suffix';
+    selected = flat;
+  } else if (namespaced.raw.startsWith(flat.raw)) {
+    relation = 'namespaced_has_flat_prefix';
+    selected = namespaced;
+  } else if (namespaced.raw.endsWith(flat.raw)) {
+    relation = 'namespaced_has_flat_suffix';
+    selected = namespaced;
+  } else {
+    throw new UltragoalError('Refusing to reconcile divergent Ultragoal ledgers without an authorized exact prefix or suffix relationship.');
+  }
+  const anchor = runAnchor(selected, plan);
+  return {
+    ancestry: {
+      relation,
+      flatDigest: flat.digest,
+      namespacedDigest: namespaced.digest,
+      selectedDigest: selected.digest!,
+      runAnchorDigest: anchor.digest,
+      runAnchorLine: anchor.line,
+    },
+    selected: selected.raw,
+  };
+}
+
+function normalizationLedgerEntries(
+  plan: UltragoalPlan,
+  receipt: UltragoalRootGoalReconciliation,
+): UltragoalLedgerEntry[] {
+  const normalization = receipt.normalization;
+  if (!normalization) return [];
+  const entries: UltragoalLedgerEntry[] = [];
+  if (normalization.migratedStatuses > 0) {
+    entries.push({
+      ts: receipt.reconciledAt,
+      event: 'plan_migrated',
+      message: `Normalized ${normalization.migratedStatuses} legacy completed goal status${normalization.migratedStatuses === 1 ? '' : 'es'} to complete.`,
+    });
+  }
+  if (normalization.previousObjective) {
+    entries.push({
+      ts: receipt.reconciledAt,
+      event: 'aggregate_objective_migrated',
+      message: 'Migrated legacy enumerated aggregate Codex objective to the stable pointer objective.',
+      before: { codexObjective: normalization.previousObjective },
+      after: { codexObjective: plan.codexObjective },
+    });
+  }
+  return entries;
+}
+
+function appendLedgerEntries(raw: string, entries: readonly UltragoalLedgerEntry[]): string {
+  return `${raw}${entries.map((entry) => `${JSON.stringify(entry)}\n`).join('')}`;
+}
+
+function assertRecordedRunAnchor(
+  selectedHistory: string,
+  receipt: UltragoalRootGoalReconciliation,
+  runId: string,
+): void {
+  const relation = receipt.ledgerAncestry.relation;
+  if (relation === 'equal' || relation === 'flat_only' || relation === 'namespaced_only') return;
+  const lineNumber = receipt.ledgerAncestry.runAnchorLine!;
+  const line = selectedHistory.split('\n')[lineNumber - 1];
+  if (!line) {
+    throw new UltragoalError('Committed root goal reconciliation run anchor line is missing.');
+  }
+  let entry: UltragoalLedgerEntry;
+  try {
+    entry = JSON.parse(line) as UltragoalLedgerEntry;
+  } catch {
+    throw new UltragoalError('Committed root goal reconciliation run anchor is malformed.');
+  }
+  if (
+    entry.event !== 'plan_created'
+    || typeof entry.message !== 'string'
+    || !entry.message.includes(`run ${runId}`)
+    || digestJson(entry) !== receipt.ledgerAncestry.runAnchorDigest
+  ) {
+    throw new UltragoalError('Committed root goal reconciliation run anchor does not match recorded ancestry.');
+  }
+}
+
+function committedRootGoalBatchPrefix(
+  ledger: ValidatedLedger,
+  expectedBatch: string,
+  receipt: UltragoalRootGoalReconciliation,
+  runId: string,
+): string {
+  const start = ledger.raw.indexOf(expectedBatch);
+  if (start < 0) {
+    throw new UltragoalError('Committed root goal reconciliation ledger batch is incomplete.');
+  }
+  if (ledger.raw.indexOf(expectedBatch, start + expectedBatch.length) >= 0) {
+    throw new UltragoalError('Committed root goal reconciliation ledger batch is duplicated.');
+  }
+  const prefix = ledger.raw.slice(0, start);
+  if (digestText(prefix) !== receipt.ledgerAncestry.selectedDigest) {
+    throw new UltragoalError('Committed root goal reconciliation ledger ancestry digest mismatch.');
+  }
+  assertRecordedRunAnchor(prefix, receipt, runId);
+  return prefix;
+}
+
+function replayLedgerBase(
+  plan: UltragoalPlan,
+  flat: ValidatedLedger,
+  namespaced: ValidatedLedger,
+  receipt: UltragoalRootGoalReconciliation,
+  entry: UltragoalLedgerEntry,
+): string {
+  const flatHasEvent = matchingRootGoalEvent(flat, entry);
+  const namespacedHasEvent = matchingRootGoalEvent(namespaced, entry);
+  if (flatHasEvent || namespacedHasEvent) {
+    const expectedBatch = appendLedgerEntries('', [
+      ...normalizationLedgerEntries(plan, receipt),
+      entry,
+    ]);
+    if (flatHasEvent) committedRootGoalBatchPrefix(flat, expectedBatch, receipt, entry.runId!);
+    if (namespacedHasEvent) committedRootGoalBatchPrefix(namespaced, expectedBatch, receipt, entry.runId!);
+    if (flatHasEvent && namespacedHasEvent) {
+      if (flat.raw === namespaced.raw) return flat.raw;
+      if (flat.raw.startsWith(namespaced.raw)) return flat.raw;
+      if (namespaced.raw.startsWith(flat.raw)) return namespaced.raw;
+      throw new UltragoalError('Root goal reconciliation ledgers diverged after the committed event.');
+    }
+    const committed = flatHasEvent ? flat : namespaced;
+    const stale = flatHasEvent ? namespaced : flat;
+    const staleDigest = stale.digest;
+    const allowedStaleDigests = new Set([
+      receipt.ledgerAncestry.flatDigest,
+      receipt.ledgerAncestry.namespacedDigest,
+    ].filter((value): value is string => Boolean(value)));
+    if (
+      stale.state !== 'missing'
+      && stale.state !== 'empty'
+      && !allowedStaleDigests.has(staleDigest ?? '')
+    ) {
+      throw new UltragoalError('Stale ledger projection does not match committed reconciliation ancestry.');
+    }
+    return committed.raw;
+  }
+  const candidates = [flat, namespaced].filter((ledger) => ledger.state === 'present');
+  const selected = candidates.find((ledger) => ledger.digest === receipt.ledgerAncestry.selectedDigest);
+  if (!selected) {
+    throw new UltragoalError('Current divergent Ultragoal ledgers do not match the committed root reconciliation ancestry.');
+  }
+  assertRecordedRunAnchor(selected.raw, receipt, entry.runId!);
+  for (const ledger of candidates) {
+    const allowed = ledger.digest === receipt.ledgerAncestry.flatDigest
+      || ledger.digest === receipt.ledgerAncestry.namespacedDigest;
+    if (!allowed) throw new UltragoalError('Ledger projection drifted before reconciliation recovery.');
+  }
+  return appendLedgerEntries(selected.raw, [
+    ...normalizationLedgerEntries(plan, receipt),
+    entry,
+  ]);
+}
+
+async function convergeRootGoalReconciliationArtifacts(
+  cwd: string,
+  canonical: CanonicalUltragoalPlan,
+  plan: UltragoalPlan,
+): Promise<string[]> {
+  const receipt = plan.rootGoalReconciliation;
+  if (!plan.runId || !receipt) throw new UltragoalError('Canonical root goal reconciliation receipt is missing.');
+  assertRootGoalReconciliationReceipt(plan);
+  const entry = rootGoalLedgerEntry(plan, receipt);
+  const namespacedLedgerPath = join(ultragoalRunDir(cwd, plan.runId), ULTRAGOAL_LEDGER);
+  const flatLedgerPath = ultragoalLedgerPath(cwd);
+  const namespacedLedger = await readValidatedLedger(namespacedLedgerPath);
+  const flatLedger = await readValidatedLedger(flatLedgerPath);
+  const expectedLedger = replayLedgerBase(plan, flatLedger, namespacedLedger, receipt, entry);
+
+  const canonicalPlanPath = join(ultragoalRunDir(cwd, plan.runId), ULTRAGOAL_GOALS);
+  const flatPlanPath = ultragoalGoalsPath(cwd);
+  const expectedPlan = `${JSON.stringify(plan, null, 2)}\n`;
+  const currentCanonical = await readFile(canonicalPlanPath, 'utf-8');
+  if (
+    currentCanonical !== expectedPlan
+    && digestText(currentCanonical) !== receipt.beforePlanDigest
+  ) {
+    throw new UltragoalError('Canonical Ultragoal plan is neither the committed reconciliation nor its exact predecessor.');
+  }
+  if (canonical.path !== canonicalPlanPath || canonical.raw !== currentCanonical) {
+    throw new UltragoalError('Canonical Ultragoal plan changed during reconciliation preflight.');
+  }
+  let currentFlat: string | null;
+  try {
+    currentFlat = await readFile(flatPlanPath, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    currentFlat = null;
+  }
+  if (
+    currentFlat !== null
+    && currentFlat !== expectedPlan
+    && digestText(currentFlat) !== receipt.beforePlanDigest
+  ) {
+    throw new UltragoalError('Flat Ultragoal plan is neither the committed reconciliation nor its exact predecessor.');
+  }
+
+  const repaired: string[] = [];
+  for (const [label, path] of [['namespaced goals', canonicalPlanPath], ['flat goals', flatPlanPath]] as const) {
+    const current = path === canonicalPlanPath ? currentCanonical : currentFlat;
+    if (current === expectedPlan) continue;
+    await writeJsonAtomic(path, plan);
+    repaired.push(label);
+  }
+
+  for (const [label, path, current] of [
+    ['namespaced ledger', namespacedLedgerPath, namespacedLedger],
+    ['flat ledger', flatLedgerPath, flatLedger],
+  ] as const) {
+    if (current.raw === expectedLedger) continue;
+    await writeTextAtomic(path, expectedLedger);
+    repaired.push(label);
+  }
+  return repaired;
+}
+
+export async function reconcileUltragoalRootGoal(
+  cwd: string,
+  options: ReconcileUltragoalRootGoalOptions,
+): Promise<ReconcileUltragoalRootGoalResult> {
+  return withUltragoalMutationLock(cwd, async () => {
+    let canonical = await readCanonicalUltragoalPlan(cwd);
+    let plan = canonical.plan;
+    if (codexGoalMode(plan) !== 'aggregate') {
+      throw new UltragoalError('Root Codex goal reconciliation is available only for aggregate Ultragoal runs.');
+    }
+    const completionPlan = plan.goals.some((goal) => (goal.status as string) === 'completed')
+      ? {
+        ...plan,
+        goals: plan.goals.map((goal) => (
+          (goal.status as string) === 'completed' ? { ...goal, status: 'complete' as const } : goal
+        )),
+      }
+      : plan;
+    if (isUltragoalDone(completionPlan) || plan.aggregateCompletion?.status === 'complete') {
+      throw new UltragoalError('Refusing to reconcile a successor Codex goal after the Ultragoal run is complete.');
+    }
+
+    const evidence = assertNonEmpty(options.evidence, '--evidence');
+    if (evidence.length > 8_000) throw new UltragoalError('--evidence exceeds 8000 characters.');
+    if (!Number.isSafeInteger(options.expectedRevision) || options.expectedRevision < 0) {
+      throw new UltragoalError('--expected-revision must be a non-negative safe integer.');
+    }
+    const snapshot = parseCodexGoalSnapshot(options.codexGoal);
+    if (!snapshot.available) {
+      throw new UltragoalError('Codex goal snapshot is absent or unavailable; call get_goal and pass its JSON with --codex-goal-json.');
+    }
+    if (snapshot.status !== 'active') {
+      throw new UltragoalError(`Successor Codex goal must be active; got ${snapshot.status ?? 'unknown'}.`);
+    }
+    const nextThreadId = assertNonEmpty(snapshot.threadId, 'Codex goal snapshot threadId');
+    const nextObjective = assertNonEmpty(snapshot.objective, 'Codex goal snapshot objective');
+    const current = plan.codexRootBinding;
+    const currentRevision = current?.revision ?? 0;
+    const receipt = plan.rootGoalReconciliation;
+    const replayMatches = receipt
+      && receipt.after.threadId === nextThreadId
+      && receipt.after.objective === nextObjective
+      && sameCodexRootBinding(current, receipt.after)
+      && options.expectedRevision === (receipt.before?.revision ?? 0);
+    if (
+      options.expectedCurrentThreadId
+      && options.expectedCurrentThreadId !== current?.threadId
+      && !replayMatches
+    ) {
+      throw new UltragoalError(`Current Codex thread mismatch: expected ${options.expectedCurrentThreadId}, got ${current?.threadId ?? 'unbound'}.`);
+    }
+    if (options.expectedRevision !== currentRevision && !replayMatches) {
+      throw new UltragoalError(`Codex root binding revision mismatch: expected ${options.expectedRevision}, current ${currentRevision}.`);
+    }
+    if (current?.threadId === nextThreadId && current.objective !== nextObjective) {
+      throw new UltragoalError('Refusing objective drift for the existing Codex thread identity.');
+    }
+
+    if (sameCodexRootBinding(current, receipt?.after) && current?.threadId === nextThreadId && current.objective === nextObjective) {
+      if (!receipt) throw new UltragoalError('Current Codex root binding has no reconciliation receipt.');
+      const repairedProjections = await convergeRootGoalReconciliationArtifacts(cwd, canonical, plan);
+      return {
+        plan,
+        deduped: true,
+        eventId: receipt.eventId,
+        before: receipt.before,
+        after: receipt.after,
+        repairedProjections,
+      };
+    }
+
+    if (current && receipt) {
+      await convergeRootGoalReconciliationArtifacts(cwd, canonical, plan);
+      canonical = await readCanonicalUltragoalPlan(cwd);
+      plan = canonical.plan;
+    }
+    const flatLedger = await readValidatedLedger(ultragoalLedgerPath(cwd));
+    const namespacedLedger = await readValidatedLedger(
+      join(ultragoalRunDir(cwd, plan.runId!), ULTRAGOAL_LEDGER),
+    );
+    if (
+      !plan.codexRootBinding
+      && (rootGoalEvents(flatLedger).length > 0 || rootGoalEvents(namespacedLedger).length > 0)
+    ) {
+      throw new UltragoalError('Ledger contains root reconciliation history but the canonical plan has no binding receipt.');
+    }
+    const ledger = initialLedgerAncestry(plan, flatLedger, namespacedLedger, options);
+    const migratedStatuses = normalizeLegacyGoalStatuses(plan);
+    const previousObjective = (
+      isLegacyEnumeratedAggregateObjective(plan.codexObjective)
+        ? plan.codexObjective
+        : undefined
+    );
+    if (previousObjective) {
+      plan.codexObjective = aggregateCodexObjective(plan.goals);
+      plan.codexObjectiveAliases = Array.from(new Set([
+        ...(plan.codexObjectiveAliases ?? []),
+        previousObjective,
+      ]));
+    }
+
+    const refreshedCurrent = plan.codexRootBinding;
+    const refreshedRevision = refreshedCurrent?.revision ?? 0;
+    const after: UltragoalCodexRootBinding = {
+      threadId: nextThreadId,
+      objective: nextObjective,
+      revision: refreshedRevision + 1,
+    };
+    const legacyPlan = plan as UltragoalPlan & { rootGoalId?: string; codexThreadId?: string };
+    const legacyBefore = refreshedCurrent ? undefined : {
+      ...(legacyPlan.rootGoalId ? { rootGoalId: legacyPlan.rootGoalId } : {}),
+      ...(legacyPlan.codexThreadId ? { codexThreadId: legacyPlan.codexThreadId } : {}),
+      ...((previousObjective ?? plan.codexObjective)
+        ? { codexObjective: previousObjective ?? plan.codexObjective }
+        : {}),
+    };
+    const now = iso(options.now);
+    const transition: UltragoalRootGoalTransition = {
+      transitionVersion: 1,
+      snapshotDigest: digestJson({ threadId: nextThreadId, objective: nextObjective, status: 'active' }),
+      evidenceDigest: digestJson(evidence),
+      evidence,
+      reconciledAt: now,
+      beforePlanDigest: digestText(canonical.raw),
+      ledgerAncestry: ledger.ancestry,
+      ...(
+        migratedStatuses > 0 || previousObjective
+          ? {
+            normalization: {
+              migratedStatuses,
+              ...(previousObjective ? { previousObjective } : {}),
+            },
+          }
+          : {}
+      ),
+      ...(refreshedCurrent ? { before: refreshedCurrent } : {}),
+      ...(legacyBefore && Object.keys(legacyBefore).length > 0 ? { legacyBefore } : {}),
+      after,
+    };
+    const eventId = expectedRootGoalEventId(plan.runId!, transition);
+    plan.codexRootBinding = after;
+    plan.rootGoalReconciliation = {
+      ...transition,
+      eventId,
+    };
+    delete legacyPlan.rootGoalId;
+    delete legacyPlan.codexThreadId;
+    plan.updatedAt = now;
+
+    const repairedProjections = await convergeRootGoalReconciliationArtifacts(cwd, canonical, plan);
+    return {
+      plan,
+      deduped: false,
+      eventId,
+      before: refreshedCurrent,
+      after,
+      repairedProjections,
+    };
+  });
+}
+
 /**
  * Same brief, same tree: continue the existing run rather than recreating it.
  * Backfills namespace identity onto pre-namespacing registries and records an
@@ -1278,7 +2296,7 @@ function appendGoalToPlan(plan: UltragoalPlan, options: AddUltragoalGoalOptions 
 
 export async function addUltragoalGoal(cwd: string, options: AddUltragoalGoalOptions): Promise<{ plan: UltragoalPlan; goal: UltragoalItem }> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const plan = await readUltragoalPlanUnderLock(cwd);
   const now = iso(options.now);
   const goal = appendGoalToPlan(plan, options);
   await writePlan(cwd, plan);
@@ -1564,7 +2582,7 @@ function applySteeringMutation(plan: UltragoalPlan, proposal: UltragoalSteeringP
 
 export async function steerUltragoal(cwd: string, proposal: UltragoalSteeringProposal, options: { now?: Date; directiveText?: string } = {}): Promise<SteerUltragoalResult> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const plan = await readUltragoalPlanUnderLock(cwd);
   const existing = proposal.idempotencyKey
     ? (await readSteeringLedgerEntries(cwd)).find((entry) => entry.event === 'steering_accepted' && (entry.idempotencyKey === proposal.idempotencyKey || entry.steering?.idempotencyKey === proposal.idempotencyKey) && entry.steering)
     : undefined;
@@ -1837,7 +2855,7 @@ function validateQualityGate(value: unknown, requiredInvariants: readonly Requir
 
 export async function startNextUltragoal(cwd: string, options: StartNextOptions = {}): Promise<{ plan: UltragoalPlan; goal: UltragoalItem | null; resumed: boolean; done: boolean }> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const plan = await readUltragoalPlanUnderLock(cwd);
   const now = iso(options.now);
   if (plan.aggregateCompletion?.status === 'complete') return { plan, goal: null, resumed: false, done: true };
   const existing = plan.goals.find((goal) => goal.status === 'in_progress' && isScheduleEligibleGoal(goal));
@@ -1870,7 +2888,7 @@ export async function startNextUltragoal(cwd: string, options: StartNextOptions 
 
 export async function checkpointUltragoal(cwd: string, options: CheckpointOptions): Promise<UltragoalPlan> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const plan = await readUltragoalPlanUnderLock(cwd);
   const goal = plan.goals.find((candidate) => candidate.id === options.goalId);
   if (!goal) throw new UltragoalError(`Unknown ultragoal id: ${options.goalId}`);
   const now = iso(options.now);
@@ -1940,6 +2958,7 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
       snapshot,
       {
         expectedObjective,
+        expectedThreadId: aggregateMode ? plan.codexRootBinding?.threadId : undefined,
         acceptedObjectives: aggregateMode ? compatibleCodexObjectives(plan) : undefined,
         allowedStatuses: aggregateMode
           ? (finalRunCheckpoint && !options.allowActiveFinalCodexGoal ? ['complete'] : ['active'])
@@ -2137,7 +3156,7 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
 
 export async function recordFinalReviewBlockers(cwd: string, options: RecordFinalReviewBlockersOptions): Promise<{ plan: UltragoalPlan; blockedGoal: UltragoalItem; addedGoal: UltragoalItem }> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const plan = await readUltragoalPlanUnderLock(cwd);
   const goal = plan.goals.find((candidate) => candidate.id === options.goalId);
   if (!goal) throw new UltragoalError(`Unknown ultragoal id: ${options.goalId}`);
   assertNonEmpty(options.evidence, '--evidence');
@@ -2155,6 +3174,7 @@ export async function recordFinalReviewBlockers(cwd: string, options: RecordFina
     options.codexGoal === undefined ? null : parseCodexGoalSnapshot(options.codexGoal),
     {
       expectedObjective,
+      expectedThreadId: aggregateMode ? plan.codexRootBinding?.threadId : undefined,
       acceptedObjectives: aggregateMode ? compatibleCodexObjectives(plan) : undefined,
       allowedStatuses: ['active'],
       requireSnapshot: true,
@@ -2304,7 +3324,9 @@ function buildPerStoryCodexGoalInstruction(goal: UltragoalItem, plan: UltragoalP
 }
 
 function buildAggregateCodexGoalInstruction(goal: UltragoalItem, plan: UltragoalPlan, options: CodexGoalInstructionOptions): string {
-  const objective = plan.codexObjective ?? aggregateCodexObjective(plan.goals);
+  const objective = plan.codexRootBinding?.objective
+    ?? plan.codexObjective
+    ?? aggregateCodexObjective(plan.goals);
   const finalStory = isFinalRunCompletionCandidate(plan, goal);
   const createPayload = { objective };
   const checkpointStatus = finalStory ? 'complete' : 'active';
