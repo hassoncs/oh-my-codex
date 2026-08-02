@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { describe, it } from 'node:test';
+import type { DistLockIdentityDiagnostic } from '../dist-lock.js';
 
 const {
   activateOwnedChildLease,
@@ -172,6 +173,84 @@ describe('compiled dist reader/writer lock', () => {
     if (process.platform !== 'win32') assert.doesNotThrow(() => assertDistProcessTreeAuthority());
   });
 
+  it('keeps a live lock authoritative and emits a typed diagnostic when identity observation is unavailable', async () => {
+    const lockRoot = await mkdtemp(join(tmpdir(), 'omx-dist-lock-owner-observer-'));
+    const lockPath = join(lockRoot, 'dist-build.lock');
+    const diagnostics: DistLockIdentityDiagnostic[] = [];
+    try {
+      await writeFile(lockPath, JSON.stringify({
+        pid: process.pid,
+        process_start_identity: currentProcessStartIdentity(),
+        token: 'live-owner-observer',
+      }));
+
+      assert.equal(isOwnedLockActive(lockPath, 60_000, {
+        observeProcessStartIdentity: () => null,
+        onDiagnostic: (diagnostic: DistLockIdentityDiagnostic) => diagnostics.push(diagnostic),
+      }), true);
+      assert.equal(isOwnedLockActive(lockPath, 60_000, {
+        observeProcessStartIdentity: () => null,
+        onDiagnostic: (diagnostic: DistLockIdentityDiagnostic) => diagnostics.push(diagnostic),
+      }), true);
+      assert.deepEqual(diagnostics, [{
+        code: 'dist_process_identity_observation_unavailable',
+        scope: 'lock-owner',
+        lock_path: lockPath,
+        pid: process.pid,
+      }]);
+    } finally {
+      await rm(lockRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a live process group authoritative and reports leader and sentinel uncertainty', { skip: process.platform === 'win32' }, async () => {
+    const lockRoot = await mkdtemp(join(tmpdir(), 'omx-dist-lock-group-observer-'));
+    const lockPath = join(lockRoot, 'dist-build.lock');
+    const token = 'live-group-observer';
+    const leasePath = prepareOwnedChildLease(lockPath, token);
+    const diagnostics: DistLockIdentityDiagnostic[] = [];
+    const child = spawn(process.execPath, ['--eval', 'setTimeout(() => {}, 5000)'], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    try {
+      assert.ok(child.pid);
+      await writeFile(leasePath, JSON.stringify({
+        pid: child.pid,
+        process_group_id: child.pid,
+        process_start_identity: 'recorded-leader',
+        sentinel_pid: child.pid,
+        sentinel_start_identity: 'recorded-sentinel',
+        token,
+      }));
+
+      assert.equal(isOwnedChildLeaseActive(lockPath, token, 60_000, {
+        observeProcessStartIdentity: () => null,
+        onDiagnostic: (diagnostic: DistLockIdentityDiagnostic) => diagnostics.push(diagnostic),
+      }), true);
+      assert.deepEqual(diagnostics, [
+        {
+          code: 'dist_process_identity_observation_unavailable',
+          scope: 'process-group-leader',
+          lock_path: leasePath,
+          pid: child.pid,
+          process_group_id: child.pid,
+        },
+        {
+          code: 'dist_process_identity_observation_unavailable',
+          scope: 'process-group-sentinel',
+          lock_path: leasePath,
+          pid: child.pid,
+          process_group_id: child.pid,
+        },
+      ]);
+    } finally {
+      if (child.pid) await killProcessGroup(child.pid);
+      releaseOwnedChildLease(lockPath, token);
+      await rm(lockRoot, { recursive: true, force: true });
+    }
+  });
+
   it('kills the child and releases authority when child identity is unavailable', { skip: process.platform === 'win32' }, async () => {
     const lockRoot = await mkdtemp(join(tmpdir(), 'omx-dist-lock-child-identity-'));
     try {
@@ -236,6 +315,7 @@ describe('compiled dist reader/writer lock', () => {
     const unrelatedReady = join(lockRoot, 'unrelated-ready');
     let leader: ReturnType<typeof spawn> | undefined;
     let unrelatedLeader: ReturnType<typeof spawn> | undefined;
+    const diagnostics: DistLockIdentityDiagnostic[] = [];
     try {
       leader = spawn(process.execPath, [
         '--import',
@@ -259,7 +339,10 @@ describe('compiled dist reader/writer lock', () => {
       const originalLease = JSON.parse(await readFile(leasePath, 'utf-8'));
 
       assert.equal(isProcessGroupAlive(leader.pid), true);
-      assert.equal(isOwnedChildLeaseActive(lockPath, 'orphan-sentinel'), true);
+      assert.equal(isOwnedChildLeaseActive(lockPath, 'orphan-sentinel', 60_000, {
+        onDiagnostic: (diagnostic: DistLockIdentityDiagnostic) => diagnostics.push(diagnostic),
+      }), true);
+      assert.deepEqual(diagnostics, []);
 
       await waitFor(
         async () => (isOwnedChildLeaseActive(lockPath, 'orphan-sentinel') ? undefined : true),
@@ -531,7 +614,7 @@ describe('compiled dist reader/writer lock', () => {
       assert.equal(blocked.status, 2);
       assert.match(blocked.stderr, /dist_build_lock_timeout:readers=1/);
 
-      await waitFor(async () => (isProcessAlive(testPid) ? undefined : true), 5_000);
+      await waitFor(async () => (isProcessGroupAlive(testPid) ? undefined : true), 5_000);
       testPid = 0;
       const recovered = runBuildProbe(lockRoot);
       assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);

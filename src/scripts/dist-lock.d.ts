@@ -5,6 +5,19 @@ export interface DistLockConfig {
   timeoutMs: number;
 }
 
+export interface DistLockIdentityDiagnostic {
+  code: 'dist_process_identity_observation_unavailable';
+  scope: 'lock-owner' | 'process-group-leader' | 'process-group-sentinel';
+  lock_path: string;
+  pid: number;
+  process_group_id?: number;
+}
+
+export interface DistLockObservationOptions {
+  observeProcessStartIdentity?: (pid: number) => string | null;
+  onDiagnostic?: (diagnostic: DistLockIdentityDiagnostic) => void;
+}
+
 export function parsePositiveMs(value: string | undefined, fallback: number): number;
 export function resolveDistLockConfig(cwd: string, env?: NodeJS.ProcessEnv): DistLockConfig;
 export function observeProcessStartIdentity(
@@ -26,8 +39,17 @@ export function activateOwnedChildLease(
 ): string;
 export function registerOwnedChildLeaseSentinel(leasePath: string, token: string, pid: number): void;
 export function releaseOwnedChildLease(lockPath: string, token: string): void;
-export function isOwnedChildLeaseActive(lockPath: string, token: string, unownedStaleMs?: number): boolean;
-export function isOwnedLockActive(lockPath: string, unownedStaleMs?: number): boolean;
+export function isOwnedChildLeaseActive(
+  lockPath: string,
+  token: string,
+  unownedStaleMs?: number,
+  options?: DistLockObservationOptions,
+): boolean;
+export function isOwnedLockActive(
+  lockPath: string,
+  unownedStaleMs?: number,
+  options?: DistLockObservationOptions,
+): boolean;
 export function tryCreateOwnedLock(lockPath: string, owner: Record<string, unknown>): boolean;
 export function releaseOwnedLock(lockPath: string, token: string): boolean;
 export function recoverStaleOwnedLock(lockPath: string, unownedStaleMs?: number): boolean;

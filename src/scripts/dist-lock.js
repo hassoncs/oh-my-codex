@@ -49,6 +49,9 @@ export function isProcessAlive(pid) {
 }
 
 const PROCESS_START_IDENTITY_ATTEMPTS = 3;
+const IDENTITY_OBSERVATION_UNAVAILABLE = 'dist_process_identity_observation_unavailable';
+const MAX_EMITTED_IDENTITY_DIAGNOSTICS = 256;
+const emittedIdentityDiagnostics = new Set();
 
 function readProcessStartIdentity(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
@@ -78,6 +81,33 @@ export function observeProcessStartIdentity(pid, observe = readProcessStartIdent
   return null;
 }
 
+function reportIdentityObservationUnavailable(
+  scope,
+  lockPath,
+  pid,
+  processGroupId,
+  onDiagnostic,
+) {
+  const diagnostic = {
+    code: IDENTITY_OBSERVATION_UNAVAILABLE,
+    scope,
+    lock_path: lockPath,
+    pid,
+    ...(processGroupId > 0 ? { process_group_id: processGroupId } : {}),
+  };
+  const key = `${scope}:${lockPath}:${pid}:${processGroupId}`;
+  if (emittedIdentityDiagnostics.has(key)) return;
+  if (emittedIdentityDiagnostics.size >= MAX_EMITTED_IDENTITY_DIAGNOSTICS) {
+    emittedIdentityDiagnostics.clear();
+  }
+  emittedIdentityDiagnostics.add(key);
+  if (onDiagnostic) {
+    onDiagnostic(diagnostic);
+    return;
+  }
+  process.stderr.write(`[dist-lock] ${JSON.stringify(diagnostic)}\n`);
+}
+
 function observedProcessGroupId(pid) {
   if (!Number.isInteger(pid) || pid <= 0 || process.platform === 'win32') return null;
   const result = spawnSync('/bin/ps', ['-o', 'pgid=', '-p', String(pid)], {
@@ -90,7 +120,7 @@ function observedProcessGroupId(pid) {
 
 const CURRENT_PROCESS_START_IDENTITY = observeProcessStartIdentity(process.pid);
 
-function recordedProcessIsAlive(owner, path, legacyMaxAgeMs) {
+function recordedProcessIsAlive(owner, path, legacyMaxAgeMs, options = {}) {
   const pid = Number.isInteger(owner?.pid) ? owner.pid : 0;
   if (pid <= 0) return isFreshUnownedPath(path, legacyMaxAgeMs);
   if (!isProcessAlive(pid)) return false;
@@ -98,8 +128,19 @@ function recordedProcessIsAlive(owner, path, legacyMaxAgeMs) {
     ? owner.process_start_identity
     : '';
   if (!recordedIdentity) return isFreshUnownedPath(path, legacyMaxAgeMs);
-  const currentIdentity = observeProcessStartIdentity(pid);
-  return currentIdentity ? currentIdentity === recordedIdentity : true;
+  const currentIdentity = observeProcessStartIdentity(
+    pid,
+    options.observeProcessStartIdentity ?? readProcessStartIdentity,
+  );
+  if (currentIdentity) return currentIdentity === recordedIdentity;
+  reportIdentityObservationUnavailable(
+    'lock-owner',
+    path,
+    pid,
+    0,
+    options.onDiagnostic,
+  );
+  return true;
 }
 
 export function assertDistProcessTreeAuthority(
@@ -217,7 +258,7 @@ function isFreshUnownedPath(path, unownedStaleMs) {
   }
 }
 
-function isChildLeaseLive(lockPath, token, unownedStaleMs) {
+function isChildLeaseLive(lockPath, token, unownedStaleMs, options = {}) {
   const leasePath = ownedChildLeasePath(lockPath, token);
   if (!existsSync(leasePath)) return false;
   const lease = readOwner(leasePath);
@@ -229,33 +270,57 @@ function isChildLeaseLive(lockPath, token, unownedStaleMs) {
   if (!recordedIdentity) return false;
   if (processGroupId > 0) {
     if (!isProcessGroupAlive(processGroupId)) return false;
-    const currentLeaderIdentity = observeProcessStartIdentity(processGroupId);
-    if (currentLeaderIdentity) return currentLeaderIdentity === recordedIdentity;
+    const observe = options.observeProcessStartIdentity ?? readProcessStartIdentity;
+    if (isProcessAlive(processGroupId)) {
+      const currentLeaderIdentity = observeProcessStartIdentity(processGroupId, observe);
+      if (currentLeaderIdentity) return currentLeaderIdentity === recordedIdentity;
+      reportIdentityObservationUnavailable(
+        'process-group-leader',
+        leasePath,
+        processGroupId,
+        processGroupId,
+        options.onDiagnostic,
+      );
+    }
     const sentinelPid = Number.isInteger(lease?.sentinel_pid) ? lease.sentinel_pid : 0;
     const sentinelIdentity = typeof lease?.sentinel_start_identity === 'string'
       ? lease.sentinel_start_identity
       : '';
     if (sentinelPid <= 0 || !sentinelIdentity) return true;
     if (!isProcessAlive(sentinelPid)) return false;
-    const currentSentinelIdentity = observeProcessStartIdentity(sentinelPid);
-    return !currentSentinelIdentity
-      || (currentSentinelIdentity === sentinelIdentity
-        && observedProcessGroupId(sentinelPid) === processGroupId);
+    const currentSentinelIdentity = observeProcessStartIdentity(sentinelPid, observe);
+    if (!currentSentinelIdentity) {
+      reportIdentityObservationUnavailable(
+        'process-group-sentinel',
+        leasePath,
+        sentinelPid,
+        processGroupId,
+        options.onDiagnostic,
+      );
+      return true;
+    }
+    return currentSentinelIdentity === sentinelIdentity
+      && observedProcessGroupId(sentinelPid) === processGroupId;
   }
   if (leasePid <= 0) return false;
-  return recordedProcessIsAlive(lease, leasePath, unownedStaleMs);
+  return recordedProcessIsAlive(lease, leasePath, unownedStaleMs, options);
 }
 
-export function isOwnedChildLeaseActive(lockPath, token, unownedStaleMs = 60_000) {
-  return isChildLeaseLive(lockPath, token, unownedStaleMs);
+export function isOwnedChildLeaseActive(
+  lockPath,
+  token,
+  unownedStaleMs = 60_000,
+  options = {},
+) {
+  return isChildLeaseLive(lockPath, token, unownedStaleMs, options);
 }
 
-export function isOwnedLockActive(lockPath, unownedStaleMs = 60_000) {
+export function isOwnedLockActive(lockPath, unownedStaleMs = 60_000, options = {}) {
   if (!existsSync(lockPath)) return false;
   const owner = readOwner(lockPath);
-  if (recordedProcessIsAlive(owner, lockPath, unownedStaleMs)) return true;
+  if (recordedProcessIsAlive(owner, lockPath, unownedStaleMs, options)) return true;
   const token = typeof owner?.token === 'string' ? owner.token : '';
-  if (token && isChildLeaseLive(lockPath, token, unownedStaleMs)) return true;
+  if (token && isChildLeaseLive(lockPath, token, unownedStaleMs, options)) return true;
   return false;
 }
 
