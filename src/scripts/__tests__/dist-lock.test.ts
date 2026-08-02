@@ -13,6 +13,7 @@ const {
   isOwnedChildLeaseActive,
   isOwnedLockActive,
   isProcessGroupAlive,
+  observeProcessStartIdentity,
   prepareOwnedChildLease,
   releaseOwnedChildLease,
 } = await import(
@@ -139,6 +140,26 @@ async function runBuildProbeAsync(lockRoot: string): Promise<void> {
 }
 
 describe('compiled dist reader/writer lock', () => {
+  it('retries a slow first identity observation but fails after hard unavailability', () => {
+    let attempts = 0;
+    assert.equal(
+      observeProcessStartIdentity(process.pid, () => {
+        attempts += 1;
+        if (attempts === 1) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+        return attempts === 1 ? null : 'stable-start';
+      }),
+      'stable-start',
+    );
+    assert.equal(attempts, 2);
+
+    attempts = 0;
+    assert.equal(observeProcessStartIdentity(process.pid, () => {
+      attempts += 1;
+      return null;
+    }), null);
+    assert.equal(attempts, 3);
+    assert.throws(() => assertDistProcessTreeAuthority(process.platform, null), /dist_process_identity_unavailable/);
+  });
   it('fails loud when process-tree authority is unavailable', () => {
     assert.throws(
       () => assertDistProcessTreeAuthority('win32'),

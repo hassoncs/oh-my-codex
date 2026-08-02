@@ -48,7 +48,9 @@ export function isProcessAlive(pid) {
   }
 }
 
-function processStartIdentity(pid) {
+const PROCESS_START_IDENTITY_ATTEMPTS = 3;
+
+function readProcessStartIdentity(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   const result = process.platform === 'win32'
     ? spawnSync(
@@ -64,6 +66,18 @@ function processStartIdentity(pid) {
   return identity || null;
 }
 
+export function observeProcessStartIdentity(pid, observe = readProcessStartIdentity) {
+  for (let attempt = 0; attempt < PROCESS_START_IDENTITY_ATTEMPTS; attempt += 1) {
+    try {
+      const identity = observe(pid);
+      if (typeof identity === 'string' && identity.trim()) return identity.trim();
+    } catch {
+      // Retry transient observer failures; exhaustion remains fail-closed.
+    }
+  }
+  return null;
+}
+
 function observedProcessGroupId(pid) {
   if (!Number.isInteger(pid) || pid <= 0 || process.platform === 'win32') return null;
   const result = spawnSync('/bin/ps', ['-o', 'pgid=', '-p', String(pid)], {
@@ -74,7 +88,7 @@ function observedProcessGroupId(pid) {
   return Number.isInteger(value) && value > 0 ? value : null;
 }
 
-const CURRENT_PROCESS_START_IDENTITY = processStartIdentity(process.pid);
+const CURRENT_PROCESS_START_IDENTITY = observeProcessStartIdentity(process.pid);
 
 function recordedProcessIsAlive(owner, path, legacyMaxAgeMs) {
   const pid = Number.isInteger(owner?.pid) ? owner.pid : 0;
@@ -84,7 +98,8 @@ function recordedProcessIsAlive(owner, path, legacyMaxAgeMs) {
     ? owner.process_start_identity
     : '';
   if (!recordedIdentity) return isFreshUnownedPath(path, legacyMaxAgeMs);
-  return processStartIdentity(pid) === recordedIdentity;
+  const currentIdentity = observeProcessStartIdentity(pid);
+  return currentIdentity ? currentIdentity === recordedIdentity : true;
 }
 
 export function assertDistProcessTreeAuthority(
@@ -154,12 +169,12 @@ export function activateOwnedChildLease(
   token,
   pid,
   processGroupId = 0,
-  observeProcessStartIdentity = processStartIdentity,
+  observe = readProcessStartIdentity,
 ) {
   const leasePath = ownedChildLeasePath(lockPath, token);
   const current = readOwner(leasePath);
   if (current?.token !== token) throw new Error(`dist_child_lease_token_mismatch:${leasePath}`);
-  const childStartIdentity = observeProcessStartIdentity(pid)?.trim();
+  const childStartIdentity = observeProcessStartIdentity(pid, observe);
   if (!childStartIdentity) throw new Error(`dist_child_process_identity_unavailable:${pid}`);
   writeFileSync(leasePath, JSON.stringify({
     pid,
@@ -177,7 +192,7 @@ export function registerOwnedChildLeaseSentinel(leasePath, token, pid) {
   const processGroupIdValue = Number.isInteger(current?.process_group_id)
     ? current.process_group_id
     : 0;
-  const sentinelStartIdentity = processStartIdentity(pid);
+  const sentinelStartIdentity = observeProcessStartIdentity(pid);
   if (!sentinelStartIdentity) throw new Error(`dist_child_sentinel_identity_unavailable:${pid}`);
   if (observedProcessGroupId(pid) !== processGroupIdValue) {
     throw new Error(`dist_child_sentinel_group_mismatch:${pid}:${processGroupIdValue}`);
@@ -214,16 +229,18 @@ function isChildLeaseLive(lockPath, token, unownedStaleMs) {
   if (!recordedIdentity) return false;
   if (processGroupId > 0) {
     if (!isProcessGroupAlive(processGroupId)) return false;
-    const currentLeaderIdentity = processStartIdentity(processGroupId);
+    const currentLeaderIdentity = observeProcessStartIdentity(processGroupId);
     if (currentLeaderIdentity) return currentLeaderIdentity === recordedIdentity;
     const sentinelPid = Number.isInteger(lease?.sentinel_pid) ? lease.sentinel_pid : 0;
     const sentinelIdentity = typeof lease?.sentinel_start_identity === 'string'
       ? lease.sentinel_start_identity
       : '';
-    return sentinelPid > 0
-      && Boolean(sentinelIdentity)
-      && processStartIdentity(sentinelPid) === sentinelIdentity
-      && observedProcessGroupId(sentinelPid) === processGroupId;
+    if (sentinelPid <= 0 || !sentinelIdentity) return true;
+    if (!isProcessAlive(sentinelPid)) return false;
+    const currentSentinelIdentity = observeProcessStartIdentity(sentinelPid);
+    return !currentSentinelIdentity
+      || (currentSentinelIdentity === sentinelIdentity
+        && observedProcessGroupId(sentinelPid) === processGroupId);
   }
   if (leasePid <= 0) return false;
   return recordedProcessIsAlive(lease, leasePath, unownedStaleMs);

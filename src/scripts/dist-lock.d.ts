@@ -7,6 +7,10 @@ export interface DistLockConfig {
 
 export function parsePositiveMs(value: string | undefined, fallback: number): number;
 export function resolveDistLockConfig(cwd: string, env?: NodeJS.ProcessEnv): DistLockConfig;
+export function observeProcessStartIdentity(
+  pid: number,
+  observe?: (pid: number) => string | null,
+): string | null;
 export function isProcessAlive(pid: number): boolean;
 export function isProcessGroupAlive(processGroupId: number): boolean;
 export function processGroupMembers(processGroupId: number): number[] | null;
