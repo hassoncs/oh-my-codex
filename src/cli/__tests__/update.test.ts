@@ -22,6 +22,12 @@ import {
   writeUserInstallStamp,
 } from '../update.js';
 
+// These suites deliberately exercise the upstream install path from inside the
+// fork checkout, which the fork-build guard exists to refuse. Opt in explicitly
+// so the guard stays enforced everywhere it is not being tested. Guard-specific
+// coverage lives in fork-build-guard.test.ts.
+process.env.OMX_ALLOW_UPSTREAM_OVERWRITE = '1';
+
 const PACKAGE_NAME = 'oh-my-codex';
 
 describe('isNewerVersion', () => {

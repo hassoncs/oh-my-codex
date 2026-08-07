@@ -15,6 +15,7 @@ import { createInterface } from 'readline/promises';
 import { getPackageRoot } from '../utils/package.js';
 import { omxUserInstallStampPath } from '../utils/paths.js';
 import { readPersistedSetupPreferencesSync } from './setup-preferences.js';
+import { evaluateForkBuildGuard } from './fork-build-guard.js';
 
 export interface UpdateState {
   last_checked_at: string;
@@ -849,6 +850,21 @@ async function executeUpdate(
     nowMs = Date.now(),
   } = options;
   const channelConfig = resolveUpdateChannelConfig(channel);
+
+  // A fork build installed from source is indistinguishable from the published
+  // package by version alone, so an upstream install would revert fork-local
+  // changes leaving no visible trace. Refuse before anything is fetched.
+  // See src/cli/fork-build-guard.ts.
+  const forkGuard = evaluateForkBuildGuard({ installSource: channelConfig.installSource });
+  if (!forkGuard.allowed) {
+    if (immediate) console.log(forkGuard.reason);
+    return {
+      status: 'failed',
+      currentVersion: await dependencies.getCurrentVersion(),
+      latestVersion: null,
+    };
+  }
+
   const [current, latest] = await Promise.all([
     dependencies.getCurrentVersion(),
     channel === 'stable' || !forceInstall || channel === 'dev' ? dependencies.fetchLatestVersion() : Promise.resolve(null),
