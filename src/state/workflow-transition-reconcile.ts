@@ -438,11 +438,11 @@ export async function assertWorkflowTransitionContextAllowed(
   } = {},
 ): Promise<void> {
   const modes = [...currentModes];
-  if (
-    !options.allowNestedAutopilotTeam
-    || requestedMode !== 'team'
-    || !modes.includes('autopilot')
-  ) {
+  // Nesting a team beneath autopilot is a legal overlap, but only from a phase
+  // that actually owns story work. This precondition is unconditional: the
+  // overlap itself no longer depends on a caller opting in, so neither may the
+  // check that keeps it honest.
+  if (requestedMode !== 'team' || !modes.includes('autopilot')) {
     return;
   }
 
@@ -453,12 +453,20 @@ export async function assertWorkflowTransitionContextAllowed(
   const validChild = isAutopilotSupervisingChild(autopilotState, 'ultragoal')
     || isAutopilotSupervisingChild(autopilotState, 'team');
   if (!validChild) {
-    throw new Error('nested_autopilot_team_requires_active_ultragoal_child');
+    throw new Error(
+      'nested_autopilot_team_requires_active_ultragoal_child: autopilot is active but its current_phase is not `ultragoal` or `team`, so there is no story for the team to run under. '
+      + 'Autopilot reaches its ultragoal phase through its own progression (deep-interview -> ralplan -> ultragoal) and rejects a direct phase jump, so either let it advance and retry, '
+      + 'or run the team standalone by clearing autopilot: `omx state clear --input \'{"mode":"autopilot"}\' --json`.',
+    );
   }
 
   const ultragoalOutcome = await resolveLeaderOwnedUltragoalContextOutcome(cwd);
   if (ultragoalOutcome.status !== 'valid') {
-    throw new Error(`invalid_ultragoal_team_context:${ultragoalOutcome.warning?.message ?? ultragoalOutcome.status}`);
+    throw new Error(
+      `invalid_ultragoal_team_context:${ultragoalOutcome.warning?.message ?? ultragoalOutcome.status}. `
+      + 'Start or repair the leader-owned ultragoal story before nesting a team under it '
+      + '(`omx ultragoal status --json` to inspect, `omx state clear --input \'{"mode":"autopilot"}\' --json` to run the team standalone).',
+    );
   }
 }
 

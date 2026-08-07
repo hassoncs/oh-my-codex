@@ -1680,7 +1680,7 @@ describe('keyword detector skill-active-state lifecycle', () => {
 
       const denied = await recordSkillActivation({
         stateDir,
-        text: '$autopilot do it too',
+        text: '$autoresearch do it too',
         sessionId: 'sess-deny',
         threadId: 'thread-deny',
         turnId: 'turn-2',
@@ -1688,8 +1688,9 @@ describe('keyword detector skill-active-state lifecycle', () => {
       });
 
       assert.ok(denied?.transition_error);
-      assert.match(String(denied?.transition_error), /Unsupported workflow overlap: team \+ autopilot\./);
-      assert.match(String(denied?.transition_error), /`omx state clear --input '{"mode":"<mode>"}' --json`/);
+      assert.match(String(denied?.transition_error), /Unsupported workflow overlap: team \+ autoresearch\./);
+      assert.match(String(denied?.transition_error), /`omx state clear --input '{"mode":"team"}' --json`/);
+      assert.doesNotMatch(String(denied?.transition_error), /"mode":"<mode>"/);
       assert.match(String(denied?.transition_error), /explicit MCP compatibility is enabled/);
 
       const persisted = JSON.parse(
@@ -1697,7 +1698,7 @@ describe('keyword detector skill-active-state lifecycle', () => {
       ) as { active_skills?: Array<{ skill: string }> };
       assert.deepEqual(persisted.active_skills?.map((entry) => entry.skill), ['team']);
       assert.equal(
-        existsSync(join(stateDir, 'sessions', 'sess-deny', 'autopilot-state.json')),
+        existsSync(join(stateDir, 'sessions', 'sess-deny', 'autoresearch-state.json')),
         false,
       );
     } finally {
@@ -3301,7 +3302,11 @@ deepMaxRounds = 21
       });
 
       assert.equal(result?.skill, 'autopilot');
-      assert.match(String(result?.transition_error), /Execution-to-planning rollback auto-complete is not allowed/i);
+      assert.match(
+        String(result?.transition_error),
+        /deep-interview is a planning workflow and cannot roll back over active execution work \(ultragoal\)/i,
+      );
+      assert.match(String(result?.transition_error), /`omx state clear --input '{"mode":"ultragoal"}' --json`/);
       assert.equal(result?.supervised_child_skill, undefined);
       assert.equal(existsSync(join(stateDir, 'sessions', sessionId, 'deep-interview-state.json')), false);
       const ultragoal = JSON.parse(
@@ -4268,13 +4273,14 @@ deepMaxRounds = 21
 
       const result = await recordSkillActivation({
         stateDir,
-        text: 'please run $ralph now',
+        text: 'please run $autoresearch now',
         nowIso: '2026-02-26T00:00:00.000Z',
       });
 
       assert.ok(result);
       assert.equal(result.skill, 'autopilot');
-      assert.match(String(result.transition_error), /Unsupported workflow overlap: autopilot \+ ralph\./);
+      assert.match(String(result.transition_error), /Unsupported workflow overlap: autopilot \+ autoresearch\./);
+      assert.match(String(result.transition_error), /`omx state clear --input '{"mode":"autopilot"}' --json`/);
       assert.equal(result.activated_at, '2026-02-25T00:00:00.000Z');
     } finally {
       await rm(cwd, { recursive: true, force: true });

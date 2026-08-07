@@ -3198,14 +3198,15 @@ describe('state operations directory initialization', () => {
       const denied = await executeStateOperation('state_write', {
         workingDirectory: wd,
         session_id: 'sess-deny',
-        mode: 'autopilot',
+        mode: 'autoresearch',
         active: true,
         current_phase: 'planning',
       });
 
       assert.equal(denied.isError, true);
-      assert.match(String((denied.payload as { error?: string }).error || ''), /Unsupported workflow overlap: team \+ autopilot\./);
-      assert.equal(existsSync(join(wd, '.omx', 'state', 'sessions', 'sess-deny', 'autopilot-state.json')), false);
+      assert.match(String((denied.payload as { error?: string }).error || ''), /Unsupported workflow overlap: team \+ autoresearch\./);
+      assert.match(String((denied.payload as { error?: string }).error || ''), /`omx state clear --input '{"mode":"team"}' --json`/);
+      assert.equal(existsSync(join(wd, '.omx', 'state', 'sessions', 'sess-deny', 'autoresearch-state.json')), false);
 
       const canonical = JSON.parse(
         await readFile(join(wd, '.omx', 'state', 'sessions', 'sess-deny', 'skill-active-state.json'), 'utf-8'),
@@ -3249,7 +3250,7 @@ describe('state operations directory initialization', () => {
     }
   });
 
-  it('rejects standalone ralplan writes while preserving active Autopilot supervisor state', async () => {
+  it('allows supervised ralplan writes while preserving active Autopilot supervisor state', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-autopilot-ralplan-child-'));
     try {
       await withOmxRootEnv(wd, async () => {
@@ -3280,7 +3281,10 @@ describe('state operations directory initialization', () => {
           }, null, 2),
         );
 
-        const denied = await executeStateOperation('state_write', {
+        // ralplan is a declared autopilot child phase, so the write is legal.
+        // What must never happen is the supervisor being auto-completed or
+        // otherwise mutated by its own child starting.
+        const supervised = await executeStateOperation('state_write', {
           workingDirectory: wd,
           session_id: sessionId,
           mode: 'ralplan',
@@ -3288,9 +3292,8 @@ describe('state operations directory initialization', () => {
           current_phase: 'planning',
         });
 
-        assert.equal(denied.isError, true);
-        assert.match(String((denied.payload as { error?: string }).error || ''), /Execution-to-planning rollback auto-complete is not allowed\./);
-        assert.equal(existsSync(join(sessionDir, 'ralplan-state.json')), false);
+        assert.equal(supervised.isError, undefined);
+        assert.equal(existsSync(join(sessionDir, 'ralplan-state.json')), true);
 
         const autopilotState = JSON.parse(
           await readFile(join(sessionDir, 'autopilot-state.json'), 'utf-8'),
@@ -3305,7 +3308,7 @@ describe('state operations directory initialization', () => {
     }
   });
 
-  it('rejects standalone ralplan writes from detail-only active Autopilot supervisor state', async () => {
+  it('allows supervised ralplan writes from detail-only active Autopilot supervisor state', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-autopilot-detail-only-ralplan-child-'));
     try {
       await withOmxRootEnv(wd, async () => {
@@ -3327,7 +3330,7 @@ describe('state operations directory initialization', () => {
           }, null, 2),
         );
 
-        const denied = await executeStateOperation('state_write', {
+        const supervised = await executeStateOperation('state_write', {
           workingDirectory: wd,
           session_id: sessionId,
           mode: 'ralplan',
@@ -3335,11 +3338,8 @@ describe('state operations directory initialization', () => {
           current_phase: 'planning',
         });
 
-        assert.equal(denied.isError, true);
-        assert.match(String((denied.payload as { error?: string }).error || ''), /Cannot write ralplan: autopilot is already active\./);
-        assert.match(String((denied.payload as { error?: string }).error || ''), /Execution-to-planning rollback auto-complete is not allowed\./);
-        assert.equal(existsSync(join(sessionDir, 'ralplan-state.json')), false);
-        assert.equal(existsSync(join(sessionDir, 'skill-active-state.json')), false);
+        assert.equal(supervised.isError, undefined);
+        assert.equal(existsSync(join(sessionDir, 'ralplan-state.json')), true);
 
         const autopilotState = JSON.parse(
           await readFile(join(sessionDir, 'autopilot-state.json'), 'utf-8'),

@@ -93,7 +93,7 @@ describe('modes/base autoresearch contract integration', () => {
       await startMode('ralph', 'demo', 5, wd);
       await assert.rejects(
         () => startMode('ralplan', 'plan again', 5, wd),
-        /Execution-to-planning rollback auto-complete is not allowed/i,
+        /is a planning workflow and cannot roll back over active execution work/i,
       );
     } finally {
       await rm(wd, { recursive: true, force: true });

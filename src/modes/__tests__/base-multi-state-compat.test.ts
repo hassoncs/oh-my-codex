@@ -30,14 +30,22 @@ describe('modes/base multi-state compatibility', () => {
     }
   });
 
-  it('rejects standalone autopilot + team overlaps with actionable clearing guidance', async () => {
+  it('rejects a team started from an autopilot phase that owns no story, with actionable guidance', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-mode-autopilot-team-'));
     try {
       await startMode('autopilot', 'run solo automation', 5, wd);
 
+      // Autopilot + team is a legal overlap, but only from the ultragoal/team
+      // phase. A fresh autopilot has no story yet, so the runtime precondition
+      // refuses and must name the exact way forward.
       await assert.rejects(
         () => startMode('team', 'attempt invalid overlap', 5, wd),
-        /omx state.*omx_state\.\*/i,
+        (error: Error) => {
+          assert.match(error.message, /nested_autopilot_team_requires_active_ultragoal_child/);
+          assert.match(error.message, /deep-interview -> ralplan -> ultragoal/);
+          assert.match(error.message, /omx state clear .*"mode":"autopilot"/);
+          return true;
+        },
       );
 
       const autopilotState = JSON.parse(

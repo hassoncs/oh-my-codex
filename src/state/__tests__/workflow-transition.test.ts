@@ -8,6 +8,7 @@ import {
   buildWorkflowTransitionMessage,
   buildWorkflowTransitionError,
   evaluateWorkflowTransition,
+  findBlockingWorkflowModes,
   readActiveWorkflowModes,
 } from '../workflow-transition.js';
 import {
@@ -47,7 +48,7 @@ describe('workflow transition rules', () => {
   it('allows the approved overlap matrix and denies unsupported combinations', () => {
     const cases: Array<{
       current: string[];
-      requested: 'team' | 'ralph' | 'ultrawork' | 'autopilot' | 'autoresearch';
+      requested: 'team' | 'ralph' | 'ultrawork' | 'autopilot' | 'autoresearch' | 'ultragoal' | 'ultraqa';
       allowed: boolean;
       resulting: string[];
     }> = [
@@ -58,9 +59,15 @@ describe('workflow transition rules', () => {
       { current: ['ultrawork'], requested: 'team', allowed: true, resulting: ['ultrawork', 'team'] },
       { current: ['ralph'], requested: 'ultrawork', allowed: true, resulting: ['ralph', 'ultrawork'] },
       { current: ['ultrawork'], requested: 'ralph', allowed: true, resulting: ['ultrawork', 'ralph'] },
-      { current: ['autopilot'], requested: 'team', allowed: false, resulting: ['autopilot'] },
-      { current: ['team'], requested: 'autopilot', allowed: false, resulting: ['team'] },
+      { current: ['autopilot'], requested: 'team', allowed: true, resulting: ['autopilot', 'team'] },
+      { current: ['team'], requested: 'autopilot', allowed: true, resulting: ['team', 'autopilot'] },
+      { current: ['ultragoal'], requested: 'team', allowed: true, resulting: ['ultragoal', 'team'] },
+      { current: ['team'], requested: 'ultragoal', allowed: true, resulting: ['team', 'ultragoal'] },
+      { current: ['autopilot', 'ultragoal'], requested: 'team', allowed: true, resulting: ['autopilot', 'ultragoal', 'team'] },
       { current: ['autoresearch'], requested: 'ralph', allowed: false, resulting: ['autoresearch'] },
+      { current: ['autoresearch'], requested: 'team', allowed: false, resulting: ['autoresearch'] },
+      { current: ['ultragoal'], requested: 'ralph', allowed: false, resulting: ['ultragoal'] },
+      { current: ['team'], requested: 'ultraqa', allowed: false, resulting: ['team'] },
       { current: ['team', 'ralph'], requested: 'ultrawork', allowed: true, resulting: ['team', 'ralph', 'ultrawork'] },
       { current: ['team', 'ultrawork'], requested: 'ralph', allowed: true, resulting: ['team', 'ultrawork', 'ralph'] },
     ];
@@ -72,7 +79,7 @@ describe('workflow transition rules', () => {
     }
   });
 
-  it('allows autopilot + team only through the validated nested-team option', () => {
+  it('allows autopilot + team with or without the nested-team caller option', () => {
     const standalone = evaluateWorkflowTransition(['autopilot'], 'team');
     const nested = evaluateWorkflowTransition(
       ['autopilot'],
@@ -80,20 +87,60 @@ describe('workflow transition rules', () => {
       { allowNestedAutopilotTeam: true },
     );
 
-    assert.equal(standalone.allowed, false);
-    assert.equal(nested.allowed, true);
-    assert.equal(nested.kind, 'overlap');
-    assert.deepEqual(nested.resultingModes, ['autopilot', 'team']);
+    for (const decision of [standalone, nested]) {
+      assert.equal(decision.allowed, true);
+      assert.equal(decision.kind, 'overlap');
+      assert.deepEqual(decision.resultingModes, ['autopilot', 'team']);
+    }
   });
 
-  it('builds actionable denial guidance that names both clearing paths', () => {
-    const error = buildWorkflowTransitionError(['team'], 'autopilot', 'start');
-    assert.match(error, /Cannot start autopilot: team is already active\./);
-    assert.match(error, /Unsupported workflow overlap: team \+ autopilot\./);
+  it('derives autopilot coexistence from its declared child phases', () => {
+    for (const child of ['deep-interview', 'ralplan', 'ultragoal', 'team', 'ralph', 'ultraqa'] as const) {
+      const decision = evaluateWorkflowTransition(['autopilot'], child);
+      assert.equal(decision.allowed, true, `autopilot + ${child}`);
+      assert.equal(decision.kind, 'overlap', `autopilot + ${child}`);
+      assert.deepEqual(decision.resultingModes, ['autopilot', child], `autopilot + ${child}`);
+    }
+    // autoresearch is not an autopilot child phase and stays standalone.
+    assert.equal(evaluateWorkflowTransition(['autopilot'], 'autoresearch').allowed, false);
+  });
+
+  it('hosts a team inside an active ultragoal story in either activation order', () => {
+    const teamUnderStory = evaluateWorkflowTransition(['ultragoal'], 'team');
+    const storyAroundTeam = evaluateWorkflowTransition(['team'], 'ultragoal');
+
+    assert.equal(teamUnderStory.kind, 'overlap');
+    assert.deepEqual(teamUnderStory.resultingModes, ['ultragoal', 'team']);
+    assert.equal(storyAroundTeam.kind, 'overlap');
+    assert.deepEqual(storyAroundTeam.resultingModes, ['team', 'ultragoal']);
+  });
+
+  it('reports the modes that actually block a denied transition', () => {
+    assert.deepEqual(findBlockingWorkflowModes(['autoresearch'], 'team'), ['autoresearch']);
+    // ralplan auto-completes into team, so it never blocks it.
+    assert.deepEqual(findBlockingWorkflowModes(['ralplan'], 'team'), []);
+    // ultragoal hosts team, so it never blocks it either.
+    assert.deepEqual(findBlockingWorkflowModes(['ultragoal'], 'team'), []);
+    assert.deepEqual(findBlockingWorkflowModes(['team', 'ultragoal'], 'ralplan'), ['team', 'ultragoal']);
+  });
+
+  it('builds actionable denial guidance that names the blocking mode by name', () => {
+    const error = buildWorkflowTransitionError(['autoresearch'], 'team', 'start');
+    assert.match(error, /Cannot start team: autoresearch is already active\./);
+    assert.match(error, /Unsupported workflow overlap: autoresearch \+ team\./);
     assert.match(error, /Current state is unchanged\./);
-    assert.match(error, /Clear incompatible workflow state yourself via/);
-    assert.match(error, /`omx state clear --input '{"mode":"<mode>"}' --json`/);
+    assert.match(error, /`omx state clear --input '{"mode":"autoresearch"}' --json`/);
     assert.match(error, /explicit MCP compatibility is enabled/);
+    // The unactionable placeholder form must never reach a caller that has a
+    // known blocking mode.
+    assert.doesNotMatch(error, /"mode":"<mode>"/);
+  });
+
+  it('names every blocking mode when several are active', () => {
+    const error = buildWorkflowTransitionError(['team', 'ultragoal'], 'ralplan', 'start');
+    assert.match(error, /`omx state clear --input '{"mode":"team"}' --json`/);
+    assert.match(error, /`omx state clear --input '{"mode":"ultragoal"}' --json`/);
+    assert.doesNotMatch(error, /"mode":"<mode>"/);
   });
 
   it('returns auto-complete decisions for allowlisted forward transitions', () => {
@@ -140,19 +187,19 @@ describe('workflow transition rules', () => {
 
   it('builds rollback denial guidance for execution-to-planning transitions', () => {
     const error = buildWorkflowTransitionError(['ralph'], 'ralplan', 'start');
-    assert.match(error, /Execution-to-planning rollback auto-complete is not allowed\./);
-    assert.match(error, /First clear current state first and retry if this action is intended\./);
-    assert.match(error, /Clear incompatible workflow state yourself via/);
+    assert.match(error, /ralplan is a planning workflow and cannot roll back over active execution work \(ralph\)\./);
+    assert.match(error, /`omx state clear --input '{"mode":"ralph"}' --json`/);
+    assert.doesNotMatch(error, /"mode":"<mode>"/);
   });
 
 
   it('does not auto-complete Autopilot when starting ralplan as a child-stage name', () => {
     const decision = evaluateWorkflowTransition(['autopilot'], 'ralplan');
-    assert.equal(decision.allowed, false);
-    assert.equal(decision.kind, 'deny');
-    assert.equal(decision.denialReason, 'rollback');
+    assert.equal(decision.allowed, true);
+    assert.equal(decision.kind, 'overlap');
+    assert.equal(decision.denialReason, undefined);
     assert.deepEqual(decision.autoCompleteModes, []);
-    assert.deepEqual(decision.resultingModes, ['autopilot']);
+    assert.deepEqual(decision.resultingModes, ['autopilot', 'ralplan']);
   });
 
   it('formats transition audit messages', () => {

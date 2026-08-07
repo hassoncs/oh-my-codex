@@ -6593,20 +6593,22 @@ export async function onHookEvent(event) {
           session_id: "sess-deny-1",
           thread_id: "thread-deny-1",
           turn_id: "turn-deny-2",
-          prompt: "$autopilot also run this",
+          prompt: "$autoresearch also run this",
         },
         { cwd },
       );
 
       assert.match(JSON.stringify(denied.outputJson), /denied workflow keyword/i);
-      assert.match(JSON.stringify(denied.outputJson), /Unsupported workflow overlap: team \+ autopilot\./);
+      assert.match(JSON.stringify(denied.outputJson), /Unsupported workflow overlap: team \+ autoresearch\./);
       assert.match(JSON.stringify(denied.outputJson), /omx state clear --input/);
-      assert.match(JSON.stringify(denied.outputJson), /mode\\":\\"<mode>/);
+      // The guidance must name the blocking mode, never the unactionable placeholder.
+      assert.match(JSON.stringify(denied.outputJson), /mode\\":\\"team/);
+      assert.doesNotMatch(JSON.stringify(denied.outputJson), /mode\\":\\"<mode>/);
       assert.match(JSON.stringify(denied.outputJson), /--json/);
       assert.match(JSON.stringify(denied.outputJson), /explicit MCP compatibility is enabled/);
       assert.match(JSON.stringify(denied.outputJson), /`omx_state\.\*` tools/);
       assert.equal(
-        existsSync(join(cwd, ".omx", "state", "sessions", "sess-deny-1", "autopilot-state.json")),
+        existsSync(join(cwd, ".omx", "state", "sessions", "sess-deny-1", "autoresearch-state.json")),
         false,
       );
     } finally {

@@ -1,6 +1,7 @@
 import { existsSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { getAuthoritativeActiveStatePaths } from '../mcp/state-paths.js';
+import { AUTOPILOT_CHILD_PHASES } from '../autopilot/fsm.js';
 
 export type DownstreamAuthority = 'plan_then_execute' | 'execute_now';
 
@@ -781,9 +782,34 @@ export interface WorkflowTransitionOptions {
   allowNestedAutopilotTeam?: boolean;
 }
 
-const ALLOWED_OVERLAP_PAIRS = new Set([
-  'ralph|team',
+/**
+ * Modes that compose with any workflow. They add behaviour to whatever run is
+ * already in progress instead of owning the run, so they never conflict.
+ */
+const UNIVERSAL_OVERLAP_MODES = new Set<TrackedWorkflowMode>([
+  'ultrawork',
 ]);
+
+/**
+ * Declared nesting: each supervising mode lists the modes it may host while it
+ * stays active. This is the single source of truth for legal coexistence, and
+ * it is derived from each supervisor's own phase declaration wherever one
+ * exists — a supervisor that gains a child phase must not also have to
+ * remember to edit a separate pair list.
+ *
+ * Overlap is symmetric in effect: declaring `host: [child]` legalises the
+ * combination in either activation order.
+ */
+const WORKFLOW_MODE_HOSTED_MODES: Partial<Record<TrackedWorkflowMode, readonly TrackedWorkflowMode[]>> = {
+  // Autopilot supervises exactly the child phases its own FSM declares.
+  autopilot: TRACKED_WORKFLOW_MODES.filter(
+    (mode) => (AUTOPILOT_CHILD_PHASES as readonly string[]).includes(mode),
+  ),
+  // Ultragoal keeps the goal ledger while a team runs the parallel lanes of a story.
+  ultragoal: ['team'],
+  // Ralph drives its iteration loop while team lanes execute beneath it.
+  ralph: ['team'],
+};
 
 const AUTO_COMPLETE_TRANSITIONS = new Set([
   'deep-interview->autopilot',
@@ -833,18 +859,33 @@ function normalizeTrackedModes(modes: Iterable<string>): TrackedWorkflowMode[] {
   return [...deduped];
 }
 
-function buildPairKey(a: string, b: string): string {
-  return [a, b].sort((left, right) => left.localeCompare(right)).join('|');
+function hostsMode(host: TrackedWorkflowMode, candidate: TrackedWorkflowMode): boolean {
+  return (WORKFLOW_MODE_HOSTED_MODES[host] ?? []).includes(candidate);
 }
 
 function isAllowedOverlap(
   a: TrackedWorkflowMode,
   b: TrackedWorkflowMode,
-  options: WorkflowTransitionOptions,
+  _options: WorkflowTransitionOptions = {},
 ): boolean {
-  if (a === 'ultrawork' || b === 'ultrawork') return true;
-  if (options.allowNestedAutopilotTeam && buildPairKey(a, b) === 'autopilot|team') return true;
-  return ALLOWED_OVERLAP_PAIRS.has(buildPairKey(a, b));
+  if (UNIVERSAL_OVERLAP_MODES.has(a) || UNIVERSAL_OVERLAP_MODES.has(b)) return true;
+  return hostsMode(a, b) || hostsMode(b, a);
+}
+
+/**
+ * Modes that block `requestedMode` from starting: neither auto-completable nor
+ * a declared overlap. These are the modes a caller has to finish or clear.
+ */
+export function findBlockingWorkflowModes(
+  currentModes: readonly TrackedWorkflowMode[],
+  requestedMode: TrackedWorkflowMode,
+): TrackedWorkflowMode[] {
+  return currentModes.filter((mode) => (
+    mode !== requestedMode
+    && !isAutoCompleteTransition(mode, requestedMode)
+    && !isEvidenceGatedAutoCompleteTransition(mode, requestedMode)
+    && !isAllowedOverlap(mode, requestedMode)
+  ));
 }
 
 function buildAutoCompleteKey(a: TrackedWorkflowMode, b: TrackedWorkflowMode): string {
@@ -965,27 +1006,47 @@ export function evaluateWorkflowTransition(
   };
 }
 
+/**
+ * Ready-to-run commands that clear exactly the modes standing in the way.
+ * A denial that does not name the blocking mode leaves the caller stuck, so
+ * the placeholder form (`"mode":"<mode>"`) is never emitted when the blocking
+ * set is known.
+ */
+function buildUnblockCommands(blockingModes: readonly TrackedWorkflowMode[]): string {
+  if (blockingModes.length === 0) {
+    return `Clear the blocking workflow state via \`omx state clear --input '{"mode":"<mode>"}' --json\`.`;
+  }
+  const commands = blockingModes
+    .map((mode) => `\`omx state clear --input '{"mode":"${mode}"}' --json\``)
+    .join(' ');
+  const subject = blockingModes.length === 1 ? 'that workflow or clear it' : 'those workflows or clear them';
+  return `To proceed, finish ${subject} yourself: ${commands}`;
+}
+
 export function buildWorkflowTransitionError(
   currentActiveModes: Iterable<string>,
   requestedMode: TrackedWorkflowMode,
   action: WorkflowTransitionAction = 'activate',
+  options: WorkflowTransitionOptions = {},
 ): string {
-  const decision = evaluateWorkflowTransition(currentActiveModes, requestedMode);
+  const decision = evaluateWorkflowTransition(currentActiveModes, requestedMode, options);
   const activeModesMessage = formatActiveModes(decision.currentModes);
   const overlap = [...decision.currentModes, requestedMode].join(' + ');
+  const blockingModes = findBlockingWorkflowModes(decision.currentModes, requestedMode);
+  const unblock = buildUnblockCommands(blockingModes);
   if (decision.denialReason === 'rollback') {
     return [
       `Cannot ${action} ${requestedMode}: ${activeModesMessage}.`,
-      'Execution-to-planning rollback auto-complete is not allowed.',
-      'First clear current state first and retry if this action is intended.',
-      `Clear incompatible workflow state yourself via \`omx state clear --input '{"mode":"<mode>"}' --json\`; if explicit MCP compatibility is enabled, \`omx_state.*\` tools are also acceptable.`,
+      `${requestedMode} is a planning workflow and cannot roll back over active execution work (${blockingModes.join(', ')}).`,
+      unblock,
+      'Current state is unchanged. If explicit MCP compatibility is enabled, `omx_state.*` tools are also acceptable.',
     ].join(' ');
   }
   return [
     `Cannot ${action} ${requestedMode}: ${activeModesMessage}.`,
     `Unsupported workflow overlap: ${overlap}.`,
-    'Current state is unchanged.',
-    `Clear incompatible workflow state yourself via \`omx state clear --input '{"mode":"<mode>"}' --json\`; if explicit MCP compatibility is enabled, \`omx_state.*\` tools are also acceptable.`,
+    unblock,
+    'Current state is unchanged. If explicit MCP compatibility is enabled, `omx_state.*` tools are also acceptable.',
   ].join(' ');
 }
 
@@ -997,7 +1058,7 @@ export function assertWorkflowTransitionAllowed(
 ): void {
   const decision = evaluateWorkflowTransition(currentActiveModes, requestedMode, options);
   if (decision.allowed) return;
-  throw new Error(buildWorkflowTransitionError(currentActiveModes, requestedMode, action));
+  throw new Error(buildWorkflowTransitionError(currentActiveModes, requestedMode, action, options));
 }
 
 export async function readActiveWorkflowModes(

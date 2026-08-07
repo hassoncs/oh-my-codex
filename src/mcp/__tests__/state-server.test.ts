@@ -878,16 +878,17 @@ describe('state-server directory initialization', () => {
           arguments: {
             workingDirectory: wd,
             session_id: 'sess-deny',
-            mode: 'autopilot',
+            mode: 'autoresearch',
             active: true,
-            current_phase: 'ralplan',
+            current_phase: 'planning',
           },
         },
       });
 
       assert.equal(denied.isError, true);
-      assert.match(denied.content[0]?.text || '', /Unsupported workflow overlap: team \+ autopilot\./);
-      assert.equal(existsSync(join(wd, '.omx', 'state', 'sessions', 'sess-deny', 'autopilot-state.json')), false);
+      assert.match(denied.content[0]?.text || '', /Unsupported workflow overlap: team \+ autoresearch\./);
+      assert.match(denied.content[0]?.text || '', /omx state clear --input/);
+      assert.equal(existsSync(join(wd, '.omx', 'state', 'sessions', 'sess-deny', 'autoresearch-state.json')), false);
 
       const canonical = JSON.parse(
         await readFile(join(wd, '.omx', 'state', 'sessions', 'sess-deny', 'skill-active-state.json'), 'utf-8'),
@@ -1151,8 +1152,9 @@ describe('state-server directory initialization', () => {
 
       assert.equal(invalidTeamWrite.isError, true);
       const body = JSON.parse(invalidTeamWrite.content[0]?.text || '{}') as { error?: string };
-      assert.match(body.error || '', /omx state/i);
-      assert.match(body.error || '', /omx_state\.\*/i);
+      assert.match(body.error || '', /nested_autopilot_team_requires_active_ultragoal_child/);
+      assert.match(body.error || '', /deep-interview -> ralplan -> ultragoal/);
+      assert.match(body.error || '', /omx state clear .*"mode":"autopilot"/);
 
       const canonical = JSON.parse(
         await readFile(
@@ -1264,8 +1266,8 @@ describe('state-server directory initialization', () => {
 
       assert.equal(denied.isError, true);
       const body = JSON.parse(denied.content[0]?.text || '{}') as { error?: string };
-      assert.match(body.error || '', /Execution-to-planning rollback auto-complete is not allowed/i);
-      assert.match(body.error || '', /First clear current state first and retry if this action is intended/i);
+      assert.match(body.error || '', /is a planning workflow and cannot roll back over active execution work/i);
+      assert.match(body.error || '', /`omx state clear --input '\{"mode":"ralph"\}' --json`/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
