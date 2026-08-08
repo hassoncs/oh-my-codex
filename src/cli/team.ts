@@ -76,6 +76,8 @@ interface ParsedTeamArgs {
   displayName?: string;
   allowRepoAwareDagHandoff: boolean;
   dagFallbackReason?: string;
+  /** Set when the DAG was unlocked by the ultragoal binding rather than an approved launch. */
+  ultragoalBoundPlanSlug?: string;
   approvedRepositoryContextSummary?: ApprovedRepositoryContextSummary;
   approvedExecution?: ApprovedTeamExecutionBinding;
 }
@@ -881,7 +883,7 @@ function renderTeamPaneStatus(
  * text path — and says which of the two it was, because "no plan was ever bound"
  * and "the plan moved" need opposite repairs.
  */
-function resolveUltragoalHostedDagHandoff(cwd: string): { allowed: true } | { allowed: false; reason?: string } {
+function resolveUltragoalHostedDagHandoff(cwd: string): { allowed: true; planSlug: string; activeGoalId: string } | { allowed: false; reason?: string } {
   const outcome = resolveLeaderOwnedUltragoalContextOutcomeSync(cwd);
   if (outcome.status === 'missing') return { allowed: false };
   if (outcome.status !== 'valid' || !outcome.context) {
@@ -900,7 +902,7 @@ function resolveUltragoalHostedDagHandoff(cwd: string): { allowed: true } | { al
       reason: `ultragoal_bound_plan_mismatch:${outcome.context.planSlug}!=${resolution.planSlug}`,
     };
   }
-  return { allowed: true };
+  return { allowed: true, planSlug: resolution.planSlug, activeGoalId: outcome.context.activeGoalId };
 }
 
 export function parseTeamArgs(args: string[], cwd: string = process.cwd()): ParsedTeamArgs {
@@ -980,13 +982,10 @@ export function parseTeamArgs(args: string[], cwd: string = process.cwd()): Pars
     && (approvedHint.workerCount == null || approvedHint.workerCount === workerCount)
     && (approvedHint.agentType == null || approvedHint.agentType === agentType)
     && Boolean(approvedHint.linkedRalph) === false;
-  const ultragoalDag = followupContext != null || matchesApprovedLaunchHint
-    ? { allowed: true as const }
-    : resolveUltragoalHostedDagHandoff(cwd);
-  const allowRepoAwareDagHandoff = followupContext != null
-    || matchesApprovedLaunchHint
-    || ultragoalDag.allowed;
-  const dagFallbackReason = ultragoalDag.allowed ? undefined : ultragoalDag.reason;
+  const approvedDagHandoff = followupContext != null || matchesApprovedLaunchHint;
+  const ultragoalDag = approvedDagHandoff ? null : resolveUltragoalHostedDagHandoff(cwd);
+  const allowRepoAwareDagHandoff = approvedDagHandoff || ultragoalDag?.allowed === true;
+  const dagFallbackReason = ultragoalDag?.allowed === false ? ultragoalDag.reason : undefined;
   const approvedRepositoryContextSummary = allowRepoAwareDagHandoff
     ? approvedHint?.repositoryContextSummary
     : undefined;
@@ -1002,6 +1001,7 @@ export function parseTeamArgs(args: string[], cwd: string = process.cwd()): Pars
     displayName: teamName,
     allowRepoAwareDagHandoff,
     ...(dagFallbackReason ? { dagFallbackReason } : {}),
+    ...(ultragoalDag?.allowed ? { ultragoalBoundPlanSlug: ultragoalDag.planSlug } : {}),
     ...(approvedRepositoryContextSummary ? { approvedRepositoryContextSummary } : {}),
     ...(allowRepoAwareDagHandoff && approvedHint
       ? { approvedExecution: buildApprovedTeamExecutionBinding(approvedHint) }
@@ -1916,6 +1916,19 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
   }
   if (executionPlan.decompositionNotice) {
     console.warn(`${executionPlan.decompositionNotice.code}: ${executionPlan.decompositionNotice.message}`);
+  }
+  if (parsed.ultragoalBoundPlanSlug && executionPlan.metadata?.decomposition_source !== 'legacy_text') {
+    // Scope, said out loud: the DAG describes the whole bound plan, not just the
+    // ultragoal goal that happens to be active. Later nodes arrive as tasks
+    // blocked on their dependencies rather than as extra workers, so this is not
+    // over-fan-out — but a leader that launches a second team for the next goal
+    // off the same plan would duplicate work, and that is only obvious if the
+    // first team says what it took on.
+    console.log(
+      `team_lanes_from_bound_plan: ${executionPlan.metadata?.ready_lane_count ?? '?'} ready lane(s) `
+      + `across ${tasks.length} node(s) from plan \`${parsed.ultragoalBoundPlanSlug}\`, the plan this ultragoal run is bound to. `
+      + 'This covers the whole plan, not only the active goal — do not launch a second team for the next goal from the same plan.',
+    );
   }
   await renderStartSummary(runtime, staffingPlan);
 }
