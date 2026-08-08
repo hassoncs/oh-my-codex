@@ -1,0 +1,95 @@
+{
+  "schema": "ch5.proof-evidence/1",
+  "proofId": "app-test:builtin-node-packages-vscode-extension",
+  "kind": "unit",
+  "stage": "dev",
+  "status": "pass",
+  "startedAt": "2026-07-26T14:49:30.411Z",
+  "finishedAt": "2026-07-26T14:49:32.119Z",
+  "durationMs": 1708,
+  "exitCode": 0,
+  "targets": [
+    "packages/vscode-extension/src/__tests__/chatProtocol.test.ts",
+    "packages/vscode-extension/src/__tests__/chatStore.test.ts",
+    "packages/vscode-extension/src/__tests__/sessionOptions.test.ts",
+    "packages/vscode-extension/src/__tests__/sessionTranscript.test.ts",
+    "packages/vscode-extension/src/__tests__/workspaceStatus.test.ts"
+  ],
+  "semantics": {
+    "schema": "ch5.proof-semantics/2",
+    "commit": "a66c65058b6379fcf793d966a24edd382137add9",
+    "coveredSetSource": "selection-plan",
+    "coveredSetItems": [
+      "packages/vscode-extension/src/__tests__/chatProtocol.test.ts",
+      "packages/vscode-extension/src/__tests__/chatStore.test.ts",
+      "packages/vscode-extension/src/__tests__/sessionOptions.test.ts",
+      "packages/vscode-extension/src/__tests__/sessionTranscript.test.ts",
+      "packages/vscode-extension/src/__tests__/workspaceStatus.test.ts"
+    ],
+    "coveredSetFingerprint": "sha256:94a0350bdef9ce7bdb7b8176a3f0d8a8eac168b64edc237db75e46cb01dfc790",
+    "proofConfigFingerprint": "sha256:7fdfa986f841913e820048dc8512b2b5ad15b2ed6d3ba73ee75de34d4f20f8a1",
+    "graphScannerFingerprint": "sha256:220666db56371b90bd8906e5ff5afe0ce395ce35d51837fce581d0261d1eecdd",
+    "causalPolicyVersion": "sha256:dd1efc77b8512c6dee56d6ef6ba91fc0c99b9421e2a40e946622faf2abf42329",
+    "selectorPolicyVersion": "ch5.proof-selector/2",
+    "oracleSemanticsVersion": "ch5.oracle.import-closure/1",
+    "tool": {
+      "name": "@ch5me/cli",
+      "version": "0.1.7",
+      "runtime": "node-24.3.0"
+    },
+    "dirtyWorktree": false
+  },
+  "meta": {
+    "commands": [
+      {
+        "command": "cd '/Users/hassoncs/worktrees/ch5/oh-my-codex/generic-design-review-closure-omx-658f8812d604/packages/vscode-extension' && 'npx' tsx --test 'src/__tests__/chatProtocol.test.ts' 'src/__tests__/chatStore.test.ts' 'src/__tests__/sessionOptions.test.ts' 'src/__tests__/sessionTranscript.test.ts' 'src/__tests__/workspaceStatus.test.ts'",
+        "status": "pass",
+        "exitCode": 0
+      }
+    ],
+    "laneId": "app-test:builtin-node-packages-vscode-extension",
+    "taskKinds": [
+      "test-files"
+    ],
+    "tasks": [
+      {
+        "kind": "test-files",
+        "target": "oh-my-codex-vscode",
+        "files": [
+          "packages/vscode-extension/src/__tests__/chatProtocol.test.ts",
+          "packages/vscode-extension/src/__tests__/chatStore.test.ts",
+          "packages/vscode-extension/src/__tests__/sessionOptions.test.ts",
+          "packages/vscode-extension/src/__tests__/sessionTranscript.test.ts",
+          "packages/vscode-extension/src/__tests__/workspaceStatus.test.ts"
+        ],
+        "targets": [
+          {
+            "id": "packages/vscode-extension/src/__tests__/chatProtocol.test.ts",
+            "file": "packages/vscode-extension/src/__tests__/chatProtocol.test.ts",
+            "targetKey": "sha256:93bf4400e6a3284dc008f0e27b86ecda896bc791ce0a47ed60b8c4db8d826425"
+          },
+          {
+            "id": "packages/vscode-extension/src/__tests__/chatStore.test.ts",
+            "file": "packages/vscode-extension/src/__tests__/chatStore.test.ts",
+            "targetKey": "sha256:a738604ea3fd6c00174e2cb3d4ff66f5a79fac8bd4f72ae6009112112569827e"
+          },
+          {
+            "id": "packages/vscode-extension/src/__tests__/sessionOptions.test.ts",
+            "file": "packages/vscode-extension/src/__tests__/sessionOptions.test.ts",
+            "targetKey": "sha256:5cb9290828c7681a4ca132b1b3429cc17c917aa0c619c7f33c9006e24ed50883"
+          },
+          {
+            "id": "packages/vscode-extension/src/__tests__/sessionTranscript.test.ts",
+            "file": "packages/vscode-extension/src/__tests__/sessionTranscript.test.ts",
+            "targetKey": "sha256:5f0d277e0b29c73beba902ff60cd6e1ca761a2b770d58a4da034c7bf8737e680"
+          },
+          {
+            "id": "packages/vscode-extension/src/__tests__/workspaceStatus.test.ts",
+            "file": "packages/vscode-extension/src/__tests__/workspaceStatus.test.ts",
+            "targetKey": "sha256:dcde492e42f4e5fca83326bd4aea03eaa7e9ea5846a7aff4513dea64f17e14c2"
+          }
+        ]
+      }
+    ]
+  }
+}

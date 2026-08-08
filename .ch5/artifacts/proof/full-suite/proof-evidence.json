@@ -1,0 +1,56 @@
+{
+  "schema": "ch5.proof-evidence/1",
+  "proofId": "full-suite",
+  "kind": "integration",
+  "stage": "dev",
+  "status": "fail",
+  "startedAt": "2026-07-26T14:41:51.240Z",
+  "finishedAt": "2026-07-26T14:50:36.818Z",
+  "durationMs": 525578,
+  "exitCode": 1,
+  "targets": [
+    "full-suite"
+  ],
+  "semantics": {
+    "schema": "ch5.proof-semantics/2",
+    "commit": "a66c65058b6379fcf793d966a24edd382137add9",
+    "coveredSetSource": "proof-config",
+    "coveredSetItems": [
+      "proof:integration:full-suite",
+      "run:command:fullSuite",
+      "stage:dev",
+      "stage:production",
+      "stage:staging",
+      "trigger:path:.ch5/proof.yaml",
+      "trigger:path:docs/**",
+      "trigger:path:package-lock.json",
+      "trigger:path:package.json",
+      "trigger:path:plugins/**",
+      "trigger:path:skills/**",
+      "trigger:path:src/**",
+      "trigger:path:tsconfig*.json"
+    ],
+    "coveredSetFingerprint": "sha256:824d9fb5cfd034cd86b950a952a8c601aba5c2cc54a673bdc47f6bae11483737",
+    "proofConfigFingerprint": "sha256:7fdfa986f841913e820048dc8512b2b5ad15b2ed6d3ba73ee75de34d4f20f8a1",
+    "graphScannerFingerprint": "sha256:220666db56371b90bd8906e5ff5afe0ce395ce35d51837fce581d0261d1eecdd",
+    "causalPolicyVersion": "sha256:dd1efc77b8512c6dee56d6ef6ba91fc0c99b9421e2a40e946622faf2abf42329",
+    "selectorPolicyVersion": "ch5.proof-selector/2",
+    "oracleSemanticsVersion": "ch5.oracle.integration/1",
+    "tool": {
+      "name": "@ch5me/cli",
+      "version": "0.1.7",
+      "runtime": "node-24.3.0"
+    },
+    "dirtyWorktree": false
+  },
+  "meta": {
+    "commandKey": "fullSuite",
+    "commands": [
+      {
+        "command": "npm test",
+        "status": "fail",
+        "exitCode": 1
+      }
+    ]
+  }
+}

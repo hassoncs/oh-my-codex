@@ -1,0 +1,63 @@
+{
+  "schema": "ch5.proof-evidence/1",
+  "proofId": "app-test",
+  "kind": "unit",
+  "stage": "dev",
+  "status": "pass",
+  "startedAt": "2026-07-26T14:52:28.207Z",
+  "finishedAt": "2026-07-26T14:52:28.451Z",
+  "durationMs": 244,
+  "exitCode": 0,
+  "targets": [
+    "src/cli/__tests__/team-decompose.test.ts"
+  ],
+  "semantics": {
+    "schema": "ch5.proof-semantics/2",
+    "commit": "a66c65058b6379fcf793d966a24edd382137add9",
+    "coveredSetSource": "selection-plan",
+    "coveredSetItems": [
+      "src/cli/__tests__/team-decompose.test.ts"
+    ],
+    "coveredSetFingerprint": "sha256:e663e70458cbf193384ad84e8c1cdf26eb883f9975ce6cd1d98d73f0cbb75534",
+    "proofConfigFingerprint": "sha256:7fdfa986f841913e820048dc8512b2b5ad15b2ed6d3ba73ee75de34d4f20f8a1",
+    "graphScannerFingerprint": "sha256:220666db56371b90bd8906e5ff5afe0ce395ce35d51837fce581d0261d1eecdd",
+    "causalPolicyVersion": "sha256:dd1efc77b8512c6dee56d6ef6ba91fc0c99b9421e2a40e946622faf2abf42329",
+    "selectorPolicyVersion": "ch5.proof-selector/2",
+    "oracleSemanticsVersion": "ch5.oracle.import-closure/1",
+    "tool": {
+      "name": "@ch5me/cli",
+      "version": "0.1.7",
+      "runtime": "node-24.3.0"
+    },
+    "dirtyWorktree": false
+  },
+  "meta": {
+    "commands": [
+      {
+        "command": "cd '/Users/hassoncs/worktrees/ch5/oh-my-codex/generic-design-review-closure-omx-658f8812d604' && '/Users/hassoncs/worktrees/ch5/oh-my-codex/generic-design-review-closure-omx-658f8812d604/node_modules/.bin/tsx' --test 'src/cli/__tests__/team-decompose.test.ts'",
+        "status": "pass",
+        "exitCode": 0
+      }
+    ],
+    "laneId": "app-test",
+    "taskKinds": [
+      "test-files"
+    ],
+    "tasks": [
+      {
+        "kind": "test-files",
+        "target": "oh-my-codex",
+        "files": [
+          "src/cli/__tests__/team-decompose.test.ts"
+        ],
+        "targets": [
+          {
+            "id": "src/cli/__tests__/team-decompose.test.ts",
+            "file": "src/cli/__tests__/team-decompose.test.ts",
+            "targetKey": "sha256:ff21f9635dd491b061b7c73ca0228d49e7eed0568032565a94468c905bad90dc"
+          }
+        ]
+      }
+    ]
+  }
+}
