@@ -1,8 +1,8 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { copyFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { join, relative } from 'node:path';
+import { constants, existsSync, type Stats } from 'node:fs';
+import { lstat, mkdir, open, rename, rm } from 'node:fs/promises';
+import { dirname, join, relative } from 'node:path';
 
 export const ULTRAGOAL_DIR = '.omx/ultragoal';
 export const ULTRAGOAL_BRIEF = 'brief.md';
@@ -10,6 +10,9 @@ export const ULTRAGOAL_GOALS = 'goals.json';
 export const ULTRAGOAL_LEDGER = 'ledger.jsonl';
 export const ULTRAGOAL_RUNS_DIR = 'runs';
 export const ULTRAGOAL_ACTIVE_RUN_POINTER = 'active-run.json';
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const LEGACY_BRIEF_HASH_PATTERN = /^[a-f0-9]{16}$/;
+const RUN_ID_PATTERN = /^(?:run|legacy)-[A-Za-z0-9._-]+$/;
 
 /**
  * Goal registries are namespaced per run under `.omx/ultragoal/runs/<runId>/`.
@@ -32,6 +35,11 @@ export interface UltragoalActiveRunPointer {
   briefHash: string;
   updatedAt: string;
   origin: UltragoalRunOrigin;
+  files?: {
+    brief: string;
+    goals: string;
+    ledger: string;
+  };
 }
 
 export type UltragoalRegistryConflictReason =
@@ -81,7 +89,7 @@ export function ultragoalActiveRunPointerPath(cwd: string): string {
 
 export function computeUltragoalBriefHash(brief: string): string {
   const normalized = brief.replace(/\r\n/g, '\n').replace(/[ \t]+$/gm, '').trim();
-  return createHash('sha256').update(normalized, 'utf-8').digest('hex').slice(0, 16);
+  return createHash('sha256').update(normalized, 'utf-8').digest('hex');
 }
 
 export function buildUltragoalRunId(briefHash: string, now: Date = new Date()): string {
@@ -113,21 +121,171 @@ export function legacyRunIdForPlan(plan: {
 
 export async function readActiveRunPointer(cwd: string): Promise<UltragoalActiveRunPointer | null> {
   const path = ultragoalActiveRunPointerPath(cwd);
+  let before: Stats;
   try {
-    const parsed = JSON.parse(await readFile(path, 'utf-8')) as UltragoalActiveRunPointer;
-    if (!parsed || parsed.version !== 1 || typeof parsed.runId !== 'string') return null;
-    return parsed;
+    before = await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  assertSafeActiveRunPointer(cwd, path, before);
+  const flags = process.platform === 'win32'
+    ? constants.O_RDONLY
+    : constants.O_RDONLY | constants.O_NOFOLLOW;
+  let handle;
+  try {
+    handle = await open(path, flags);
+  } catch (error) {
+    throw new Error(
+      `Refusing unsafe ultragoal active-run pointer at ${repoRelative(cwd, path)}: ${error instanceof Error ? error.message : String(error)}.`,
+    );
+  }
+  let raw: string;
+  try {
+    const opened = await handle.stat();
+    assertSafeActiveRunPointer(cwd, path, opened);
+    if (opened.dev !== before.dev || opened.ino !== before.ino) {
+      throw new Error(`Refusing replaced ultragoal active-run pointer at ${repoRelative(cwd, path)}.`);
+    }
+    raw = await handle.readFile({ encoding: 'utf-8' });
+  } finally {
+    await handle.close();
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
   } catch {
-    return null;
+    throw new Error(`Invalid ultragoal active-run pointer at ${repoRelative(cwd, path)}.`);
+  }
+  if (!isValidActiveRunPointer(parsed)) {
+    throw new Error(`Invalid ultragoal active-run pointer at ${repoRelative(cwd, path)}.`);
+  }
+  if (LEGACY_BRIEF_HASH_PATTERN.test(parsed.briefHash)) {
+    let brief: string;
+    try {
+      brief = (await readArchiveFile(cwd, join(ultragoalDir(cwd), ULTRAGOAL_BRIEF))).toString('utf-8');
+    } catch {
+      throw new Error(`Invalid ultragoal active-run pointer at ${repoRelative(cwd, path)}.`);
+    }
+    if (!computeUltragoalBriefHash(brief).startsWith(parsed.briefHash)) {
+      throw new Error(`Invalid ultragoal active-run pointer at ${repoRelative(cwd, path)}.`);
+    }
+  }
+  return parsed;
+}
+
+function assertSafeActiveRunPointer(cwd: string, path: string, file: Stats): void {
+  if (!file.isFile() || file.isSymbolicLink() || file.nlink !== 1) {
+    throw new Error(`Refusing unsafe ultragoal active-run pointer at ${repoRelative(cwd, path)}.`);
   }
 }
 
+function isValidRunOrigin(value: unknown): value is UltragoalRunOrigin {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const origin = value as Record<string, unknown>;
+  return (
+    typeof origin.worktreePath === 'string'
+    && origin.worktreePath.length > 0
+    && typeof origin.createdAt === 'string'
+    && origin.createdAt.length > 0
+    && (
+      origin.adoptedWorktreePaths === undefined
+      || (
+        Array.isArray(origin.adoptedWorktreePaths)
+        && origin.adoptedWorktreePaths.every((path) => typeof path === 'string' && path.length > 0)
+      )
+    )
+  );
+}
+
+function isValidPointerFiles(value: unknown): value is NonNullable<UltragoalActiveRunPointer['files']> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const files = value as Record<string, unknown>;
+  return (
+    Object.keys(files).length === 3
+    && SHA256_PATTERN.test(String(files.brief))
+    && SHA256_PATTERN.test(String(files.goals))
+    && SHA256_PATTERN.test(String(files.ledger))
+  );
+}
+
+function isValidActiveRunPointer(value: unknown): value is UltragoalActiveRunPointer {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const pointer = value as Record<string, unknown>;
+  return (
+    pointer.version === 1
+    && RUN_ID_PATTERN.test(String(pointer.runId))
+    && (
+      SHA256_PATTERN.test(String(pointer.briefHash))
+      || LEGACY_BRIEF_HASH_PATTERN.test(String(pointer.briefHash))
+    )
+    && typeof pointer.updatedAt === 'string'
+    && pointer.updatedAt.length > 0
+    && isValidRunOrigin(pointer.origin)
+    && (pointer.files === undefined || isValidPointerFiles(pointer.files))
+  );
+}
+
 export async function writeActiveRunPointer(cwd: string, pointer: UltragoalActiveRunPointer): Promise<void> {
-  await mkdir(ultragoalDir(cwd), { recursive: true });
+  await ensureDirectoryDurable(ultragoalDir(cwd));
   const path = ultragoalActiveRunPointerPath(cwd);
-  const tmpPath = `${path}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(tmpPath, `${JSON.stringify(pointer, null, 2)}\n`);
-  await rename(tmpPath, path);
+  const destination = await inspectPointerDestination(cwd, path);
+  const tmpPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    const handle = await open(tmpPath, 'wx', destination?.mode ?? 0o644);
+    try {
+      await handle.writeFile(`${JSON.stringify(pointer, null, 2)}\n`);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    const current = await inspectPointerDestination(cwd, path);
+    if (
+      (destination === null && current !== null)
+      || (
+        destination !== null
+        && (
+          current === null
+          || current.dev !== destination.dev
+          || current.ino !== destination.ino
+        )
+      )
+    ) {
+      throw new Error(`Refusing changed ultragoal active-run pointer at ${repoRelative(cwd, path)}.`);
+    }
+    await renameDurable(tmpPath, path);
+  } catch (error) {
+    await rm(tmpPath, { force: true });
+    throw error;
+  }
+}
+
+async function inspectPointerDestination(
+  cwd: string,
+  path: string,
+): Promise<{ dev: number; ino: number; mode: number } | null> {
+  let before: Stats;
+  try {
+    before = await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  assertSafeActiveRunPointer(cwd, path, before);
+  const flags = process.platform === 'win32'
+    ? constants.O_RDONLY
+    : constants.O_RDONLY | constants.O_NOFOLLOW;
+  const handle = await open(path, flags);
+  try {
+    const opened = await handle.stat();
+    assertSafeActiveRunPointer(cwd, path, opened);
+    if (opened.dev !== before.dev || opened.ino !== before.ino) {
+      throw new Error(`Refusing replaced ultragoal active-run pointer at ${repoRelative(cwd, path)}.`);
+    }
+    return { dev: opened.dev, ino: opened.ino, mode: opened.mode & 0o777 };
+  } finally {
+    await handle.close();
+  }
 }
 
 function repoRelative(cwd: string, path: string): string {
@@ -243,13 +401,173 @@ export function describeRegistryConflict(
  */
 export async function archiveFlatRegistry(cwd: string, runId: string): Promise<string | null> {
   const flatGoals = join(ultragoalDir(cwd), ULTRAGOAL_GOALS);
-  if (!existsSync(flatGoals)) return null;
+  const flatGoalsStat = await archiveFileStat(flatGoals);
+  if (!flatGoalsStat) return null;
+  assertArchiveFile(cwd, flatGoals, flatGoalsStat);
   const runDir = ultragoalRunDir(cwd, runId);
-  await mkdir(runDir, { recursive: true });
+  const files = new Map<string, { bytes: Buffer; mode: number }>();
   for (const file of [ULTRAGOAL_GOALS, ULTRAGOAL_BRIEF, ULTRAGOAL_LEDGER]) {
     const source = join(ultragoalDir(cwd), file);
-    if (!existsSync(source)) continue;
-    await copyFile(source, join(runDir, file));
+    const sourceStat = await archiveFileStat(source);
+    if (!sourceStat) continue;
+    assertArchiveFile(cwd, source, sourceStat);
+    const sourceBytes = await readArchiveFile(cwd, source);
+    files.set(file, { bytes: sourceBytes, mode: sourceStat.mode & 0o777 });
+  }
+
+  const runDirStat = await archiveDirectoryStat(runDir);
+  if (!runDirStat) {
+    const stageDir = join(ultragoalRunsDir(cwd), `.archive-stage-${runId}`);
+    const staleStage = await archiveDirectoryStat(stageDir);
+    if (staleStage) {
+      assertArchiveDirectory(stageDir, staleStage);
+      await rm(stageDir, { recursive: true });
+      await syncDirectory(dirname(stageDir));
+    }
+    await ensureDirectoryDurable(stageDir);
+    try {
+      for (const [file, source] of files) {
+        const destination = join(stageDir, file);
+        const handle = await open(destination, 'wx', source.mode);
+        try {
+          await handle.writeFile(source.bytes);
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+      }
+      await syncDirectory(stageDir);
+      await ensureDirectoryDurable(ultragoalRunsDir(cwd));
+      if (await archiveDirectoryStat(runDir)) {
+        throw new Error(`Refusing to overwrite canonical ultragoal archive at ${repoRelative(cwd, runDir)}.`);
+      }
+      await renameDurable(stageDir, runDir);
+    } catch (error) {
+      await rm(stageDir, { recursive: true, force: true });
+      throw error;
+    }
+    return repoRelative(cwd, runDir);
+  }
+
+  assertArchiveDirectory(runDir, runDirStat);
+  for (const file of [ULTRAGOAL_GOALS, ULTRAGOAL_BRIEF, ULTRAGOAL_LEDGER]) {
+    const source = files.get(file);
+    const destination = join(runDir, file);
+    const destinationStat = await archiveFileStat(destination);
+    if (!source) {
+      if (destinationStat) {
+        throw new Error(`Refusing unexpected canonical ultragoal archive file at ${repoRelative(cwd, destination)}.`);
+      }
+      continue;
+    }
+    if (destinationStat) {
+      const destinationBytes = await readArchiveFile(cwd, destination);
+      if (!source.bytes.equals(destinationBytes)) {
+        throw new Error(`Refusing to overwrite canonical ultragoal archive at ${repoRelative(cwd, destination)}.`);
+      }
+      continue;
+    }
+    const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      const handle = await open(temporary, 'wx', source.mode);
+      try {
+        await handle.writeFile(source.bytes);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      if (await archiveFileStat(destination)) {
+        throw new Error(`Refusing changed canonical ultragoal archive at ${repoRelative(cwd, destination)}.`);
+      }
+      await renameDurable(temporary, destination);
+    } catch (error) {
+      await rm(temporary, { force: true });
+      throw error;
+    }
   }
   return repoRelative(cwd, runDir);
+}
+
+async function archiveFileStat(path: string): Promise<Stats | null> {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function archiveDirectoryStat(path: string): Promise<Stats | null> {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function assertArchiveFile(cwd: string, path: string, file: Stats): void {
+  if (!file.isFile() || file.isSymbolicLink() || file.nlink !== 1) {
+    throw new Error(`Refusing unsafe ultragoal archive file at ${repoRelative(cwd, path)}.`);
+  }
+}
+
+async function readArchiveFile(cwd: string, path: string): Promise<Buffer> {
+  const before = await lstat(path);
+  assertArchiveFile(cwd, path, before);
+  const flags = process.platform === 'win32'
+    ? constants.O_RDONLY
+    : constants.O_RDONLY | constants.O_NOFOLLOW;
+  const handle = await open(path, flags);
+  try {
+    const opened = await handle.stat();
+    assertArchiveFile(cwd, path, opened);
+    if (opened.dev !== before.dev || opened.ino !== before.ino) {
+      throw new Error(`Refusing replaced ultragoal archive file at ${repoRelative(cwd, path)}.`);
+    }
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  if (process.platform === 'win32') return;
+  const handle = await open(path, 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function ensureDirectoryDurable(path: string): Promise<void> {
+  if (existsSync(path)) {
+    assertArchiveDirectory(path, await lstat(path));
+    return;
+  }
+  const parent = dirname(path);
+  if (parent !== path) await ensureDirectoryDurable(parent);
+  try {
+    await mkdir(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  assertArchiveDirectory(path, await lstat(path));
+  await syncDirectory(path);
+  if (parent !== path) await syncDirectory(parent);
+}
+
+function assertArchiveDirectory(path: string, directory: Stats): void {
+  if (!directory.isDirectory() || directory.isSymbolicLink()) {
+    throw new Error(`Refusing unsafe ultragoal archive directory at ${path}.`);
+  }
+}
+
+async function renameDurable(source: string, destination: string): Promise<void> {
+  await rename(source, destination);
+  const sourceParent = dirname(source);
+  const destinationParent = dirname(destination);
+  await syncDirectory(destinationParent);
+  if (sourceParent !== destinationParent) await syncDirectory(sourceParent);
 }

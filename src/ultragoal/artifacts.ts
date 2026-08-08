@@ -1,7 +1,8 @@
-import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { appendFile, chmod, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { join, relative } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { constants, existsSync, type Stats } from 'node:fs';
+import { link, lstat, mkdir, open, rename, rm } from 'node:fs/promises';
+import { dirname, join, relative } from 'node:path';
 import {
   formatCodexGoalReconciliation,
   buildCompletedCodexGoalRemediation,
@@ -28,8 +29,10 @@ import {
   isInheritedOrigin,
   isUnownedInheritedRegistry,
   readActiveRunPointer,
+  ultragoalActiveRunPointerPath,
   ultragoalDir,
   ultragoalRunDir,
+  ultragoalRunsDir,
   writeActiveRunPointer,
   type UltragoalRunOrigin,
 } from './registry.js';
@@ -44,7 +47,9 @@ export {
   ultragoalDir,
 };
 const ULTRAGOAL_MUTATION_LOCK = '.mutation.lock';
+const ULTRAGOAL_MUTATION_GUARD = '.mutation.guard';
 const ULTRAGOAL_LEDGER_TRANSACTION = '.ledger-transaction.json';
+const ULTRAGOAL_RUN_TRANSACTION = '.run-transaction.json';
 
 export type UltragoalStatus = 'pending' | 'in_progress' | 'complete' | 'failed' | 'review_blocked' | 'needs_user_decision';
 export type UltragoalCodexGoalMode = 'aggregate' | 'per_story';
@@ -637,10 +642,13 @@ async function snapshotObjectiveMapsToUltragoalPlan(cwd: string, snapshotObjecti
   const actual = normalizeObjective(snapshotObjective).toLowerCase();
   if (actual.length < 24) return false;
   try {
-    const brief = normalizeObjective(await readFile(ultragoalBriefPath(cwd), 'utf-8')).toLowerCase();
+    const brief = normalizeObjective(
+      await readSafeRegularFile(cwd, ultragoalBriefPath(cwd), 'active ultragoal projection'),
+    ).toLowerCase();
     if (!brief || brief.length < 24) return false;
     return brief.includes(actual) || actual.includes(brief) || objectivesHaveConservativeSpecificTokenOverlap(actual, brief);
-  } catch {
+  } catch (error) {
+    if (error instanceof UltragoalError) throw error;
     return false;
   }
 }
@@ -870,29 +878,332 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function withUltragoalMutationLock<T>(cwd: string, operation: () => Promise<T>): Promise<T> {
-  await mkdir(ultragoalDir(cwd), { recursive: true });
-  const lockPath = join(ultragoalDir(cwd), ULTRAGOAL_MUTATION_LOCK);
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+interface UltragoalMutationLockOwner {
+  version: 1;
+  pid: number;
+  createdAt: string;
+  ownerToken: string;
+  processStartIdentity?: string;
+}
+
+interface LegacyUltragoalMutationLockOwner {
+  pid: number;
+  createdAt: string;
+}
+
+function parseMutationLockOwner(
+  raw: string,
+): UltragoalMutationLockOwner | LegacyUltragoalMutationLockOwner | null {
+  try {
+    const parsed = JSON.parse(raw) as Partial<UltragoalMutationLockOwner>;
+    if (
+      !Number.isSafeInteger(parsed.pid)
+      || (parsed.pid as number) <= 0
+      || typeof parsed.createdAt !== 'string'
+      || parsed.createdAt.length === 0
+    ) {
+      return null;
+    }
+    if (parsed.version === undefined && parsed.ownerToken === undefined) {
+      return { pid: parsed.pid as number, createdAt: parsed.createdAt };
+    }
+    if (
+      parsed.version === 1
+      && typeof parsed.ownerToken === 'string'
+      && parsed.ownerToken.length > 0
+      && (parsed.processStartIdentity === undefined || typeof parsed.processStartIdentity === 'string')
+    ) {
+      return parsed as UltragoalMutationLockOwner;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function processStartIdentity(pid: number): string | null {
+  if (process.platform === 'win32') return null;
+  try {
+    return execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function inspectProcess(pid: number): { alive: boolean; startIdentity: string | null } {
+  try {
+    process.kill(pid, 0);
+    return { alive: true, startIdentity: processStartIdentity(pid) };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EPERM') {
+      return { alive: true, startIdentity: processStartIdentity(pid) };
+    }
+    return { alive: false, startIdentity: null };
+  }
+}
+
+function lockOwnerMatchesProcess(
+  owner: UltragoalMutationLockOwner | LegacyUltragoalMutationLockOwner,
+  processState: { alive: boolean; startIdentity: string | null },
+): boolean {
+  if (!processState.alive) return false;
+  if ('ownerToken' in owner) {
+    return (
+      !owner.processStartIdentity
+      || !processState.startIdentity
+      || processState.startIdentity === owner.processStartIdentity
+    );
+  }
+  if (!processState.startIdentity) return true;
+  const processStartedAt = Date.parse(processState.startIdentity);
+  const lockCreatedAt = Date.parse(owner.createdAt);
+  if (!Number.isFinite(processStartedAt) || !Number.isFinite(lockCreatedAt)) return true;
+  return processStartedAt <= lockCreatedAt + 1_000;
+}
+
+function advisoryLockCommand(path: string): { command: string; args: string[] } {
+  const readyScript = [
+    'process.stdout.write("LOCKED\\n");',
+    'process.stdin.resume();',
+    'process.stdin.on("end", () => process.exit(0));',
+  ].join('');
+  if (process.platform === 'darwin') {
+    return {
+      command: '/usr/bin/lockf',
+      args: ['-k', '-t', '0', path, process.execPath, '-e', readyScript],
+    };
+  }
+  if (process.platform === 'win32') {
+    const script = [
+      '$path = $args[0];',
+      '$stream = [System.IO.File]::Open($path, "OpenOrCreate", "ReadWrite", "None");',
+      '[Console]::Out.WriteLine("LOCKED");',
+      '[Console]::In.ReadToEnd() | Out-Null;',
+      '$stream.Dispose();',
+    ].join(' ');
+    return {
+      command: 'powershell.exe',
+      args: ['-NoProfile', '-NonInteractive', '-Command', script, path],
+    };
+  }
+  return {
+    command: 'flock',
+    args: ['-n', path, process.execPath, '-e', readyScript],
+  };
+}
+
+async function startAdvisoryLock(path: string): Promise<ChildProcessWithoutNullStreams | null> {
+  const invocation = advisoryLockCommand(path);
+  const child = spawn(invocation.command, invocation.args, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let stdout = '';
+    const finish = (value: ChildProcessWithoutNullStreams | null): void => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    child.stdout.setEncoding('utf-8');
+    child.stdout.on('data', (chunk: string) => {
+      stdout += chunk;
+      if (stdout.includes('LOCKED\n')) finish(child);
+    });
+    child.once('error', (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    child.once('exit', () => finish(null));
+  });
+}
+
+async function stopAdvisoryLock(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null) return;
+  await new Promise<void>((resolve) => {
+    child.once('exit', () => resolve());
+    child.stdin.end();
+  });
+}
+
+async function ensureAdvisoryGuard(path: string): Promise<Stats> {
+  try {
+    const existing = await lstat(path);
+    if (!existing.isFile() || existing.isSymbolicLink() || existing.nlink !== 1) {
+      throw new UltragoalError(`Refusing unsafe ultragoal mutation guard at ${path}.`);
+    }
+    return existing;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  try {
+    const handle = await open(path, 'wx', 0o600);
     try {
-      handle = await open(lockPath, 'wx');
-      await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: iso() }));
-      break;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== 'EEXIST') throw error;
-      await sleep(Math.min(25 + attempt * 5, 250));
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await syncDirectory(dirname(path));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  const created = await lstat(path);
+  if (!created.isFile() || created.isSymbolicLink() || created.nlink !== 1) {
+    throw new UltragoalError(`Refusing unsafe ultragoal mutation guard at ${path}.`);
+  }
+  return created;
+}
+
+async function readCompatibleMutationLock(
+  cwd: string,
+  lockPath: string,
+): Promise<{
+  owner: UltragoalMutationLockOwner | LegacyUltragoalMutationLockOwner;
+  publicationCandidatePath: string | null;
+} | null> {
+  let raw: string;
+  let publicationCandidatePath: string | null = null;
+  try {
+    raw = await readSafeRegularFile(cwd, lockPath, 'ultragoal mutation lock');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    const publication = await readMutationLockPublication(lockPath);
+    if (publication) {
+      raw = publication.raw;
+      publicationCandidatePath = publication.candidatePath;
+    } else {
+      try {
+        raw = await readSafeRegularFile(cwd, lockPath, 'ultragoal mutation lock');
+      } catch (retryError) {
+        if ((retryError as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw retryError;
+      }
     }
   }
-  if (!handle) {
+  const owner = parseMutationLockOwner(raw);
+  if (!owner) {
+    throw new UltragoalError(`Refusing malformed ultragoal mutation lock at ${lockPath}.`);
+  }
+  return { owner, publicationCandidatePath };
+}
+
+async function clearAbandonedMutationLock(
+  cwd: string,
+  lockPath: string,
+): Promise<boolean> {
+  const existing = await readCompatibleMutationLock(cwd, lockPath);
+  if (!existing) return true;
+  if (lockOwnerMatchesProcess(existing.owner, inspectProcess(existing.owner.pid))) {
+    return false;
+  }
+  if (existing.publicationCandidatePath) {
+    await removeDurable(existing.publicationCandidatePath);
+  }
+  await removeDurable(lockPath);
+  return true;
+}
+
+async function publishMutationLock(
+  lockPath: string,
+  owner: UltragoalMutationLockOwner,
+): Promise<boolean> {
+  const candidatePath = `${lockPath}.${owner.ownerToken}.candidate`;
+  let linked = false;
+  try {
+    await writeFileSynced(candidatePath, `${JSON.stringify(owner, null, 2)}\n`, 0o600);
+    try {
+      await link(candidatePath, lockPath);
+      linked = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        await removeDurable(candidatePath);
+        return false;
+      }
+      throw error;
+    }
+    await syncDirectory(dirname(lockPath));
+    await removeDurable(candidatePath);
+    return true;
+  } catch (error) {
+    if (linked) await rm(lockPath, { force: true }).catch(() => undefined);
+    await rm(candidatePath, { force: true }).catch(() => undefined);
+    await syncDirectory(dirname(lockPath)).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function withUltragoalMutationLock<T>(cwd: string, operation: () => Promise<T>): Promise<T> {
+  await ensureDirectoryDurable(ultragoalDir(cwd));
+  const lockPath = join(ultragoalDir(cwd), ULTRAGOAL_MUTATION_LOCK);
+  const guardPath = join(ultragoalDir(cwd), ULTRAGOAL_MUTATION_GUARD);
+  const owner: UltragoalMutationLockOwner = {
+    version: 1,
+    pid: process.pid,
+    createdAt: iso(),
+    ownerToken: randomUUID(),
+    processStartIdentity: processStartIdentity(process.pid) ?? undefined,
+  };
+  const guardIdentity = await ensureAdvisoryGuard(guardPath);
+  let guard: ChildProcessWithoutNullStreams | null = null;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const attemptGuard = await startAdvisoryLock(guardPath);
+    if (attemptGuard) {
+      let keepGuard = false;
+      try {
+        const guarded = await lstat(guardPath);
+        if (
+          !guarded.isFile()
+          || guarded.isSymbolicLink()
+          || guarded.nlink !== 1
+          || guarded.dev !== guardIdentity.dev
+          || guarded.ino !== guardIdentity.ino
+        ) {
+          throw new UltragoalError(`Refusing replaced ultragoal mutation guard at ${repoRelative(cwd, guardPath)}.`);
+        }
+        if (
+          await clearAbandonedMutationLock(cwd, lockPath)
+          && await publishMutationLock(lockPath, owner)
+        ) {
+          guard = attemptGuard;
+          keepGuard = true;
+          break;
+        }
+      } finally {
+        if (!keepGuard) await stopAdvisoryLock(attemptGuard);
+      }
+    }
+    await sleep(Math.min(25 + attempt * 5, 250));
+  }
+  if (!guard) {
     throw new UltragoalError(`Timed out waiting for ultragoal mutation lock at ${repoRelative(cwd, lockPath)}.`);
   }
   try {
-    return await operation();
+    try {
+      await recoverRunTransaction(cwd);
+      await recoverLedgerTransaction(cwd);
+      return await operation();
+    } finally {
+      let current: Partial<UltragoalMutationLockOwner>;
+      try {
+        current = JSON.parse(
+          await readSafeRegularFile(cwd, lockPath, 'ultragoal mutation lock'),
+        ) as Partial<UltragoalMutationLockOwner>;
+      } catch (error) {
+        throw new UltragoalError(
+          `Lost or invalid ultragoal mutation lock ownership at ${repoRelative(cwd, lockPath)}: ${error instanceof Error ? error.message : String(error)}.`,
+        );
+      }
+      if (current.ownerToken !== owner.ownerToken) {
+        throw new UltragoalError(`Refusing to release ultragoal mutation lock owned by a different writer at ${repoRelative(cwd, lockPath)}.`);
+      }
+      await removeDurable(lockPath);
+    }
   } finally {
-    await handle.close().catch(() => undefined);
-    await rm(lockPath, { force: true }).catch(() => undefined);
+    await stopAdvisoryLock(guard);
   }
 }
 
@@ -904,8 +1215,588 @@ interface UltragoalLedgerTransaction {
   nextSha256: string;
 }
 
+interface UltragoalRunFileDigests {
+  brief: string;
+  goals: string;
+  ledger: string;
+}
+
+interface UltragoalRunFileStates {
+  brief: string | null;
+  goals: string | null;
+  ledger: string | null;
+}
+
+interface UltragoalRunTransaction {
+  version: 1;
+  mode?: 'create' | 'update';
+  runId: string;
+  pointer: {
+    version: 1;
+    runId: string;
+    briefHash: string;
+    updatedAt: string;
+    origin: UltragoalRunOrigin;
+  };
+  files: UltragoalRunFileDigests;
+  before: {
+    run: UltragoalRunFileStates;
+    projection: UltragoalRunFileStates;
+    pointerSha256: string | null;
+  };
+  archive?: {
+    runId: string;
+    files: UltragoalRunFileDigests;
+  };
+}
+
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const LEGACY_BRIEF_HASH_PATTERN = /^[a-f0-9]{16}$/;
+const RUN_ID_PATTERN = /^(?:run|legacy)-[A-Za-z0-9._-]+$/;
+const ULTRAGOAL_STATUS_VALUES = new Set([
+  'pending',
+  'in_progress',
+  'complete',
+  'completed',
+  'failed',
+  'review_blocked',
+  'needs_user_decision',
+]);
+
 function sha256(value: string): string {
   return createHash('sha256').update(value, 'utf-8').digest('hex');
+}
+
+function isRunOrigin(value: unknown): value is UltragoalRunOrigin {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const origin = value as Partial<UltragoalRunOrigin>;
+  return (
+    typeof origin.worktreePath === 'string'
+    && origin.worktreePath.length > 0
+    && typeof origin.createdAt === 'string'
+    && origin.createdAt.length > 0
+    && (
+      origin.adoptedWorktreePaths === undefined
+      || (
+        Array.isArray(origin.adoptedWorktreePaths)
+        && origin.adoptedWorktreePaths.every((path) => typeof path === 'string' && path.length > 0)
+      )
+    )
+  );
+}
+
+function sameRunOrigin(left: UltragoalRunOrigin | undefined, right: UltragoalRunOrigin): boolean {
+  if (!left) return false;
+  const leftAdopted = left.adoptedWorktreePaths ?? [];
+  const rightAdopted = right.adoptedWorktreePaths ?? [];
+  return (
+    left.worktreePath === right.worktreePath
+    && left.createdAt === right.createdAt
+    && leftAdopted.length === rightAdopted.length
+    && leftAdopted.every((path, index) => path === rightAdopted[index])
+  );
+}
+
+function sameBriefHashIdentity(left: string, right: string): boolean {
+  return (
+    left === right
+    || (LEGACY_BRIEF_HASH_PATTERN.test(left) && right.startsWith(left))
+    || (LEGACY_BRIEF_HASH_PATTERN.test(right) && left.startsWith(right))
+  );
+}
+
+function assertPointerAuthority(
+  pointer: Awaited<ReturnType<typeof readActiveRunPointer>>,
+  plan: UltragoalPlan,
+  files: { brief: string; goals: string; ledger: string },
+): void {
+  if (
+    !pointer
+    || pointer.runId !== plan.runId
+    || !plan.briefHash
+    || !sameBriefHashIdentity(pointer.briefHash, plan.briefHash)
+    || pointer.updatedAt !== plan.updatedAt
+    || !sameRunOrigin(plan.origin, pointer.origin)
+  ) {
+    throw new UltragoalError(`Refusing ultragoal run ${plan.runId ?? 'unknown'} without matching active-run pointer authority.`);
+  }
+  if (pointer.files) {
+    assertRunFileDigests(files, pointer.files, `committed run ${plan.runId}`);
+  }
+}
+
+function parseUltragoalPlanJson(raw: string, path: string): UltragoalPlan {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new UltragoalError(`Invalid ultragoal plan at ${path}.`);
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new UltragoalError(`Invalid ultragoal plan at ${path}.`);
+  }
+  const plan = value as Partial<UltragoalPlan>;
+  if (
+    plan.version !== 1
+    || typeof plan.createdAt !== 'string'
+    || plan.createdAt.length === 0
+    || typeof plan.updatedAt !== 'string'
+    || plan.updatedAt.length === 0
+    || typeof plan.briefPath !== 'string'
+    || plan.briefPath.length === 0
+    || typeof plan.goalsPath !== 'string'
+    || plan.goalsPath.length === 0
+    || typeof plan.ledgerPath !== 'string'
+    || plan.ledgerPath.length === 0
+    || !Array.isArray(plan.goals)
+  ) {
+    throw new UltragoalError(`Invalid ultragoal plan at ${path}.`);
+  }
+  for (const goal of plan.goals) {
+    if (
+      !goal
+      || typeof goal !== 'object'
+      || Array.isArray(goal)
+      || typeof goal.id !== 'string'
+      || goal.id.length === 0
+      || typeof goal.title !== 'string'
+      || goal.title.length === 0
+      || typeof goal.objective !== 'string'
+      || goal.objective.length === 0
+      || typeof goal.status !== 'string'
+      || !ULTRAGOAL_STATUS_VALUES.has(goal.status)
+      || !Number.isSafeInteger(goal.attempt)
+      || goal.attempt < 0
+      || typeof goal.createdAt !== 'string'
+      || goal.createdAt.length === 0
+      || typeof goal.updatedAt !== 'string'
+      || goal.updatedAt.length === 0
+    ) {
+      throw new UltragoalError(`Invalid ultragoal plan at ${path}.`);
+    }
+  }
+  if (plan.activeGoalId !== undefined && !plan.goals.some((goal) => goal.id === plan.activeGoalId)) {
+    throw new UltragoalError(`Invalid ultragoal plan at ${path}: active goal is missing.`);
+  }
+  if (plan.runId !== undefined && (typeof plan.runId !== 'string' || !RUN_ID_PATTERN.test(plan.runId))) {
+    throw new UltragoalError(`Invalid ultragoal plan at ${path}: invalid run identity.`);
+  }
+  if (
+    plan.briefHash !== undefined
+    && (
+      typeof plan.briefHash !== 'string'
+      || (!SHA256_PATTERN.test(plan.briefHash) && !LEGACY_BRIEF_HASH_PATTERN.test(plan.briefHash))
+    )
+  ) {
+    throw new UltragoalError(`Invalid ultragoal plan at ${path}: invalid brief hash.`);
+  }
+  if (plan.origin !== undefined && !isRunOrigin(plan.origin)) {
+    throw new UltragoalError(`Invalid ultragoal plan at ${path}: invalid run origin.`);
+  }
+  return plan as UltragoalPlan;
+}
+
+function runTransactionPath(cwd: string): string {
+  return join(ultragoalDir(cwd), ULTRAGOAL_RUN_TRANSACTION);
+}
+
+function runStageDir(cwd: string, runId: string): string {
+  return join(ultragoalDir(cwd), `.run-stage-${runId}`);
+}
+
+async function readRunFiles(cwd: string, runId: string): Promise<{ brief: string; goals: string; ledger: string }> {
+  const runsDir = ultragoalRunsDir(cwd);
+  const dir = ultragoalRunDir(cwd, runId);
+  assertSafeDirectory(runsDir, await lstat(runsDir));
+  assertSafeDirectory(dir, await lstat(dir));
+  return {
+    brief: await readCanonicalRunFile(cwd, join(dir, ULTRAGOAL_BRIEF)),
+    goals: await readCanonicalRunFile(cwd, join(dir, ULTRAGOAL_GOALS)),
+    ledger: await readCanonicalRunFile(cwd, join(dir, ULTRAGOAL_LEDGER)),
+  };
+}
+
+async function readCanonicalRunFile(cwd: string, path: string): Promise<string> {
+  const runDir = dirname(path);
+  assertSafeDirectory(ultragoalRunsDir(cwd), await lstat(ultragoalRunsDir(cwd)));
+  assertSafeDirectory(runDir, await lstat(runDir));
+  return readSafeRegularFile(cwd, path, 'canonical ultragoal run file');
+}
+
+async function readRunFileStateFromDir(
+  cwd: string,
+  dir: string,
+  label: string,
+): Promise<{ raw: { brief: string | null; goals: string | null; ledger: string | null }; digests: UltragoalRunFileStates }> {
+  const empty = {
+    raw: { brief: null, goals: null, ledger: null },
+    digests: emptyRunFileStates(),
+  };
+  try {
+    assertSafeDirectory(ultragoalRunsDir(cwd), await lstat(ultragoalRunsDir(cwd)));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return empty;
+    throw error;
+  }
+  try {
+    assertSafeDirectory(dir, await lstat(dir));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return empty;
+    throw error;
+  }
+  const raw = {
+    brief: await readOptionalSafeRegularFile(cwd, join(dir, ULTRAGOAL_BRIEF), label),
+    goals: await readOptionalSafeRegularFile(cwd, join(dir, ULTRAGOAL_GOALS), label),
+    ledger: await readOptionalSafeRegularFile(cwd, join(dir, ULTRAGOAL_LEDGER), label),
+  };
+  return { raw, digests: runFileStates(raw) };
+}
+
+async function readFlatRunFileState(
+  cwd: string,
+): Promise<{ raw: { brief: string | null; goals: string | null; ledger: string | null }; digests: UltragoalRunFileStates }> {
+  const raw = {
+    brief: await readOptionalSafeRegularFile(cwd, ultragoalBriefPath(cwd), 'active ultragoal projection'),
+    goals: await readOptionalSafeRegularFile(cwd, ultragoalGoalsPath(cwd), 'active ultragoal projection'),
+    ledger: await readOptionalSafeRegularFile(cwd, ultragoalLedgerPath(cwd), 'active ultragoal projection'),
+  };
+  return { raw, digests: runFileStates(raw) };
+}
+
+async function readSafeRegularFile(cwd: string, path: string, label: string): Promise<string> {
+  const before = await lstat(path);
+  assertSafeRegularFile(cwd, path, before, label);
+  const flags = process.platform === 'win32'
+    ? constants.O_RDONLY
+    : constants.O_RDONLY | constants.O_NOFOLLOW;
+  let handle;
+  try {
+    handle = await open(path, flags);
+  } catch (error) {
+    throw new UltragoalError(
+      `Refusing unsafe ${label} at ${repoRelative(cwd, path)}: ${error instanceof Error ? error.message : String(error)}.`,
+    );
+  }
+  try {
+    const opened = await handle.stat();
+    assertSafeRegularFile(cwd, path, opened, label);
+    if (opened.dev !== before.dev || opened.ino !== before.ino) {
+      throw new UltragoalError(`Refusing replaced ${label} at ${repoRelative(cwd, path)}.`);
+    }
+    return await handle.readFile({ encoding: 'utf-8' });
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readMutationLockPublication(
+  lockPath: string,
+): Promise<{ raw: string; candidatePath: string } | null> {
+  let before: Stats;
+  try {
+    before = await lstat(lockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 2) return null;
+
+  const flags = process.platform === 'win32'
+    ? constants.O_RDONLY
+    : constants.O_RDONLY | constants.O_NOFOLLOW;
+  let handle;
+  try {
+    handle = await open(lockPath, flags);
+  } catch {
+    return null;
+  }
+  try {
+    const opened = await handle.stat();
+    if (
+      !opened.isFile()
+      || opened.isSymbolicLink()
+      || opened.nlink !== 2
+      || opened.dev !== before.dev
+      || opened.ino !== before.ino
+    ) {
+      return null;
+    }
+    const raw = await handle.readFile({ encoding: 'utf-8' });
+    const owner = parseMutationLockOwner(raw);
+    if (!owner || !('ownerToken' in owner)) return null;
+    const candidatePath = `${lockPath}.${owner.ownerToken}.candidate`;
+    let candidate: Stats;
+    try {
+      candidate = await lstat(candidatePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+    if (
+      !candidate.isFile()
+      || candidate.isSymbolicLink()
+      || candidate.nlink !== 2
+      || candidate.dev !== opened.dev
+      || candidate.ino !== opened.ino
+    ) {
+      return null;
+    }
+    return { raw, candidatePath };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readOptionalSafeRegularFile(cwd: string, path: string, label: string): Promise<string | null> {
+  try {
+    return await readSafeRegularFile(cwd, path, label);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function assertSafeRegularFile(cwd: string, path: string, file: Stats, label: string): void {
+  if (!file.isFile() || file.isSymbolicLink() || file.nlink !== 1) {
+    throw new UltragoalError(`Refusing unsafe ${label} at ${repoRelative(cwd, path)}.`);
+  }
+}
+
+function runFileDigests(files: { brief: string; goals: string; ledger: string }): UltragoalRunFileDigests {
+  return {
+    brief: sha256(files.brief),
+    goals: sha256(files.goals),
+    ledger: sha256(files.ledger),
+  };
+}
+
+function isRunFileDigests(value: unknown): value is UltragoalRunFileDigests {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  return (
+    keys.length === 3
+    && keys[0] === 'brief'
+    && keys[1] === 'goals'
+    && keys[2] === 'ledger'
+    && SHA256_PATTERN.test(String(record.brief))
+    && SHA256_PATTERN.test(String(record.goals))
+    && SHA256_PATTERN.test(String(record.ledger))
+  );
+}
+
+function isRunFileStates(value: unknown): value is UltragoalRunFileStates {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  return (
+    keys.length === 3
+    && keys[0] === 'brief'
+    && keys[1] === 'goals'
+    && keys[2] === 'ledger'
+    && [record.brief, record.goals, record.ledger].every(
+      (digest) => digest === null || (typeof digest === 'string' && SHA256_PATTERN.test(digest)),
+    )
+  );
+}
+
+function emptyRunFileStates(): UltragoalRunFileStates {
+  return { brief: null, goals: null, ledger: null };
+}
+
+function runFileStates(files: { brief: string | null; goals: string | null; ledger: string | null }): UltragoalRunFileStates {
+  return {
+    brief: files.brief === null ? null : sha256(files.brief),
+    goals: files.goals === null ? null : sha256(files.goals),
+    ledger: files.ledger === null ? null : sha256(files.ledger),
+  };
+}
+
+function assertRunFileStateCanAdvance(
+  current: UltragoalRunFileStates,
+  before: UltragoalRunFileStates,
+  next: UltragoalRunFileDigests,
+  label: string,
+): void {
+  for (const key of ['brief', 'goals', 'ledger'] as const) {
+    if (current[key] === before[key] || current[key] === next[key]) continue;
+    throw new UltragoalError(`Refusing to recover ultragoal run transaction with divergent ${label} ${key}.`);
+  }
+}
+
+function assertRunFileDigests(
+  actual: { brief: string; goals: string; ledger: string },
+  expected: UltragoalRunFileDigests,
+  label: string,
+): void {
+  for (const key of ['brief', 'goals', 'ledger'] as const) {
+    if (sha256(actual[key]) !== expected[key]) {
+      throw new UltragoalError(`Refusing to recover ultragoal run transaction with divergent ${label} ${key}.`);
+    }
+  }
+}
+
+async function recoverRunTransaction(cwd: string): Promise<void> {
+  const path = runTransactionPath(cwd);
+  if (!existsSync(path)) return;
+
+  let transaction: UltragoalRunTransaction;
+  try {
+    transaction = JSON.parse(await readSafeRegularFile(cwd, path, 'ultragoal run transaction journal')) as UltragoalRunTransaction;
+  } catch (error) {
+    if (error instanceof UltragoalError) throw error;
+    throw new UltragoalError(`Invalid ultragoal run transaction at ${repoRelative(cwd, path)}.`);
+  }
+  if (
+    transaction.version !== 1
+    || (transaction.mode !== undefined && transaction.mode !== 'create' && transaction.mode !== 'update')
+    || !RUN_ID_PATTERN.test(transaction.runId)
+    || transaction.pointer?.version !== 1
+    || transaction.pointer.runId !== transaction.runId
+    || !SHA256_PATTERN.test(transaction.pointer.briefHash)
+    || typeof transaction.pointer.updatedAt !== 'string'
+    || transaction.pointer.updatedAt.length === 0
+    || !isRunOrigin(transaction.pointer.origin)
+    || !isRunFileDigests(transaction.files)
+    || !transaction.before
+    || !isRunFileStates(transaction.before.run)
+    || !isRunFileStates(transaction.before.projection)
+    || (
+      transaction.before.pointerSha256 !== null
+      && !SHA256_PATTERN.test(transaction.before.pointerSha256)
+    )
+    || (
+      transaction.archive !== undefined
+      && (
+        !RUN_ID_PATTERN.test(transaction.archive.runId)
+        || transaction.archive.runId === transaction.runId
+        || !isRunFileDigests(transaction.archive.files)
+      )
+    )
+  ) {
+    throw new UltragoalError(`Invalid ultragoal run transaction at ${repoRelative(cwd, path)}.`);
+  }
+
+  const finalDir = ultragoalRunDir(cwd, transaction.runId);
+  const stageDir = runStageDir(cwd, transaction.runId);
+  const staged = existsSync(stageDir) ? await readFilesFromDir(stageDir) : null;
+  if (staged) validateRunFiles(cwd, stageDir, staged, transaction);
+  const currentRun = await readRunFileStateFromDir(
+    cwd,
+    finalDir,
+    'canonical ultragoal run file',
+  );
+  const currentProjection = await readFlatRunFileState(cwd);
+  assertRunFileStateCanAdvance(
+    currentRun.digests,
+    transaction.before.run,
+    transaction.files,
+    `canonical run ${transaction.runId}`,
+  );
+  assertRunFileStateCanAdvance(
+    currentProjection.digests,
+    transaction.before.projection,
+    transaction.files,
+    'active projection',
+  );
+  const pointerRaw = await readOptionalSafeRegularFile(
+    cwd,
+    ultragoalActiveRunPointerPath(cwd),
+    'ultragoal active-run pointer',
+  );
+  const pointerSha256 = pointerRaw === null ? null : sha256(pointerRaw);
+  const nextPointerRaw = `${JSON.stringify({ ...transaction.pointer, files: transaction.files }, null, 2)}\n`;
+  const nextPointerSha256 = sha256(nextPointerRaw);
+  if (
+    pointerSha256 !== transaction.before.pointerSha256
+    && pointerSha256 !== nextPointerSha256
+  ) {
+    throw new UltragoalError('Refusing to recover ultragoal run transaction with divergent active-run pointer.');
+  }
+
+  if (transaction.mode === 'update') {
+    if (staged) {
+      await ensureDirectoryDurable(finalDir);
+      if (currentRun.digests.brief !== transaction.files.brief) {
+        await writeTextAtomic(join(finalDir, ULTRAGOAL_BRIEF), staged.brief);
+      }
+      if (currentRun.digests.goals !== transaction.files.goals) {
+        await writeTextAtomic(join(finalDir, ULTRAGOAL_GOALS), staged.goals);
+      }
+      if (currentRun.digests.ledger !== transaction.files.ledger) {
+        await writeJsonlAtomic(join(finalDir, ULTRAGOAL_LEDGER), staged.ledger);
+      }
+      await syncDirectory(finalDir);
+    } else if (!existsSync(finalDir)) {
+      throw new UltragoalError(`Ultragoal run transaction is missing staged run ${transaction.runId}.`);
+    }
+  } else if (!existsSync(finalDir)) {
+    if (!existsSync(stageDir)) {
+      throw new UltragoalError(`Ultragoal run transaction is missing staged run ${transaction.runId}.`);
+    }
+    await ensureDirectoryDurable(ultragoalRunsDir(cwd));
+    await renameDurable(stageDir, finalDir);
+  }
+
+  const canonical = await readRunFiles(cwd, transaction.runId);
+  validateRunFiles(cwd, finalDir, canonical, transaction);
+
+  if (transaction.archive) {
+    const archived = await readRunFiles(cwd, transaction.archive.runId);
+    assertRunFileDigests(archived, transaction.archive.files, `archive ${transaction.archive.runId}`);
+  }
+
+  if (currentProjection.digests.brief !== transaction.files.brief) {
+    await writeTextAtomic(ultragoalBriefPath(cwd), canonical.brief);
+  }
+  if (currentProjection.digests.goals !== transaction.files.goals) {
+    await writeTextAtomic(ultragoalGoalsPath(cwd), canonical.goals);
+  }
+  if (currentProjection.digests.ledger !== transaction.files.ledger) {
+    await writeJsonlAtomic(ultragoalLedgerPath(cwd), canonical.ledger);
+  }
+  if (pointerSha256 !== nextPointerSha256) {
+    await writeActiveRunPointer(cwd, { ...transaction.pointer, files: transaction.files });
+  }
+
+  const projected = {
+    brief: await readSafeRegularFile(cwd, ultragoalBriefPath(cwd), 'active ultragoal projection'),
+    goals: await readSafeRegularFile(cwd, ultragoalGoalsPath(cwd), 'active ultragoal projection'),
+    ledger: await readSafeRegularFile(cwd, ultragoalLedgerPath(cwd), 'active ultragoal projection'),
+  };
+  assertRunFileDigests(projected, transaction.files, 'active projection');
+  await removeDirectoryDurable(stageDir);
+  await removeDurable(path);
+}
+
+async function readFilesFromDir(dir: string): Promise<{ brief: string; goals: string; ledger: string }> {
+  assertSafeDirectory(dir, await lstat(dir));
+  return {
+    brief: await readSafeRegularFile(dir, join(dir, ULTRAGOAL_BRIEF), 'staged run file'),
+    goals: await readSafeRegularFile(dir, join(dir, ULTRAGOAL_GOALS), 'staged run file'),
+    ledger: await readSafeRegularFile(dir, join(dir, ULTRAGOAL_LEDGER), 'staged run file'),
+  };
+}
+
+function validateRunFiles(
+  cwd: string,
+  dir: string,
+  files: { brief: string; goals: string; ledger: string },
+  transaction: UltragoalRunTransaction,
+): void {
+  assertRunFileDigests(files, transaction.files, `run ${transaction.runId}`);
+  assertValidLedgerJsonl(files.ledger, repoRelative(cwd, join(dir, ULTRAGOAL_LEDGER)));
+  const goalsPath = repoRelative(cwd, join(dir, ULTRAGOAL_GOALS));
+  const plan = parseUltragoalPlanJson(files.goals, goalsPath);
+  if (
+    plan.runId !== transaction.runId
+    || plan.briefHash !== transaction.pointer.briefHash
+    || computeUltragoalBriefHash(files.brief) !== transaction.pointer.briefHash
+    || plan.updatedAt !== transaction.pointer.updatedAt
+    || !sameRunOrigin(plan.origin, transaction.pointer.origin)
+  ) {
+    throw new UltragoalError(`Ultragoal run transaction identity mismatch for ${transaction.runId}.`);
+  }
 }
 
 function assertValidLedgerJsonl(value: string, path: string): void {
@@ -927,83 +1818,127 @@ function ledgerTransactionPath(cwd: string): string {
   return join(ultragoalDir(cwd), ULTRAGOAL_LEDGER_TRANSACTION);
 }
 
-async function readLedger(path: string): Promise<string> {
-  return existsSync(path) ? readFile(path, 'utf-8') : '';
+async function readLedger(cwd: string, path: string): Promise<string> {
+  return (await readOptionalSafeRegularFile(cwd, path, 'ultragoal ledger')) ?? '';
 }
 
 async function recoverLedgerTransaction(cwd: string): Promise<void> {
   const path = ledgerTransactionPath(cwd);
   if (!existsSync(path)) return;
-  const transaction = JSON.parse(await readFile(path, 'utf-8')) as UltragoalLedgerTransaction;
+  let transaction: UltragoalLedgerTransaction;
+  try {
+    transaction = JSON.parse(
+      await readSafeRegularFile(cwd, path, 'ultragoal ledger transaction journal'),
+    ) as UltragoalLedgerTransaction;
+  } catch (error) {
+    if (error instanceof UltragoalError) throw error;
+    throw new UltragoalError(`Invalid ultragoal ledger transaction at ${repoRelative(cwd, path)}.`);
+  }
   const pointer = await readActiveRunPointer(cwd);
   if (
     transaction.version !== 1
     || !transaction.runId
     || !transaction.line.endsWith('\n')
+    || !SHA256_PATTERN.test(transaction.baseSha256)
+    || !SHA256_PATTERN.test(transaction.nextSha256)
     || pointer?.runId !== transaction.runId
+    || !pointer.files
   ) {
     throw new UltragoalError(`Invalid ultragoal ledger transaction at ${repoRelative(cwd, path)}.`);
   }
   assertValidLedgerJsonl(transaction.line, repoRelative(cwd, path));
   const runPath = join(ultragoalRunDir(cwd, transaction.runId), ULTRAGOAL_LEDGER);
   const flatPath = ultragoalLedgerPath(cwd);
+  const runFilesBefore = await readRunFiles(cwd, transaction.runId);
+  if (
+    pointer.files.brief !== sha256(runFilesBefore.brief)
+    || pointer.files.goals !== sha256(runFilesBefore.goals)
+    || (
+      pointer.files.ledger !== transaction.baseSha256
+      && pointer.files.ledger !== transaction.nextSha256
+    )
+  ) {
+    throw new UltragoalError(`Invalid ultragoal ledger transaction authority at ${repoRelative(cwd, path)}.`);
+  }
   for (const target of [runPath, flatPath]) {
-    const current = await readLedger(target);
+    const current = await readLedger(cwd, target);
     assertValidLedgerJsonl(current, repoRelative(cwd, target));
     const currentSha = sha256(current);
     if (currentSha === transaction.nextSha256) continue;
     if (currentSha !== transaction.baseSha256) {
       throw new UltragoalError(`Refusing to recover divergent ultragoal ledger transaction at ${repoRelative(cwd, target)}.`);
     }
-    await appendFile(target, transaction.line);
+    if (sha256(`${current}${transaction.line}`) !== transaction.nextSha256) {
+      throw new UltragoalError(`Invalid ultragoal ledger transaction digest at ${repoRelative(cwd, path)}.`);
+    }
+    await writeJsonlAtomic(target, `${current}${transaction.line}`);
   }
-  const run = await readLedger(runPath);
-  const flat = await readLedger(flatPath);
+  const run = await readLedger(cwd, runPath);
+  const flat = await readLedger(cwd, flatPath);
   if (run !== flat || sha256(run) !== transaction.nextSha256) {
     throw new UltragoalError(`Ultragoal ledger transaction did not converge ${repoRelative(cwd, runPath)} and ${repoRelative(cwd, flatPath)}.`);
   }
-  await rm(path, { force: true });
+  const runFiles = await readRunFiles(cwd, transaction.runId);
+  await writeActiveRunPointer(cwd, { ...pointer, files: runFileDigests(runFiles) });
+  await removeDurable(path);
 }
 
-async function reconcileLegacyLedgerProjection(cwd: string, runId: string): Promise<void> {
+async function selectLegacyLedgerProjection(cwd: string, runId: string): Promise<string> {
   await recoverLedgerTransaction(cwd);
   const runDir = ultragoalRunDir(cwd, runId);
-  await mkdir(runDir, { recursive: true });
   const runPath = join(runDir, ULTRAGOAL_LEDGER);
   const flatPath = ultragoalLedgerPath(cwd);
-  const run = await readLedger(runPath);
-  const flat = await readLedger(flatPath);
+  const run = await readLedger(cwd, runPath);
+  const flat = await readLedger(cwd, flatPath);
   assertValidLedgerJsonl(run, repoRelative(cwd, runPath));
   assertValidLedgerJsonl(flat, repoRelative(cwd, flatPath));
-  if (run === flat) return;
+  if (run === flat) return run;
   if (!run || flat.startsWith(run) || flat.endsWith(run)) {
-    await writeJsonlAtomic(runPath, flat);
-    return;
+    return flat;
   }
   if (!flat || run.startsWith(flat) || run.endsWith(flat)) {
-    await writeJsonlAtomic(flatPath, run);
-    return;
+    return run;
   }
   throw new UltragoalError(
     `Refusing to reconcile unrelated ultragoal ledgers at ${repoRelative(cwd, flatPath)} and ${repoRelative(cwd, runPath)}.`,
   );
 }
 
-async function appendLedger(cwd: string, entry: UltragoalLedgerEntry): Promise<void> {
-  await mkdir(ultragoalDir(cwd), { recursive: true });
+async function appendLedger(
+  cwd: string,
+  entry: UltragoalLedgerEntry,
+  expectedRunId?: string,
+): Promise<void> {
+  await ensureDirectoryDurable(ultragoalDir(cwd));
   const line = `${JSON.stringify(entry)}\n`;
+  await recoverLedgerTransaction(cwd);
   const pointer = await readActiveRunPointer(cwd);
   if (!pointer) {
-    await appendFile(ultragoalLedgerPath(cwd), line);
+    if (expectedRunId) {
+      throw new UltragoalError(`Refusing ledger append without active-run pointer authority for ${expectedRunId}.`);
+    }
+    const path = ultragoalLedgerPath(cwd);
+    await writeJsonlAtomic(path, `${await readLedger(cwd, path)}${line}`);
     return;
   }
-  await recoverLedgerTransaction(cwd);
+  if (expectedRunId && pointer.runId !== expectedRunId) {
+    throw new UltragoalError(
+      `Refusing ledger append for ${expectedRunId}; active-run pointer owns ${pointer.runId}.`,
+    );
+  }
+  if (!pointer.files) {
+    throw new UltragoalError(`Refusing ledger append without active-run file digests for ${pointer.runId}.`);
+  }
   const runDir = ultragoalRunDir(cwd, pointer.runId);
-  await mkdir(runDir, { recursive: true });
+  assertSafeDirectory(runDir, await lstat(runDir));
   const flatPath = ultragoalLedgerPath(cwd);
   const runPath = join(runDir, ULTRAGOAL_LEDGER);
-  const flat = await readLedger(flatPath);
-  const run = await readLedger(runPath);
+  const canonical = await readRunFiles(cwd, pointer.runId);
+  assertRunFileDigests(canonical, pointer.files, `committed run ${pointer.runId}`);
+  const flatFiles = await readFlatRunFiles(cwd);
+  assertRunFileDigests(flatFiles, pointer.files, 'active projection');
+  const flat = flatFiles.ledger;
+  const run = canonical.ledger;
   assertValidLedgerJsonl(flat, repoRelative(cwd, flatPath));
   assertValidLedgerJsonl(run, repoRelative(cwd, runPath));
   if (flat !== run) {
@@ -1019,8 +1954,8 @@ async function appendLedger(cwd: string, entry: UltragoalLedgerEntry): Promise<v
     nextSha256: sha256(`${run}${line}`),
   };
   await writePrivateJsonAtomic(ledgerTransactionPath(cwd), transaction);
-  await appendFile(runPath, line);
-  await appendFile(flatPath, line);
+  await writeJsonlAtomic(runPath, `${run}${line}`);
+  await writeJsonlAtomic(flatPath, `${flat}${line}`);
   await recoverLedgerTransaction(cwd);
 }
 
@@ -1033,13 +1968,27 @@ function normalizeLegacyGoalStatuses(plan: UltragoalPlan): number {
   }
   return migrated;
 }
-async function appendLegacyStatusMigration(cwd: string, migratedStatuses: number, now: string): Promise<void> {
-  if (migratedStatuses === 0) return;
-  await appendLedger(cwd, {
-    ts: now,
-    event: 'plan_migrated',
-    message: `Normalized ${migratedStatuses} legacy completed goal status${migratedStatuses === 1 ? '' : 'es'} to complete.`,
-  });
+
+async function normalizeLegacyBriefHash(cwd: string, plan: UltragoalPlan): Promise<boolean> {
+  if (!plan.briefHash || SHA256_PATTERN.test(plan.briefHash)) return false;
+  const briefPath = plan.runId && existsSync(join(ultragoalRunDir(cwd, plan.runId), ULTRAGOAL_BRIEF))
+    ? join(ultragoalRunDir(cwd, plan.runId), ULTRAGOAL_BRIEF)
+    : ultragoalBriefPath(cwd);
+  let brief: string;
+  try {
+    brief = briefPath === ultragoalBriefPath(cwd)
+      ? await readSafeRegularFile(cwd, briefPath, 'active ultragoal projection')
+      : await readCanonicalRunFile(cwd, briefPath);
+  } catch (error) {
+    if (error instanceof UltragoalError) throw error;
+    throw new UltragoalError(`Cannot validate legacy ultragoal brief hash without ${repoRelative(cwd, briefPath)}.`);
+  }
+  const canonical = computeUltragoalBriefHash(brief);
+  if (!canonical.startsWith(plan.briefHash)) {
+    throw new UltragoalError(`Legacy ultragoal brief hash does not match ${repoRelative(cwd, briefPath)}.`);
+  }
+  plan.briefHash = canonical;
+  return true;
 }
 
 async function readUltragoalPlanUnlocked(cwd: string): Promise<UltragoalPlan> {
@@ -1047,14 +1996,12 @@ async function readUltragoalPlanUnlocked(cwd: string): Promise<UltragoalPlan> {
   const path = ultragoalGoalsPath(cwd);
   let raw: string;
   try {
-    raw = await readFile(path, 'utf-8');
-  } catch {
+    raw = await readSafeRegularFile(cwd, path, 'active ultragoal projection');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     throw new UltragoalError(`No ultragoal plan found at ${repoRelative(cwd, path)}. Run \`omx ultragoal create-goals ...\` first.`);
   }
-  const parsed = JSON.parse(raw) as UltragoalPlan;
-  if (parsed.version !== 1 || !Array.isArray(parsed.goals)) {
-    throw new UltragoalError(`Invalid ultragoal plan at ${repoRelative(cwd, path)}.`);
-  }
+  const parsed = parseUltragoalPlanJson(raw, repoRelative(cwd, path));
   if (await isUnownedInheritedRegistry(parsed.origin, cwd)) {
     throw new UltragoalRegistryConflictError(
       [
@@ -1074,9 +2021,47 @@ async function readUltragoalPlanUnlocked(cwd: string): Promise<UltragoalPlan> {
       },
     );
   }
+  let migratedPointerHash = false;
+  let migratedPointerDigests = false;
+  if (parsed.runId && existsSync(join(ultragoalRunDir(cwd, parsed.runId), ULTRAGOAL_GOALS))) {
+    const canonical = await readRunFiles(cwd, parsed.runId);
+    if (raw !== canonical.goals) {
+      throw new UltragoalError(
+        `Refusing to migrate divergent flat and canonical ultragoal goals for ${parsed.runId}.`,
+      );
+    }
+    let pointer = await readActiveRunPointer(cwd);
+    if (pointer && LEGACY_BRIEF_HASH_PATTERN.test(pointer.briefHash)) {
+      const fullBriefHash = computeUltragoalBriefHash(canonical.brief);
+      if (!fullBriefHash.startsWith(pointer.briefHash)) {
+        throw new UltragoalError(`Legacy active-run brief hash does not match canonical run ${parsed.runId}.`);
+      }
+      pointer = { ...pointer, briefHash: fullBriefHash };
+      migratedPointerHash = true;
+    }
+    assertPointerAuthority(pointer, parsed, canonical);
+    const projected = {
+      brief: await readSafeRegularFile(cwd, ultragoalBriefPath(cwd), 'active ultragoal projection'),
+      goals: raw,
+      ledger: await readSafeRegularFile(cwd, ultragoalLedgerPath(cwd), 'active ultragoal projection'),
+    };
+    if (pointer?.files) {
+      assertRunFileDigests(projected, pointer.files, 'active projection');
+    } else {
+      migratedPointerDigests = true;
+    }
+    if (
+      projected.brief !== canonical.brief
+      || projected.goals !== canonical.goals
+      || projected.ledger !== canonical.ledger
+    ) {
+      throw new UltragoalError(`Refusing divergent active and canonical ultragoal run ${parsed.runId}.`);
+    }
+  }
   const migratedStatuses = normalizeLegacyGoalStatuses(parsed);
+  const migratedBriefHash = await normalizeLegacyBriefHash(cwd, parsed);
   const objectiveMigrated = codexGoalMode(parsed) === 'aggregate' && isLegacyEnumeratedAggregateObjective(parsed.codexObjective);
-  if (migratedStatuses > 0 || objectiveMigrated) {
+  if (migratedStatuses > 0 || migratedBriefHash || migratedPointerHash || migratedPointerDigests || objectiveMigrated) {
     const previousObjective = parsed.codexObjective;
     const now = iso();
     if (objectiveMigrated) {
@@ -1084,13 +2069,37 @@ async function readUltragoalPlanUnlocked(cwd: string): Promise<UltragoalPlan> {
       parsed.codexObjectiveAliases = Array.from(new Set([...(parsed.codexObjectiveAliases ?? []), previousObjective].filter((value): value is string => typeof value === 'string' && value.length > 0)));
     }
     parsed.updatedAt = now;
-    if (migratedStatuses > 0 && parsed.runId) {
-      await reconcileLegacyLedgerProjection(cwd, parsed.runId);
+    const migrationEntries: UltragoalLedgerEntry[] = [];
+    if (migratedStatuses > 0) {
+      migrationEntries.push({
+        ts: now,
+        event: 'plan_migrated',
+        message: `Normalized ${migratedStatuses} legacy completed goal status${migratedStatuses === 1 ? '' : 'es'} to complete.`,
+      });
     }
-    await writePlan(cwd, parsed);
-    await appendLegacyStatusMigration(cwd, migratedStatuses, now);
+    if (migratedBriefHash) {
+      migrationEntries.push({
+        ts: now,
+        event: 'plan_migrated',
+        message: 'Expanded legacy truncated brief hash to full SHA-256.',
+      });
+    }
+    if (migratedPointerHash) {
+      migrationEntries.push({
+        ts: now,
+        event: 'plan_migrated',
+        message: 'Expanded legacy truncated active-run brief hash to full SHA-256.',
+      });
+    }
+    if (migratedPointerDigests) {
+      migrationEntries.push({
+        ts: now,
+        event: 'plan_migrated',
+        message: 'Bound legacy active-run pointer to canonical run file digests.',
+      });
+    }
     if (objectiveMigrated) {
-      await appendLedger(cwd, {
+      migrationEntries.push({
         ts: now,
         event: 'aggregate_objective_migrated',
         message: 'Migrated legacy enumerated aggregate Codex objective to the stable pointer objective.',
@@ -1098,6 +2107,9 @@ async function readUltragoalPlanUnlocked(cwd: string): Promise<UltragoalPlan> {
         after: { codexObjective: parsed.codexObjective },
       });
     }
+    await publishPlanMutation(cwd, parsed, migrationEntries, {
+      allowLegacyPointerFiles: migratedPointerDigests,
+    });
   }
   return parsed;
 }
@@ -1106,24 +2118,166 @@ export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
   return withUltragoalMutationLock(cwd, () => readUltragoalPlanUnlocked(cwd));
 }
 
-async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
-  const tmpPath = `${path}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`);
-  await rename(tmpPath, path);
+async function writeTextAtomic(path: string, value: string, defaultMode = 0o644): Promise<void> {
+  const tmpPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  const destination = await inspectReplacementDestination(path);
+  try {
+    await writeFileSynced(tmpPath, value, destination?.mode ?? defaultMode);
+    await replacePreparedFile(path, tmpPath, destination);
+  } catch (error) {
+    await rm(tmpPath, { force: true });
+    throw error;
+  }
 }
 
 async function writePrivateJsonAtomic(path: string, value: unknown): Promise<void> {
-  const tmpPath = `${path}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  await rename(tmpPath, path);
+  await writeTextAtomic(path, `${JSON.stringify(value, null, 2)}\n`, 0o600);
 }
 
 async function writeJsonlAtomic(path: string, value: string): Promise<void> {
-  const tmpPath = `${path}.${process.pid}.${Date.now()}.tmp`;
-  const mode = existsSync(path) ? (await stat(path)).mode & 0o777 : 0o600;
-  await writeFile(tmpPath, value, { mode });
-  await rename(tmpPath, path);
-  await chmod(path, mode);
+  const tmpPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  const destination = await inspectReplacementDestination(path);
+  try {
+    await writeFileSynced(tmpPath, value, destination?.mode ?? 0o600);
+    await replacePreparedFile(path, tmpPath, destination);
+  } catch (error) {
+    await rm(tmpPath, { force: true });
+    throw error;
+  }
+}
+
+interface ReplacementDestination {
+  dev: number;
+  ino: number;
+  mode: number;
+}
+
+async function inspectReplacementDestination(path: string): Promise<ReplacementDestination | null> {
+  let before: Stats;
+  try {
+    before = await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) {
+    throw new UltragoalError(`Refusing unsafe atomic replacement target at ${path}.`);
+  }
+  const flags = process.platform === 'win32'
+    ? constants.O_RDONLY
+    : constants.O_RDONLY | constants.O_NOFOLLOW;
+  const handle = await open(path, flags);
+  try {
+    const opened = await handle.stat();
+    if (
+      !opened.isFile()
+      || opened.isSymbolicLink()
+      || opened.nlink !== 1
+      || opened.dev !== before.dev
+      || opened.ino !== before.ino
+    ) {
+      throw new UltragoalError(`Refusing replaced atomic replacement target at ${path}.`);
+    }
+    return { dev: opened.dev, ino: opened.ino, mode: opened.mode & 0o777 };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function replacePreparedFile(
+  destination: string,
+  temporary: string,
+  expected: ReplacementDestination | null,
+): Promise<void> {
+  try {
+    const current = await inspectReplacementDestination(destination);
+    if (
+      (expected === null && current !== null)
+      || (
+        expected !== null
+        && (
+          current === null
+          || current.dev !== expected.dev
+          || current.ino !== expected.ino
+        )
+      )
+    ) {
+      throw new UltragoalError(`Refusing changed atomic replacement target at ${destination}.`);
+    }
+    await renameDurable(temporary, destination);
+  } catch (error) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
+}
+
+async function writeFileSynced(path: string, value: string, mode: number): Promise<void> {
+  const handle = await open(path, 'wx', mode);
+  try {
+    await handle.writeFile(value);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  if (process.platform === 'win32') return;
+  const handle = await open(path, 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function ensureDirectoryDurable(path: string): Promise<void> {
+  if (existsSync(path)) {
+    assertSafeDirectory(path, await lstat(path));
+    return;
+  }
+  const parent = dirname(path);
+  if (parent !== path) await ensureDirectoryDurable(parent);
+  try {
+    await mkdir(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  assertSafeDirectory(path, await lstat(path));
+  await syncDirectory(path);
+  if (parent !== path) await syncDirectory(parent);
+}
+
+function assertSafeDirectory(path: string, directory: Stats): void {
+  if (!directory.isDirectory() || directory.isSymbolicLink()) {
+    throw new UltragoalError(`Refusing unsafe ultragoal directory at ${path}.`);
+  }
+}
+
+async function renameDurable(source: string, destination: string): Promise<void> {
+  await rename(source, destination);
+  const sourceParent = dirname(source);
+  const destinationParent = dirname(destination);
+  await syncDirectory(destinationParent);
+  if (sourceParent !== destinationParent) await syncDirectory(sourceParent);
+}
+
+async function removeDurable(path: string): Promise<void> {
+  await rm(path, { force: true });
+  await syncDirectory(dirname(path));
+}
+
+async function removeDirectoryDurable(path: string): Promise<void> {
+  let directory: Stats;
+  try {
+    directory = await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  assertSafeDirectory(path, directory);
+  await rm(path, { recursive: true, force: true });
+  await syncDirectory(dirname(path));
 }
 
 /**
@@ -1131,16 +2285,6 @@ async function writeJsonlAtomic(path: string, value: string): Promise<void> {
  * is the active-run projection every existing reader (HUD, shutdown gates, state
  * operations) consumes. One writer, both paths, always together.
  */
-async function writePlan(cwd: string, plan: UltragoalPlan): Promise<void> {
-  await mkdir(ultragoalDir(cwd), { recursive: true });
-  if (plan.runId) {
-    const runDir = ultragoalRunDir(cwd, plan.runId);
-    await mkdir(runDir, { recursive: true });
-    await writeJsonAtomic(join(runDir, ULTRAGOAL_GOALS), plan);
-  }
-  await writeJsonAtomic(ultragoalGoalsPath(cwd), plan);
-}
-
 function availableRunId(cwd: string, briefHash: string, now: Date): string {
   const base = buildUltragoalRunId(briefHash, now);
   if (!existsSync(ultragoalRunDir(cwd, base))) return base;
@@ -1154,15 +2298,34 @@ function availableRunId(cwd: string, briefHash: string, now: Date): string {
 interface ExistingUltragoalPlan {
   plan: UltragoalPlan;
   migratedStatuses: number;
+  migratedBriefHash: boolean;
 }
 
 async function readExistingPlanForConflictCheck(cwd: string): Promise<ExistingUltragoalPlan | null> {
   if (!existsSync(ultragoalGoalsPath(cwd))) return null;
   try {
-    const plan = JSON.parse(await readFile(ultragoalGoalsPath(cwd), 'utf-8')) as UltragoalPlan;
-    if (!Array.isArray(plan.goals)) return null;
-    return { plan, migratedStatuses: normalizeLegacyGoalStatuses(plan) };
-  } catch {
+    const flatRaw = await readSafeRegularFile(
+      cwd,
+      ultragoalGoalsPath(cwd),
+      'active ultragoal projection',
+    );
+    const plan = parseUltragoalPlanJson(flatRaw, repoRelative(cwd, ultragoalGoalsPath(cwd)));
+    if (plan.runId && existsSync(join(ultragoalRunDir(cwd, plan.runId), ULTRAGOAL_GOALS))) {
+      const canonicalRaw = await readCanonicalRunFile(
+        cwd,
+        join(ultragoalRunDir(cwd, plan.runId), ULTRAGOAL_GOALS),
+      );
+      if (flatRaw !== canonicalRaw) {
+        throw new UltragoalError(
+          `Refusing to use divergent flat and canonical ultragoal goals for ${plan.runId}.`,
+        );
+      }
+    }
+    const migratedStatuses = normalizeLegacyGoalStatuses(plan);
+    const migratedBriefHash = await normalizeLegacyBriefHash(cwd, plan);
+    return { plan, migratedStatuses, migratedBriefHash };
+  } catch (error) {
+    if (error instanceof UltragoalError) throw error;
     return null;
   }
 }
@@ -1176,10 +2339,11 @@ async function resolveRegistryDisposition(
   cwd: string,
   briefHash: string,
   options: CreateUltragoalOptions,
-): Promise<{ adopt: ExistingUltragoalPlan | null; archivedTo: string | null }> {
+): Promise<{ adopt: ExistingUltragoalPlan | null; archivedTo: string | null; archivedRunId: string | null }> {
   const loaded = await readExistingPlanForConflictCheck(cwd);
-  if (!loaded) return { adopt: null, archivedTo: null };
-  const { plan: existing, migratedStatuses } = loaded;
+  if (!loaded) return { adopt: null, archivedTo: null, archivedRunId: null };
+  const existing = loaded.plan;
+  const migratedStatuses = loaded.migratedStatuses;
 
   const pointer = await readActiveRunPointer(cwd);
   const existingOrigin = existing.origin ?? pointer?.origin;
@@ -1196,9 +2360,9 @@ async function resolveRegistryDisposition(
   const archive = options.archiveExisting || options.force;
   if (!conflict && !options.newNamespace && !archive) {
     // Same brief, same worktree: this is a resume of the same run.
-    return { adopt: loaded, archivedTo: null };
+    return { adopt: loaded, archivedTo: null, archivedRunId: null };
   }
-  if (options.adoptExisting) return { adopt: loaded, archivedTo: null };
+  if (options.adoptExisting) return { adopt: loaded, archivedTo: null, archivedRunId: null };
   if (!archive && !options.newNamespace && conflict) {
     throw new UltragoalRegistryConflictError(conflict.message, {
       reason: conflict.reason,
@@ -1210,10 +2374,215 @@ async function resolveRegistryDisposition(
   // Creating a new run overwrites the flat files and truncates the flat ledger.
   // Archive first, on every path that reaches here: a pre-namespacing registry
   // has no run directory behind those files, so skipping this destroys it.
-  await writeJsonAtomic(ultragoalGoalsPath(cwd), existing);
-  await appendLegacyStatusMigration(cwd, migratedStatuses, iso(options.now));
-  const archivedTo = await archiveFlatRegistry(cwd, existing.runId ?? legacyRunIdForPlan(existing));
-  return { adopt: null, archivedTo };
+  const archivedRunId = existing.runId ?? legacyRunIdForPlan(existing);
+  const existingRunDir = existing.runId ? ultragoalRunDir(cwd, existing.runId) : null;
+  if (existing.runId && existingRunDir && existsSync(existingRunDir)) {
+    const canonical = await readRunFiles(cwd, existing.runId);
+    const flat = await readFlatRunFiles(cwd);
+    if (flat.brief !== canonical.brief || flat.goals !== canonical.goals || flat.ledger !== canonical.ledger) {
+      throw new UltragoalError(
+        `Refusing to archive divergent flat and canonical ultragoal run ${existing.runId}.`,
+      );
+    }
+  } else {
+    const now = iso(options.now);
+    const existingBrief = (await readOptionalSafeRegularFile(
+      cwd,
+      ultragoalBriefPath(cwd),
+      'active ultragoal projection',
+    )) ?? '';
+    existing.runId = archivedRunId;
+    existing.briefHash ??= computeUltragoalBriefHash(existingBrief);
+    existing.origin ??= { worktreePath: cwd, createdAt: existing.createdAt };
+    existing.updatedAt = now;
+    await publishExistingRunState(cwd, existing, migratedStatuses === 0 ? [] : [{
+      ts: now,
+      event: 'plan_migrated',
+      message: `Normalized ${migratedStatuses} legacy completed goal status${migratedStatuses === 1 ? '' : 'es'} to complete.`,
+    }]);
+  }
+  const archivedTo = await archiveFlatRegistry(cwd, archivedRunId);
+  return { adopt: null, archivedTo, archivedRunId };
+}
+
+async function publishRunState(
+  cwd: string,
+  plan: UltragoalPlan,
+  brief: string,
+  ledger: string,
+  mode: 'create' | 'update',
+  archivedRunId: string | null,
+): Promise<void> {
+  const runId = plan.runId as string;
+  const finalDir = ultragoalRunDir(cwd, runId);
+  const stageDir = runStageDir(cwd, runId);
+  if (mode === 'create' && existsSync(finalDir)) {
+    throw new UltragoalError(`Refusing to overwrite existing ultragoal run ${runId}.`);
+  }
+  await removeDirectoryDurable(stageDir);
+  await ensureDirectoryDurable(stageDir);
+  await writeTextAtomic(join(stageDir, ULTRAGOAL_BRIEF), brief);
+  await writeTextAtomic(join(stageDir, ULTRAGOAL_GOALS), `${JSON.stringify(plan, null, 2)}\n`);
+  await writeTextAtomic(join(stageDir, ULTRAGOAL_LEDGER), ledger, 0o600);
+  await syncDirectory(stageDir);
+  await syncDirectory(dirname(stageDir));
+
+  const staged = await readFilesFromDir(stageDir);
+  assertValidLedgerJsonl(staged.ledger, repoRelative(cwd, join(stageDir, ULTRAGOAL_LEDGER)));
+  const beforeRun = await readRunFileStateFromDir(
+    cwd,
+    finalDir,
+    'canonical ultragoal run file',
+  );
+  const beforeProjection = await readFlatRunFileState(cwd);
+  const beforePointer = await readOptionalSafeRegularFile(
+    cwd,
+    ultragoalActiveRunPointerPath(cwd),
+    'ultragoal active-run pointer',
+  );
+
+  const transaction: UltragoalRunTransaction = {
+    version: 1,
+    mode,
+    runId,
+    pointer: {
+      version: 1,
+      runId,
+      briefHash: plan.briefHash as string,
+      updatedAt: plan.updatedAt,
+      origin: plan.origin as UltragoalRunOrigin,
+    },
+    files: runFileDigests(staged),
+    before: {
+      run: beforeRun.digests,
+      projection: beforeProjection.digests,
+      pointerSha256: beforePointer === null ? null : sha256(beforePointer),
+    },
+  };
+  if (archivedRunId) {
+    const archived = await readRunFiles(cwd, archivedRunId);
+    transaction.archive = {
+      runId: archivedRunId,
+      files: runFileDigests(archived),
+    };
+  }
+
+  validateRunFiles(cwd, stageDir, staged, transaction);
+  await writePrivateJsonAtomic(runTransactionPath(cwd), transaction);
+  await recoverRunTransaction(cwd);
+}
+
+async function readFlatRunFiles(cwd: string): Promise<{ brief: string; goals: string; ledger: string }> {
+  return {
+    brief: (await readOptionalSafeRegularFile(
+      cwd,
+      ultragoalBriefPath(cwd),
+      'active ultragoal projection',
+    )) ?? '',
+    goals: await readSafeRegularFile(cwd, ultragoalGoalsPath(cwd), 'active ultragoal projection'),
+    ledger: await readLedger(cwd, ultragoalLedgerPath(cwd)),
+  };
+}
+
+async function publishExistingRunState(
+  cwd: string,
+  plan: UltragoalPlan,
+  entries: UltragoalLedgerEntry[],
+  options: { allowLegacyPointerFiles?: boolean } = {},
+): Promise<void> {
+  if (!plan.runId || !plan.briefHash || !plan.origin) {
+    throw new UltragoalError('Cannot publish an existing ultragoal run without canonical identity.');
+  }
+  const runDir = ultragoalRunDir(cwd, plan.runId);
+  const current = existsSync(runDir)
+    ? await readRunFiles(cwd, plan.runId)
+    : await readFlatRunFiles(cwd);
+  if (existsSync(runDir)) {
+    const flat = await readFlatRunFiles(cwd);
+    const pointer = await readActiveRunPointer(cwd);
+    const currentPlan = parseUltragoalPlanJson(
+      current.goals,
+      repoRelative(cwd, join(runDir, ULTRAGOAL_GOALS)),
+    );
+    assertPointerAuthority(pointer, currentPlan, current);
+    if (
+      plan.runId !== currentPlan.runId
+      || !sameBriefHashIdentity(plan.briefHash, currentPlan.briefHash as string)
+      || !sameRunOrigin(plan.origin, currentPlan.origin as UltragoalRunOrigin)
+    ) {
+      throw new UltragoalError(`Refusing ordinary mutation that changes canonical run identity for ${plan.runId}.`);
+    }
+    if (!pointer?.files && !options.allowLegacyPointerFiles) {
+      throw new UltragoalError(`Refusing ordinary mutation without active-run file digests for ${plan.runId}.`);
+    }
+    if (pointer?.files) assertRunFileDigests(flat, pointer.files, 'active projection');
+    if (flat.brief !== current.brief || flat.goals !== current.goals || flat.ledger !== current.ledger) {
+      throw new UltragoalError(
+        `Refusing to update divergent flat and canonical ultragoal run ${plan.runId}.`,
+      );
+    }
+  }
+  assertValidLedgerJsonl(current.ledger, repoRelative(cwd, join(runDir, ULTRAGOAL_LEDGER)));
+  const ledger = entries.reduce((value, entry) => `${value}${JSON.stringify(entry)}\n`, current.ledger);
+  await publishRunState(cwd, plan, current.brief, ledger, 'update', null);
+}
+
+async function publishPlanMutation(
+  cwd: string,
+  plan: UltragoalPlan,
+  entries: UltragoalLedgerEntry[],
+  options: { allowLegacyPointerFiles?: boolean } = {},
+): Promise<void> {
+  const identityCount = Number(Boolean(plan.runId)) + Number(Boolean(plan.briefHash)) + Number(Boolean(plan.origin));
+  if (identityCount !== 0 && identityCount !== 3) {
+    throw new UltragoalError('Refusing to mutate an ultragoal plan with partial canonical identity.');
+  }
+  if (identityCount === 0) {
+    const pointer = await readActiveRunPointer(cwd);
+    const runId = legacyRunIdForPlan(plan);
+    if (pointer || existsSync(ultragoalRunDir(cwd, runId))) {
+      throw new UltragoalError('Refusing to mutate an ambiguous pre-namespacing ultragoal plan; run `omx ultragoal adopt-run` first.');
+    }
+    const brief = (await readOptionalSafeRegularFile(
+      cwd,
+      ultragoalBriefPath(cwd),
+      'active ultragoal projection',
+    )) ?? '';
+    plan.runId = runId;
+    plan.briefHash = computeUltragoalBriefHash(brief);
+    plan.origin = { worktreePath: cwd, createdAt: plan.createdAt };
+  }
+  await publishExistingRunState(cwd, plan, entries, options);
+}
+
+async function readAdoptionBase(
+  cwd: string,
+  runId: string,
+): Promise<{ brief: string; ledger: string }> {
+  const runDir = ultragoalRunDir(cwd, runId);
+  if (existsSync(join(runDir, ULTRAGOAL_BRIEF)) && existsSync(ultragoalBriefPath(cwd))) {
+    const canonicalBrief = await readCanonicalRunFile(cwd, join(runDir, ULTRAGOAL_BRIEF));
+    const flatBrief = await readSafeRegularFile(
+      cwd,
+      ultragoalBriefPath(cwd),
+      'active ultragoal projection',
+    );
+    if (canonicalBrief !== flatBrief) {
+      throw new UltragoalError(`Refusing to adopt divergent flat and canonical ultragoal brief for ${runId}.`);
+    }
+  }
+  return {
+    brief: existsSync(join(runDir, ULTRAGOAL_BRIEF))
+      ? await readCanonicalRunFile(cwd, join(runDir, ULTRAGOAL_BRIEF))
+      : (await readOptionalSafeRegularFile(
+          cwd,
+          ultragoalBriefPath(cwd),
+          'active ultragoal projection',
+        )) ?? '',
+    ledger: existsSync(join(runDir, ULTRAGOAL_LEDGER))
+      ? await selectLegacyLedgerProjection(cwd, runId)
+      : await readLedger(cwd, ultragoalLedgerPath(cwd)),
+  };
 }
 
 export async function createUltragoalPlan(cwd: string, options: CreateUltragoalOptions): Promise<UltragoalPlan> {
@@ -1221,7 +2590,13 @@ export async function createUltragoalPlan(cwd: string, options: CreateUltragoalO
   const briefHash = computeUltragoalBriefHash(options.brief);
   const disposition = await resolveRegistryDisposition(cwd, briefHash, options);
   if (disposition.adopt) {
-    const adopted = await adoptExistingPlanForRun(cwd, disposition.adopt.plan, disposition.adopt.migratedStatuses, briefHash, options);
+    const adopted = await adoptExistingPlanForRun(
+      cwd,
+      disposition.adopt.plan,
+      disposition.adopt.migratedStatuses,
+      disposition.adopt.migratedBriefHash,
+      options,
+    );
     return adopted;
   }
   const now = iso(options.now);
@@ -1256,26 +2631,20 @@ export async function createUltragoalPlan(cwd: string, options: CreateUltragoalO
   };
   if (plan.codexGoalMode === 'aggregate') plan.codexObjective = aggregateCodexObjective(candidates);
 
-  await mkdir(ultragoalDir(cwd), { recursive: true });
-  await mkdir(ultragoalRunDir(cwd, runId), { recursive: true });
-  await writeFile(ultragoalBriefPath(cwd), options.brief.endsWith('\n') ? options.brief : `${options.brief}\n`);
-  await writeJsonlAtomic(ultragoalLedgerPath(cwd), '');
-  await writeJsonlAtomic(join(ultragoalRunDir(cwd, runId), ULTRAGOAL_LEDGER), '');
-  await writeActiveRunPointer(cwd, {
-    version: 1,
-    runId,
-    briefHash,
-    updatedAt: now,
-    origin: plan.origin as UltragoalRunOrigin,
-  });
-  await writePlan(cwd, plan);
-  await writeFile(join(ultragoalRunDir(cwd, runId), ULTRAGOAL_BRIEF), options.brief.endsWith('\n') ? options.brief : `${options.brief}\n`);
-  await appendLedger(cwd, {
+  const initialLedger = `${JSON.stringify({
     ts: now,
     event: 'plan_created',
     message: `${candidates.length} goal(s) created in run ${runId}`
       + (disposition.archivedTo ? `; archived previous registry to ${disposition.archivedTo}` : ''),
-  });
+  })}\n`;
+  await publishRunState(
+    cwd,
+    plan,
+    options.brief.endsWith('\n') ? options.brief : `${options.brief}\n`,
+    initialLedger,
+    'create',
+    disposition.archivedRunId,
+  );
   return plan;
   });
 }
@@ -1294,27 +2663,47 @@ export async function adoptUltragoalRun(cwd: string, options: { now?: Date } = {
     if (!loaded) {
       throw new UltragoalError(`Invalid ultragoal registry at ${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS}.`);
     }
-    const { plan: existing, migratedStatuses } = loaded;
+    const { plan: existing, migratedStatuses, migratedBriefHash } = loaded;
     const now = iso(options.now);
     const runId = existing.runId ?? legacyRunIdForPlan(existing);
     const origin: UltragoalRunOrigin = existing.origin ?? { worktreePath: cwd, createdAt: existing.createdAt };
     origin.adoptedWorktreePaths = Array.from(new Set([...(origin.adoptedWorktreePaths ?? []), cwd]));
-    const adopted: UltragoalPlan = { ...existing, runId, origin, updatedAt: now };
-    await reconcileLegacyLedgerProjection(cwd, runId);
-    await writeActiveRunPointer(cwd, {
-      version: 1,
+    const base = await readAdoptionBase(cwd, runId);
+    const adopted: UltragoalPlan = {
+      ...existing,
       runId,
-      briefHash: adopted.briefHash ?? 'unknown',
-      updatedAt: now,
+      briefHash: computeUltragoalBriefHash(base.brief),
       origin,
-    });
-    await writePlan(cwd, adopted);
-    await appendLegacyStatusMigration(cwd, migratedStatuses, now);
-    await appendLedger(cwd, {
+      updatedAt: now,
+    };
+    const entries: UltragoalLedgerEntry[] = [];
+    if (migratedStatuses > 0) {
+      entries.push({
+        ts: now,
+        event: 'plan_migrated',
+        message: `Normalized ${migratedStatuses} legacy completed goal status${migratedStatuses === 1 ? '' : 'es'} to complete.`,
+      });
+    }
+    if (migratedBriefHash) {
+      entries.push({
+        ts: now,
+        event: 'plan_migrated',
+        message: 'Expanded legacy truncated brief hash to full SHA-256.',
+      });
+    }
+    entries.push({
       ts: now,
       event: 'plan_created',
       message: `run ${runId} adopted by worktree ${cwd} (origin ${origin.worktreePath})`,
     });
+    await publishRunState(
+      cwd,
+      adopted,
+      base.brief,
+      entries.reduce((ledger, entry) => `${ledger}${JSON.stringify(entry)}\n`, base.ledger),
+      'update',
+      null,
+    );
     return adopted;
   });
 }
@@ -1328,7 +2717,7 @@ async function adoptExistingPlanForRun(
   cwd: string,
   existing: UltragoalPlan,
   migratedStatuses: number,
-  briefHash: string,
+  migratedBriefHash: boolean,
   options: CreateUltragoalOptions,
 ): Promise<UltragoalPlan> {
   const now = iso(options.now);
@@ -1337,28 +2726,42 @@ async function adoptExistingPlanForRun(
   if (isInheritedOrigin(origin, cwd)) {
     origin.adoptedWorktreePaths = Array.from(new Set([...(origin.adoptedWorktreePaths ?? []), cwd]));
   }
+  const base = await readAdoptionBase(cwd, runId);
   const adopted: UltragoalPlan = {
     ...existing,
     runId,
-    briefHash: existing.briefHash ?? briefHash,
+    briefHash: computeUltragoalBriefHash(base.brief),
     origin,
     updatedAt: now,
   };
-  await reconcileLegacyLedgerProjection(cwd, runId);
-  await writeActiveRunPointer(cwd, {
-    version: 1,
-    runId,
-    briefHash: adopted.briefHash as string,
-    updatedAt: now,
-    origin,
-  });
-  await writePlan(cwd, adopted);
-  await appendLegacyStatusMigration(cwd, migratedStatuses, now);
-  await appendLedger(cwd, {
+  const entries: UltragoalLedgerEntry[] = [];
+  if (migratedStatuses > 0) {
+    entries.push({
+      ts: now,
+      event: 'plan_migrated',
+      message: `Normalized ${migratedStatuses} legacy completed goal status${migratedStatuses === 1 ? '' : 'es'} to complete.`,
+    });
+  }
+  if (migratedBriefHash) {
+    entries.push({
+      ts: now,
+      event: 'plan_migrated',
+      message: 'Expanded legacy truncated brief hash to full SHA-256.',
+    });
+  }
+  entries.push({
     ts: now,
     event: 'plan_created',
     message: `adopted existing ultragoal registry as run ${runId} (${adopted.goals.length} goal(s))`,
   });
+  await publishRunState(
+    cwd,
+    adopted,
+    base.brief,
+    entries.reduce((ledger, entry) => `${ledger}${JSON.stringify(entry)}\n`, base.ledger),
+    'update',
+    null,
+  );
   return adopted;
 }
 
@@ -1435,15 +2838,14 @@ export async function addUltragoalGoal(cwd: string, options: AddUltragoalGoalOpt
   const plan = await readUltragoalPlanUnlocked(cwd);
   const now = iso(options.now);
   const goal = appendGoalToPlan(plan, options);
-  await writePlan(cwd, plan);
-  await appendLedger(cwd, {
+  await publishPlanMutation(cwd, plan, [{
     ts: now,
     event: 'goal_added',
     goalId: goal.id,
     status: goal.status,
     evidence: options.evidence,
     message: goal.title,
-  });
+  }]);
   return { plan, goal };
   });
 }
@@ -1622,9 +3024,10 @@ export const validateSteeringProposal = validateUltragoalSteeringProposal;
 
 async function readSteeringLedgerEntries(cwd: string): Promise<UltragoalLedgerEntry[]> {
   try {
-    const raw = await readFile(ultragoalLedgerPath(cwd), 'utf-8');
+    const raw = await readSafeRegularFile(cwd, ultragoalLedgerPath(cwd), 'active ultragoal projection');
     return raw.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as UltragoalLedgerEntry);
-  } catch {
+  } catch (error) {
+    if (error instanceof UltragoalError) throw error;
     return [];
   }
 }
@@ -1759,8 +3162,7 @@ export async function steerUltragoal(cwd: string, proposal: UltragoalSteeringPro
     idempotencyKey: proposal.idempotencyKey,
   };
 
-  if (invariant.accepted) await writePlan(cwd, plan);
-  await appendLedger(cwd, {
+  const entry: UltragoalLedgerEntry = {
     ts: now,
     event: invariant.accepted ? 'steering_accepted' : 'steering_rejected',
     goalId: proposalTargetIds(proposal)[0],
@@ -1770,7 +3172,9 @@ export async function steerUltragoal(cwd: string, proposal: UltragoalSteeringPro
     mutationKind: proposal.kind,
     before: audit.before,
     after: audit.after,
-  });
+  };
+  if (invariant.accepted) await publishPlanMutation(cwd, plan, [entry]);
+  else await appendLedger(cwd, entry, plan.runId);
 
   return { plan, accepted: invariant.accepted, audit, rejectedReasons: invariant.rejectedReasons, deduped: false };
   });
@@ -1881,7 +3285,9 @@ function extractArchitectureInvariantsFromAcceptedSteering(entries: readonly Ult
 }
 
 async function collectRequiredArchitectureInvariants(cwd: string): Promise<RequiredArchitectureInvariant[]> {
-  const briefInvariants = extractArchitectureInvariantsFromBrief(await readFile(ultragoalBriefPath(cwd), 'utf-8'));
+  const briefInvariants = extractArchitectureInvariantsFromBrief(
+    await readSafeRegularFile(cwd, ultragoalBriefPath(cwd), 'active ultragoal projection'),
+  );
   const steeringInvariants = extractArchitectureInvariantsFromAcceptedSteering(await readSteeringLedgerEntries(cwd));
   return uniqueRequiredArchitectureInvariants([...briefInvariants, ...steeringInvariants]);
 }
@@ -1996,14 +3402,19 @@ export async function startNextUltragoal(cwd: string, options: StartNextOptions 
   if (plan.aggregateCompletion?.status === 'complete') return { plan, goal: null, resumed: false, done: true };
   const existing = plan.goals.find((goal) => goal.status === 'in_progress' && isScheduleEligibleGoal(goal));
   if (existing) {
-    await appendLedger(cwd, { ts: now, event: 'goal_resumed', goalId: existing.id, status: existing.status, message: 'Resuming active ultragoal' });
+    await appendLedger(
+      cwd,
+      { ts: now, event: 'goal_resumed', goalId: existing.id, status: existing.status, message: 'Resuming active ultragoal' },
+      plan.runId,
+    );
     return { plan, goal: existing, resumed: true, done: false };
   }
 
   let next = plan.goals.find((goal) => goal.status === 'pending' && isScheduleEligible(goal));
+  const entries: UltragoalLedgerEntry[] = [];
   if (!next && options.retryFailed) {
     next = plan.goals.find((goal) => goal.status === 'failed' && !goal.nonRetriable && isScheduleEligible(goal));
-    if (next) await appendLedger(cwd, { ts: now, event: 'goal_retried', goalId: next.id, status: 'pending', message: next.failureReason });
+    if (next) entries.push({ ts: now, event: 'goal_retried', goalId: next.id, status: 'pending', message: next.failureReason });
   }
   if (!next) return { plan, goal: null, resumed: false, done: isUltragoalDone(plan) };
 
@@ -2016,8 +3427,8 @@ export async function startNextUltragoal(cwd: string, options: StartNextOptions 
   next.updatedAt = now;
   plan.activeGoalId = next.id;
   plan.updatedAt = now;
-  await writePlan(cwd, plan);
-  await appendLedger(cwd, { ts: now, event: 'goal_started', goalId: next.id, status: next.status, message: `Attempt ${next.attempt}` });
+  entries.push({ ts: now, event: 'goal_started', goalId: next.id, status: next.status, message: `Attempt ${next.attempt}` });
+  await publishPlanMutation(cwd, plan, entries);
   return { plan, goal: next, resumed: false, done: false };
   });
 }
@@ -2038,8 +3449,7 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
       goal.failureReason = assertNonEmpty(options.evidence, '--evidence');
       plan.activeGoalId = goal.id;
       plan.updatedAt = now;
-      await writePlan(cwd, plan);
-      await appendLedger(cwd, {
+      await publishPlanMutation(cwd, plan, [{
         ts: now,
         event: 'goal_blocked',
         goalId: goal.id,
@@ -2047,7 +3457,7 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
         evidence: options.evidence,
         codexGoal: options.codexGoal,
         message: 'Codex get_goal was unavailable due to a DB/schema/context error; strict completion reconciliation is deferred until get_goal works.',
-      });
+      }]);
       return plan;
     }
     if (!snapshot?.available) {
@@ -2069,8 +3479,7 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
     if (safeCompletedAggregateBlocker) goal.failureReason = assertNonEmpty(options.evidence, '--evidence');
     plan.activeGoalId = goal.id;
     plan.updatedAt = now;
-    await writePlan(cwd, plan);
-    await appendLedger(cwd, {
+    await publishPlanMutation(cwd, plan, [{
       ts: now,
       event: 'goal_blocked',
       goalId: goal.id,
@@ -2080,7 +3489,7 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
       message: safeCompletedAggregateBlocker
         ? 'Completed aggregate Codex goal is already terminal while the repo-native microgoal remains in progress; recorded a non-terminal safe-recovery blocker to avoid repeating an impossible checkpoint loop.'
         : undefined,
-    });
+    }]);
     return plan;
   }
   let aggregateCompletion: UltragoalAggregateCompletion | undefined;
@@ -2175,27 +3584,28 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
     plan.aggregateCompletion = aggregateCompletion;
     if (plan.activeGoalId === goal.id) delete plan.activeGoalId;
     plan.updatedAt = now;
-    await writePlan(cwd, plan);
-    await appendLedger(cwd, {
-      ts: now,
-      event: 'goal_completed',
-      goalId: goal.id,
-      status: goal.status,
-      evidence: options.evidence,
-      codexGoal: options.codexGoal,
-      qualityGate,
-      message: 'Active repo-native microgoal completed while reconciling a completed task-scoped aggregate Codex goal snapshot.',
-    });
-    await appendLedger(cwd, {
-      ts: now,
-      event: 'aggregate_completed',
-      goalId: goal.id,
-      status: goal.status,
-      evidence: options.evidence,
-      codexGoal: options.codexGoal,
-      qualityGate,
-      message: 'Aggregate ultragoal plan completed via task-scoped Codex goal snapshot; checkpointed active microgoal row was reconciled to complete.',
-    });
+    await publishPlanMutation(cwd, plan, [
+      {
+        ts: now,
+        event: 'goal_completed',
+        goalId: goal.id,
+        status: goal.status,
+        evidence: options.evidence,
+        codexGoal: options.codexGoal,
+        qualityGate,
+        message: 'Active repo-native microgoal completed while reconciling a completed task-scoped aggregate Codex goal snapshot.',
+      },
+      {
+        ts: now,
+        event: 'aggregate_completed',
+        goalId: goal.id,
+        status: goal.status,
+        evidence: options.evidence,
+        codexGoal: options.codexGoal,
+        qualityGate,
+        message: 'Aggregate ultragoal plan completed via task-scoped Codex goal snapshot; checkpointed active microgoal row was reconciled to complete.',
+      },
+    ]);
     return plan;
   }
   goal.status = options.status;
@@ -2241,9 +3651,8 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
     if (plan.activeGoalId === goal.id) delete plan.activeGoalId;
   }
   plan.updatedAt = now;
-  await writePlan(cwd, plan);
   const blockerEvent = goal.status === 'needs_user_decision';
-  await appendLedger(cwd, {
+  const entries: UltragoalLedgerEntry[] = [{
     ts: now,
     event: options.status === 'complete' ? 'goal_completed' : blockerEvent ? 'goal_needs_user_decision' : 'goal_failed',
     goalId: goal.id,
@@ -2257,11 +3666,11 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
     message: blockerEvent
       ? `Blocked on repeated external authorization. Required decision: ${goal.requiredExternalDecision}.`
       : undefined,
-  });
+  }];
   if (options.status === 'complete' && goal.resolvesReviewBlockedGoalId) {
     const resolvedParent = plan.goals.find((candidate) => candidate.id === goal.resolvesReviewBlockedGoalId);
     if (resolvedParent?.reviewBlockerResolution?.status === 'complete' && resolvedParent.reviewBlockerResolution.resolverGoalId === goal.id) {
-      await appendLedger(cwd, {
+      entries.push({
         ts: now,
         event: 'goal_completed',
         goalId: resolvedParent.id,
@@ -2274,7 +3683,7 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
     }
   }
   if (normalFinalAggregateCompletion) {
-    await appendLedger(cwd, {
+    entries.push({
       ts: now,
       event: 'aggregate_completed',
       goalId: goal.id,
@@ -2285,6 +3694,7 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
       message: 'Aggregate ultragoal plan completed with a clean final quality gate.',
     });
   }
+  await publishPlanMutation(cwd, plan, entries);
   return plan;
   });
 }
@@ -2324,15 +3734,14 @@ export async function recordFinalReviewBlockers(cwd: string, options: RecordFina
     const recaptureGoal = appendGoalToPlan(plan, { ...options, now: options.now });
     goal.updatedAt = now;
     plan.updatedAt = now;
-    await writePlan(cwd, plan);
-    await appendLedger(cwd, {
+    await publishPlanMutation(cwd, plan, [{
       ts: now,
       event: 'goal_added',
       goalId: recaptureGoal.id,
       status: recaptureGoal.status,
       evidence: options.evidence,
       message: `Final review reported stale evidence against the repaired state; appended evidence re-capture story ${recaptureGoal.id} and left ${goal.id} in progress instead of a full review-block round-trip.`,
-    });
+    }]);
     return { plan, blockedGoal: goal, addedGoal: recaptureGoal };
   }
 
@@ -2352,34 +3761,35 @@ export async function recordFinalReviewBlockers(cwd: string, options: RecordFina
   if (plan.activeGoalId === goal.id) delete plan.activeGoalId;
   plan.updatedAt = now;
 
-  await writePlan(cwd, plan);
-  await appendLedger(cwd, {
-    ts: now,
-    event: 'final_review_failed',
-    goalId: goal.id,
-    status: goal.status,
-    evidence: options.evidence,
-    codexGoal: options.codexGoal,
-    message: aggregateMode
-      ? 'Final aggregate code-review was not clean; blocker story was appended while Codex goal remains active.'
-      : 'Final per-story code-review was not clean; blocker story was appended and may require an available Codex goal context.',
-  });
-  await appendLedger(cwd, {
-    ts: now,
-    event: 'goal_added',
-    goalId: addedGoal.id,
-    status: addedGoal.status,
-    evidence: options.evidence,
-    message: addedGoal.title,
-  });
-  await appendLedger(cwd, {
-    ts: now,
-    event: 'goal_review_blocked',
-    goalId: goal.id,
-    status: goal.status,
-    evidence: options.evidence,
-    codexGoal: options.codexGoal,
-  });
+  await publishPlanMutation(cwd, plan, [
+    {
+      ts: now,
+      event: 'final_review_failed',
+      goalId: goal.id,
+      status: goal.status,
+      evidence: options.evidence,
+      codexGoal: options.codexGoal,
+      message: aggregateMode
+        ? 'Final aggregate code-review was not clean; blocker story was appended while Codex goal remains active.'
+        : 'Final per-story code-review was not clean; blocker story was appended and may require an available Codex goal context.',
+    },
+    {
+      ts: now,
+      event: 'goal_added',
+      goalId: addedGoal.id,
+      status: addedGoal.status,
+      evidence: options.evidence,
+      message: addedGoal.title,
+    },
+    {
+      ts: now,
+      event: 'goal_review_blocked',
+      goalId: goal.id,
+      status: goal.status,
+      evidence: options.evidence,
+      codexGoal: options.codexGoal,
+    },
+  ]);
   return { plan, blockedGoal: goal, addedGoal };
   });
 }

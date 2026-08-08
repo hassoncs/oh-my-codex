@@ -7,8 +7,9 @@
  * document that can be read from OUTSIDE the session, by path.
  */
 
-import { existsSync } from 'node:fs';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { constants, existsSync, type Stats } from 'node:fs';
+import { lstat, open, readFile, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { isInheritedOrigin, isRegistryGitTracked, type UltragoalRunOrigin } from '../ultragoal/registry.js';
 
@@ -89,6 +90,8 @@ const CHECKPOINT_EVENTS = new Set([
   'goal_needs_user_decision',
   'aggregate_completed',
 ]);
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const RUN_ID_PATTERN = /^(?:run|legacy)-[A-Za-z0-9._-]+$/;
 
 async function readJson<T>(path: string): Promise<T | null> {
   try {
@@ -104,6 +107,171 @@ function optionalString(value: unknown): string | null {
 
 function optionalNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasRunFileDigests(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return (
+    Object.keys(value).length === 3
+    && SHA256_PATTERN.test(String(value.brief))
+    && SHA256_PATTERN.test(String(value.goals))
+    && SHA256_PATTERN.test(String(value.ledger))
+  );
+}
+
+function hasRunOrigin(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return (
+    optionalString(value.worktreePath) !== null
+    && optionalString(value.createdAt) !== null
+    && (
+      value.adoptedWorktreePaths === undefined
+      || (
+        Array.isArray(value.adoptedWorktreePaths)
+        && value.adoptedWorktreePaths.every((path) => optionalString(path) !== null)
+      )
+    )
+  );
+}
+
+function sameRunOrigin(left: unknown, right: unknown): boolean {
+  if (!hasRunOrigin(left) || !hasRunOrigin(right)) return false;
+  const leftOrigin = left as Record<string, unknown>;
+  const rightOrigin = right as Record<string, unknown>;
+  const leftAdopted = (leftOrigin.adoptedWorktreePaths as string[] | undefined) ?? [];
+  const rightAdopted = (rightOrigin.adoptedWorktreePaths as string[] | undefined) ?? [];
+  return (
+    leftOrigin.worktreePath === rightOrigin.worktreePath
+    && leftOrigin.createdAt === rightOrigin.createdAt
+    && leftAdopted.length === rightAdopted.length
+    && leftAdopted.every((path, index) => path === rightAdopted[index])
+  );
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value, 'utf-8').digest('hex');
+}
+
+function isValidLedgerTransaction(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return (
+    value.version === 1
+    && RUN_ID_PATTERN.test(String(value.runId))
+    && typeof value.line === 'string'
+    && value.line.endsWith('\n')
+    && SHA256_PATTERN.test(String(value.baseSha256))
+    && SHA256_PATTERN.test(String(value.nextSha256))
+  );
+}
+
+function isValidRunTransaction(value: unknown): boolean {
+  if (!isRecord(value) || !isRecord(value.pointer)) return false;
+  const archive = value.archive;
+  const before = value.before;
+  return (
+    value.version === 1
+    && (value.mode === undefined || value.mode === 'create' || value.mode === 'update')
+    && RUN_ID_PATTERN.test(String(value.runId))
+    && value.pointer.version === 1
+    && value.pointer.runId === value.runId
+    && SHA256_PATTERN.test(String(value.pointer.briefHash))
+    && optionalString(value.pointer.updatedAt) !== null
+    && hasRunOrigin(value.pointer.origin)
+    && hasRunFileDigests(value.files)
+    && isRecord(before)
+    && hasRunFileStates(before.run)
+    && hasRunFileStates(before.projection)
+    && (
+      before.pointerSha256 === null
+      || SHA256_PATTERN.test(String(before.pointerSha256))
+    )
+    && (
+      archive === undefined
+      || (
+        isRecord(archive)
+        && RUN_ID_PATTERN.test(String(archive.runId))
+        && archive.runId !== value.runId
+        && hasRunFileDigests(archive.files)
+      )
+    )
+  );
+}
+
+function hasRunFileStates(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return (
+    Object.keys(value).length === 3
+    && [value.brief, value.goals, value.ledger].every(
+      (digest) => digest === null || SHA256_PATTERN.test(String(digest)),
+    )
+  );
+}
+
+function isValidActiveRunPointer(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return (
+    value.version === 1
+    && RUN_ID_PATTERN.test(String(value.runId))
+    && SHA256_PATTERN.test(String(value.briefHash))
+    && optionalString(value.updatedAt) !== null
+    && hasRunOrigin(value.origin)
+    && hasRunFileDigests(value.files)
+  );
+}
+
+async function readSafeUltragoalFile(path: string): Promise<string> {
+  const before = await lstat(path);
+  assertSafeUltragoalFile(before);
+  const flags = process.platform === 'win32'
+    ? constants.O_RDONLY
+    : constants.O_RDONLY | constants.O_NOFOLLOW;
+  const handle = await open(path, flags);
+  try {
+    const opened = await handle.stat();
+    assertSafeUltragoalFile(opened);
+    if (opened.dev !== before.dev || opened.ino !== before.ino) {
+      throw new Error('transaction journal was replaced while reading');
+    }
+    return await handle.readFile({ encoding: 'utf-8' });
+  } finally {
+    await handle.close();
+  }
+}
+
+function assertSafeUltragoalFile(file: Stats): void {
+  if (!file.isFile() || file.isSymbolicLink() || file.nlink !== 1) {
+    throw new Error('unsafe transaction journal');
+  }
+}
+
+async function readOptionalSafeUltragoalFile(path: string): Promise<string | null> {
+  try {
+    return await readSafeUltragoalFile(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function inspectTransactionJournals(
+  transactions: Array<{ path: string; validate: (value: unknown) => boolean }>,
+): Promise<{ invalid: boolean; present: boolean }> {
+  let present = false;
+  for (const transaction of transactions) {
+    try {
+      const parsed = JSON.parse(await readSafeUltragoalFile(transaction.path)) as unknown;
+      present = true;
+      if (!transaction.validate(parsed)) return { invalid: true, present: true };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      return { invalid: true, present: true };
+    }
+  }
+  return { invalid: false, present };
 }
 
 async function collectModeStateFiles(stateDir: string, sessionId: string | null): Promise<SupervisionModeStatus[]> {
@@ -148,11 +316,9 @@ function toLedgerEntry(raw: Record<string, unknown>): SupervisionLedgerEntry {
   };
 }
 
-async function readLedgerTail(path: string): Promise<{ last: SupervisionLedgerEntry | null; lastCheckpoint: SupervisionLedgerEntry | null }> {
-  if (!existsSync(path)) return { last: null, lastCheckpoint: null };
+function parseLedgerTail(contents: string): { last: SupervisionLedgerEntry | null; lastCheckpoint: SupervisionLedgerEntry | null } {
   let last: SupervisionLedgerEntry | null = null;
   let lastCheckpoint: SupervisionLedgerEntry | null = null;
-  const contents = await readFile(path, 'utf-8').catch(() => '');
   for (const line of contents.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -178,30 +344,161 @@ async function collectUltragoal(cwd: string): Promise<SupervisionUltragoalStatus
   const goalsPath = join(dir, 'goals.json');
   const ledgerPath = join(dir, 'ledger.jsonl');
   const activeRunPath = join(dir, 'active-run.json');
-  if (!existsSync(goalsPath)) return null;
+  const failedStatus = (
+    error: string,
+    lastCheckpoint: SupervisionLedgerEntry | null = null,
+    lastLedgerEntry: SupervisionLedgerEntry | null = null,
+  ): SupervisionUltragoalStatus => ({
+    present: true,
+    runId: null,
+    briefHash: null,
+    origin: { worktreePath: null, inherited: false, deliveredViaGit: false },
+    activeGoalId: null,
+    aggregateComplete: false,
+    counts: {},
+    goals: [],
+    lastCheckpoint,
+    lastLedgerEntry,
+    paths: { goals: goalsPath, ledger: ledgerPath, activeRun: activeRunPath, runDir: null },
+    error,
+  });
+  try {
+    const directory = await lstat(dir);
+    if (!directory.isDirectory() || directory.isSymbolicLink()) {
+      return failedStatus('unsafe ultragoal registry directory');
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    return failedStatus('unsafe ultragoal registry directory');
+  }
 
-  const plan = await readJson<Record<string, unknown>>(goalsPath);
-  const ledger = await readLedgerTail(ledgerPath);
+  const transactions = [
+    { path: join(dir, '.ledger-transaction.json'), validate: isValidLedgerTransaction },
+    { path: join(dir, '.run-transaction.json'), validate: isValidRunTransaction },
+  ];
+  let goalsRaw: string | null = null;
+  let briefRaw: string | null = null;
+  let ledgerRaw: string | null = null;
+  let pointerRaw: string | null = null;
+  let stable = false;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const beforeTransactions = await inspectTransactionJournals(transactions);
+    if (beforeTransactions.invalid) {
+      return failedStatus('invalid ultragoal transaction journal');
+    }
+    if (beforeTransactions.present) continue;
+    try {
+      [briefRaw, goalsRaw, ledgerRaw, pointerRaw] = await Promise.all([
+        readOptionalSafeUltragoalFile(join(dir, 'brief.md')),
+        readOptionalSafeUltragoalFile(goalsPath),
+        readOptionalSafeUltragoalFile(ledgerPath),
+        readOptionalSafeUltragoalFile(activeRunPath),
+      ]);
+    } catch {
+      return failedStatus('unsafe ultragoal registry object');
+    }
+    const afterTransactions = await inspectTransactionJournals(transactions);
+    if (afterTransactions.invalid) {
+      return failedStatus('invalid ultragoal transaction journal');
+    }
+    if (afterTransactions.present) continue;
+    let confirm: Array<string | null>;
+    try {
+      confirm = await Promise.all([
+        readOptionalSafeUltragoalFile(join(dir, 'brief.md')),
+        readOptionalSafeUltragoalFile(goalsPath),
+        readOptionalSafeUltragoalFile(ledgerPath),
+        readOptionalSafeUltragoalFile(activeRunPath),
+      ]);
+    } catch {
+      return failedStatus('unsafe ultragoal registry object');
+    }
+    if (
+      briefRaw === confirm[0]
+      && goalsRaw === confirm[1]
+      && ledgerRaw === confirm[2]
+      && pointerRaw === confirm[3]
+    ) {
+      stable = true;
+      break;
+    }
+  }
+  if (!stable) {
+    return failedStatus('ultragoal registry transaction in progress');
+  }
+  if (goalsRaw === null) return null;
+
+  let plan: Record<string, unknown> | null = null;
+  try {
+    plan = JSON.parse(goalsRaw) as Record<string, unknown>;
+  } catch {
+    // Malformed snapshots are reported below.
+  }
+  const ledger = parseLedgerTail(ledgerRaw ?? '');
   if (!plan || !Array.isArray(plan.goals)) {
-    return {
-      present: true,
-      runId: null,
-      briefHash: null,
-      origin: { worktreePath: null, inherited: false, deliveredViaGit: false },
-      activeGoalId: null,
-      aggregateComplete: false,
-      counts: {},
-      goals: [],
-      lastCheckpoint: ledger.lastCheckpoint,
-      lastLedgerEntry: ledger.last,
-      paths: { goals: goalsPath, ledger: ledgerPath, activeRun: activeRunPath, runDir: null },
-      error: 'malformed goal registry',
-    };
+    return failedStatus('malformed goal registry', ledger.lastCheckpoint, ledger.last);
+  }
+
+  const runId = optionalString(plan.runId);
+  if (runId) {
+    if (briefRaw === null || ledgerRaw === null || pointerRaw === null) {
+      return failedStatus('missing active ultragoal projection', ledger.lastCheckpoint, ledger.last);
+    }
+    let pointer: Record<string, unknown>;
+    try {
+      pointer = JSON.parse(pointerRaw) as Record<string, unknown>;
+    } catch {
+      return failedStatus('invalid ultragoal active-run pointer', ledger.lastCheckpoint, ledger.last);
+    }
+    if (
+      !isValidActiveRunPointer(pointer)
+      || pointer.runId !== runId
+      || pointer.briefHash !== plan.briefHash
+      || pointer.updatedAt !== plan.updatedAt
+      || !sameRunOrigin(pointer.origin, plan.origin)
+    ) {
+      return failedStatus('invalid ultragoal active-run pointer authority', ledger.lastCheckpoint, ledger.last);
+    }
+    const runDir = join(dir, 'runs', runId);
+    try {
+      const runsStat = await lstat(join(dir, 'runs'));
+      const runStat = await lstat(runDir);
+      if (
+        !runsStat.isDirectory()
+        || runsStat.isSymbolicLink()
+        || !runStat.isDirectory()
+        || runStat.isSymbolicLink()
+      ) {
+        return failedStatus('unsafe ultragoal registry object', ledger.lastCheckpoint, ledger.last);
+      }
+      const [canonicalBrief, canonicalGoals, canonicalLedger] = await Promise.all([
+        readSafeUltragoalFile(join(runDir, 'brief.md')),
+        readSafeUltragoalFile(join(runDir, 'goals.json')),
+        readSafeUltragoalFile(join(runDir, 'ledger.jsonl')),
+      ]);
+      const files = pointer.files as Record<string, string>;
+      if (
+        sha256(canonicalBrief) !== files.brief
+        || sha256(canonicalGoals) !== files.goals
+        || sha256(canonicalLedger) !== files.ledger
+        || sha256(briefRaw) !== files.brief
+        || sha256(goalsRaw) !== files.goals
+        || sha256(ledgerRaw) !== files.ledger
+        || canonicalBrief !== briefRaw
+        || canonicalGoals !== goalsRaw
+        || canonicalLedger !== ledgerRaw
+      ) {
+        return failedStatus('divergent ultragoal pointer, canonical run, or projection', ledger.lastCheckpoint, ledger.last);
+      }
+    } catch {
+      return failedStatus('unsafe or missing canonical ultragoal run', ledger.lastCheckpoint, ledger.last);
+    }
+  } else if (pointerRaw !== null) {
+    return failedStatus('unexpected ultragoal active-run pointer', ledger.lastCheckpoint, ledger.last);
   }
 
   const origin = plan.origin as UltragoalRunOrigin | undefined;
   const deliveredViaGit = isInheritedOrigin(origin, cwd) ? await isRegistryGitTracked(cwd) : false;
-  const runId = optionalString(plan.runId);
   const goals: SupervisionGoalStatus[] = (plan.goals as Array<Record<string, unknown>>).map((goal) => ({
     id: optionalString(goal.id) ?? 'unknown',
     title: optionalString(goal.title) ?? '',

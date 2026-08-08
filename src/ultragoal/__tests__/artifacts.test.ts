@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -20,7 +21,12 @@ import {
   type UltragoalPlan,
   type UltragoalSteeringProposal,
 } from '../artifacts.js';
-import { legacyRunIdForPlan, ultragoalRunDir } from '../registry.js';
+import {
+  legacyRunIdForPlan,
+  readActiveRunPointer,
+  ultragoalRunDir,
+  writeActiveRunPointer,
+} from '../registry.js';
 import { LEADER_CONDUCTOR_BLOCK, buildUnsupportedNativeSubagentGuidance } from '../../leader/contract.js';
 import { steeringFixtures, type SteeringFixtureProposal } from './steering-fixtures.js';
 
@@ -65,6 +71,28 @@ async function writeFixturePlan(cwd: string, plan: UltragoalPlan): Promise<void>
   await writeFile(join(cwd, '.omx/ultragoal/brief.md'), 'G001-core-steering-model fixture for .omx/ultragoal steering behavior.\n');
   await writeFile(join(cwd, '.omx/ultragoal/goals.json'), `${JSON.stringify(plan, null, 2)}\n`);
   await writeFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), '');
+}
+
+async function writeGoalsProjections(cwd: string, plan: UltragoalPlan): Promise<void> {
+  const contents = `${JSON.stringify(plan, null, 2)}\n`;
+  await writeFile(join(cwd, '.omx/ultragoal/goals.json'), contents);
+  if (plan.runId) {
+    const runDir = ultragoalRunDir(cwd, plan.runId);
+    await writeFile(join(runDir, 'goals.json'), contents);
+    const pointer = await readActiveRunPointer(cwd);
+    if (pointer?.runId === plan.runId) {
+      const digest = (value: string) => createHash('sha256').update(value, 'utf-8').digest('hex');
+      await writeActiveRunPointer(cwd, {
+        ...pointer,
+        updatedAt: plan.updatedAt,
+        files: {
+          brief: digest(await readFile(join(runDir, 'brief.md'), 'utf-8')),
+          goals: digest(contents),
+          ledger: digest(await readFile(join(runDir, 'ledger.jsonl'), 'utf-8')),
+        },
+      });
+    }
+  }
 }
 
 function asChildGoals(after: unknown): Array<{ title: string; objective: string }> | undefined {
@@ -648,7 +676,7 @@ describe('ultragoal artifacts', () => {
       });
       delete created.codexGoalMode;
       delete created.codexObjective;
-      await writeFile(join(cwd, '.omx/ultragoal/goals.json'), `${JSON.stringify(created, null, 2)}\n`);
+      await writeGoalsProjections(cwd, created);
 
       const first = await startNextUltragoal(cwd);
       const instruction = buildCodexGoalInstruction(first.goal!, first.plan);
@@ -884,7 +912,7 @@ describe('ultragoal artifacts', () => {
       const planPath = join(cwd, '.omx/ultragoal/goals.json');
       const legacyPlan = JSON.parse(await readFile(planPath, 'utf-8')) as UltragoalPlan;
       legacyPlan.codexObjective = legacyObjective;
-      await writeFile(planPath, `${JSON.stringify(legacyPlan, null, 2)}\n`);
+      await writeGoalsProjections(cwd, legacyPlan);
 
       const first = await startNextUltragoal(cwd);
       const checkpointed = await checkpointUltragoal(cwd, {
@@ -1078,7 +1106,7 @@ describe('ultragoal artifacts', () => {
         resolvesReviewBlockedGoalId: blocked.blockedGoal.id,
       });
       tampered.activeGoalId = 'G999-forged-resolver';
-      await writeFile(planPath, `${JSON.stringify(tampered, null, 2)}\n`);
+      await writeGoalsProjections(cwd, tampered);
 
       const completed = await checkpointUltragoal(cwd, {
         goalId: 'G999-forged-resolver',
@@ -1128,7 +1156,7 @@ describe('ultragoal artifacts', () => {
         resolvesReviewBlockedGoalId: blocked.blockedGoal.id,
       });
       tampered.activeGoalId = 'G999-forged-resolver';
-      await writeFile(planPath, `${JSON.stringify(tampered, null, 2)}\n`);
+      await writeGoalsProjections(cwd, tampered);
 
       await assert.rejects(
         () => checkpointUltragoal(cwd, {
