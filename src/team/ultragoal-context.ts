@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
@@ -10,6 +10,13 @@ export interface UltragoalTeamContext {
   ledgerPath: '.omx/ultragoal/ledger.jsonl';
   activeGoalId: string;
   activeGoalTitle?: string;
+  /**
+   * Planning slug (`prd-<slug>.md`) this ultragoal run was created from, when a
+   * plan existed. It is what binds the run to one plan's DAG: without it a team
+   * nested under ultragoal could inherit lanes from whatever plan happens to be
+   * newest in `.omx/plans`, which is a different task's file scope.
+   */
+  planSlug?: string;
   codexGoalMode: 'aggregate' | 'per_story';
   checkpointPolicy: 'fresh_leader_get_goal_required';
 }
@@ -99,12 +106,16 @@ export function normalizeUltragoalTeamContext(value: unknown): UltragoalTeamCont
   const activeGoalTitle = typeof raw.activeGoalTitle === 'string' && raw.activeGoalTitle.trim() !== ''
     ? raw.activeGoalTitle.trim()
     : undefined;
+  const planSlug = typeof raw.planSlug === 'string' && raw.planSlug.trim() !== ''
+    ? raw.planSlug.trim()
+    : undefined;
   return {
     kind: 'leader_owned_ultragoal_context',
     goalsPath: '.omx/ultragoal/goals.json',
     ledgerPath: '.omx/ultragoal/ledger.jsonl',
     activeGoalId,
     ...(activeGoalTitle ? { activeGoalTitle } : {}),
+    ...(planSlug ? { planSlug } : {}),
     codexGoalMode: normalizeCodexGoalMode(raw.codexGoalMode),
     checkpointPolicy: 'fresh_leader_get_goal_required',
   };
@@ -121,12 +132,20 @@ function warning(code: UltragoalContextResolutionStatus, message: string): Ultra
   return { status: code, context: null, warning: { code, message } };
 }
 
-export async function resolveLeaderOwnedUltragoalContextOutcome(cwd: string): Promise<UltragoalContextResolution> {
-  const goalsJsonPath = join(cwd, '.omx', 'ultragoal', 'goals.json');
-  if (!existsSync(goalsJsonPath)) return { status: 'missing', context: null };
+function goalsJsonPathFor(cwd: string): string {
+  return join(cwd, '.omx', 'ultragoal', 'goals.json');
+}
 
+/**
+ * One evaluator behind both the async and sync readers. The sync twin exists
+ * because `parseTeamArgs` is synchronous and has to know whether a team launch
+ * is happening inside a leader-owned ultragoal run; two hand-written copies of
+ * this decision would drift, and the drift would be invisible (both would still
+ * return a plausible verdict).
+ */
+export function evaluateLeaderOwnedUltragoalContext(goalsJsonText: string): UltragoalContextResolution {
   try {
-    const parsed = JSON.parse(await readFile(goalsJsonPath, 'utf-8')) as Record<string, unknown>;
+    const parsed = JSON.parse(goalsJsonText) as Record<string, unknown>;
     const activeGoalId = typeof parsed.activeGoalId === 'string' ? parsed.activeGoalId.trim() : '';
     if (activeGoalId === '') {
       return { status: 'missing', context: null };
@@ -150,12 +169,16 @@ export async function resolveLeaderOwnedUltragoalContextOutcome(cwd: string): Pr
     const activeGoalTitle = typeof activeGoal?.title === 'string' && activeGoal.title.trim() !== ''
       ? activeGoal.title.trim()
       : undefined;
+    const planSlug = typeof parsed.planSlug === 'string' && parsed.planSlug.trim() !== ''
+      ? parsed.planSlug.trim()
+      : undefined;
     const context: UltragoalTeamContext = {
       kind: 'leader_owned_ultragoal_context',
       goalsPath: '.omx/ultragoal/goals.json',
       ledgerPath: '.omx/ultragoal/ledger.jsonl',
       activeGoalId,
       ...(activeGoalTitle ? { activeGoalTitle } : {}),
+      ...(planSlug ? { planSlug } : {}),
       codexGoalMode: resolvePlanCodexGoalMode(parsed.codexGoalMode),
       checkpointPolicy: 'fresh_leader_get_goal_required',
     };
@@ -165,6 +188,22 @@ export async function resolveLeaderOwnedUltragoalContextOutcome(cwd: string): Pr
       return warning('malformed', error.message);
     }
     return warning('malformed', 'malformed_goals_json');
+  }
+}
+
+export async function resolveLeaderOwnedUltragoalContextOutcome(cwd: string): Promise<UltragoalContextResolution> {
+  const goalsJsonPath = goalsJsonPathFor(cwd);
+  if (!existsSync(goalsJsonPath)) return { status: 'missing', context: null };
+  return evaluateLeaderOwnedUltragoalContext(await readFile(goalsJsonPath, 'utf-8'));
+}
+
+export function resolveLeaderOwnedUltragoalContextOutcomeSync(cwd: string): UltragoalContextResolution {
+  const goalsJsonPath = goalsJsonPathFor(cwd);
+  if (!existsSync(goalsJsonPath)) return { status: 'missing', context: null };
+  try {
+    return evaluateLeaderOwnedUltragoalContext(readFileSync(goalsJsonPath, 'utf-8'));
+  } catch {
+    return warning('malformed', 'unreadable_goals_json');
   }
 }
 

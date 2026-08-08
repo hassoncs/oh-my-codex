@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { appendFile, mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
+import { readTeamDagArtifactResolution } from '../planning/artifacts.js';
 import {
   formatCodexGoalReconciliation,
   buildCompletedCodexGoalRemediation,
@@ -199,6 +200,14 @@ export interface UltragoalPlan {
   runId?: string;
   /** Stable hash of the brief this run was created from. */
   briefHash?: string;
+  /**
+   * Planning slug (`prd-<slug>.md`) that was current when this run was created.
+   * It binds the run to one plan so a team nested beneath it can inherit that
+   * plan's DAG lanes — file-scoped and dependency-ordered — instead of lanes
+   * split out of the task string. Absent when the run was created with no plan
+   * in `.omx/plans`, and an absent slug never unlocks a DAG.
+   */
+  planSlug?: string;
   /** Worktree that created this run, plus any that explicitly adopted it. */
   origin?: UltragoalRunOrigin;
   briefPath: string;
@@ -1091,12 +1100,17 @@ export async function createUltragoalPlan(cwd: string, options: CreateUltragoalO
     }));
 
   const runId = buildUltragoalRunId(briefHash, options.now ?? new Date());
+  // Only a plan that actually carries a team DAG is worth binding: a slug with no
+  // DAG behind it would unlock nothing and only make the binding look load-bearing.
+  const planDag = readTeamDagArtifactResolution(cwd);
+  const planSlug = planDag.source !== 'none' && planDag.planSlug ? planDag.planSlug : undefined;
   const plan: UltragoalPlan = {
     version: 1,
     createdAt: now,
     updatedAt: now,
     runId,
     briefHash,
+    ...(planSlug ? { planSlug } : {}),
     origin: { worktreePath: cwd, createdAt: now },
     briefPath: `${ULTRAGOAL_DIR}/${ULTRAGOAL_BRIEF}`,
     goalsPath: `${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS}`,

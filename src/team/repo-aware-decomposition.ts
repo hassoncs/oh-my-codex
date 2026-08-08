@@ -68,6 +68,17 @@ export interface RepoAwareTeamExecutionPlan {
     code: 'team_over_orchestration_warning' | 'explicit_team_override_acknowledged';
     message: string;
   };
+  /**
+   * Raised when lanes were invented from the task string instead of read from the
+   * plan. Heuristic lanes carry no file scope, so the allocator cannot keep two
+   * workers off one file — that is a materially different run from a plan-derived
+   * one, and it used to be visible only by reading `metadata.fallback_reason`
+   * after the fact.
+   */
+  decompositionNotice?: {
+    code: 'team_lanes_not_plan_derived';
+    message: string;
+  };
 }
 
 const DEFAULT_MAX_WORKERS = 20;
@@ -137,20 +148,59 @@ function topologicalSort(nodes: TeamDagNode[]): TeamDagNode[] {
   return sorted;
 }
 
+/**
+ * How many ready nodes can run at once without two of them editing the same file.
+ *
+ * Nodes are grouped by *shared file paths*, transitively: `[a.ts]`, `[a.ts, b.ts]`
+ * and `[b.ts, c.ts]` are one lane, not three. Grouping by whole-path-set equality
+ * — which is what this did — counts overlapping-but-unequal scopes as independent
+ * and widens the run into the exact collision the file scope exists to prevent.
+ *
+ * A node declaring no file scope is its own lane: unknown scope is not proof of
+ * disjoint scope, but refusing to fan out on unscoped nodes would collapse every
+ * plan that has not filled `filePaths` in to a single worker.
+ */
 function firstReadyLaneCount(nodes: TeamDagNode[]): number {
   const ready = nodes.filter((node) => (node.depends_on?.length ?? 0) === 0);
   if (ready.length === 0) return 1;
-  const conflictGroups = new Set<string>();
-  let noFileCount = 0;
+
+  const groupOfPath = new Map<string, number>();
+  const parent: number[] = [];
+  const find = (index: number): number => {
+    let root = index;
+    while (parent[root] !== root) root = parent[root];
+    for (let cursor = index; parent[cursor] !== root; ) {
+      const next = parent[cursor];
+      parent[cursor] = root;
+      cursor = next;
+    }
+    return root;
+  };
+  const union = (left: number, right: number): void => {
+    const a = find(left);
+    const b = find(right);
+    if (a !== b) parent[b] = a;
+  };
+
+  let laneCount = 0;
   for (const node of ready) {
-    const files = node.filePaths ?? [];
+    const files = (node.filePaths ?? []).map(normalizePath);
     if (files.length === 0) {
-      noFileCount += 1;
+      laneCount += 1;
       continue;
     }
-    conflictGroups.add(files.map(normalizePath).sort().join('|'));
+    const own = parent.length;
+    parent.push(own);
+    for (const file of files) {
+      const seen = groupOfPath.get(file);
+      if (seen === undefined) groupOfPath.set(file, own);
+      else union(seen, own);
+    }
   }
-  return Math.max(1, conflictGroups.size + noFileCount);
+
+  const distinctScopedGroups = new Set<number>();
+  for (let index = 0; index < parent.length; index += 1) distinctScopedGroups.add(find(index));
+  return Math.max(1, laneCount + distinctScopedGroups.size);
 }
 
 function hasImplementationWork(nodes: TeamDagNode[]): boolean {
@@ -297,12 +347,20 @@ export function buildRepoAwareTeamExecutionPlan(input: LegacyTeamExecutionPlanIn
   if (resolution.dag) return buildFromDag(input, resolution as TeamDagResolution & { dag: TeamDagHandoff });
 
   const legacy = input.buildLegacyPlan(input.task, input.workerCount, input.agentType, input.explicitAgentType, input.explicitWorkerCount);
+  const fallbackReason = resolution.error ?? 'no_valid_dag';
   return {
     ...legacy,
+    decompositionNotice: {
+      code: 'team_lanes_not_plan_derived',
+      message: `lanes were split from the task text, not from a plan DAG (${fallbackReason}). `
+        + 'These lanes have no file scope, so nothing keeps two workers off the same file. '
+        + 'For plan-derived, non-overlapping lanes run `$ralplan` first and then launch the exact '
+        + '`omx team ...` command its approved-execution section prints.',
+    },
     metadata: {
       decomposition_source: 'legacy_text',
       dag_artifact_path: resolution.path,
-      fallback_reason: resolution.error ?? 'no_valid_dag',
+      fallback_reason: fallbackReason,
       worker_count_requested: input.workerCount,
       worker_count_effective: legacy.workerCount,
       worker_count_source: input.explicitWorkerCount ? 'cli-explicit' : 'default-derived',

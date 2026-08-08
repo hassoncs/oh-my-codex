@@ -168,4 +168,65 @@ describe('buildRepoAwareTeamExecutionPlan', () => {
     assert.equal(plan.workerCount, 4);
     assert.equal(plan.metadata?.worker_count_source, 'cli-explicit');
   });
+
+  it('counts ready nodes with overlapping file scopes as one lane', () => {
+    // a.ts <- shared -> b.ts: a transitive chain, so all three nodes are one lane.
+    // Grouping by whole-path-set equality reported three, which is three workers
+    // editing two files.
+    const cwd = repo();
+    writeFileSync(join(cwd, '.omx', 'plans', 'team-dag-demo.json'), JSON.stringify({
+      schema_version: 1,
+      nodes: [
+        { id: 'one', subject: 'Adjust alpha', description: 'Alpha', filePaths: ['src/a.ts'] },
+        { id: 'two', subject: 'Adjust alpha and beta', description: 'Both', filePaths: ['src/a.ts', 'src/b.ts'] },
+        { id: 'three', subject: 'Adjust beta', description: 'Beta', filePaths: ['src/b.ts'] },
+      ],
+    }));
+    const plan = buildRepoAwareTeamExecutionPlan({
+      task: 'team', workerCount: 3, agentType: 'executor', explicitAgentType: false, explicitWorkerCount: false, cwd, buildLegacyPlan: legacy, allowDagHandoff: true,
+    });
+    assert.equal(plan.metadata?.ready_lane_count, 1);
+    assert.equal(plan.workerCount, 1);
+  });
+
+  it('still fans out across ready nodes whose file scopes are disjoint', () => {
+    // The guard on the test above: collapsing every scoped plan to one lane would
+    // satisfy it and destroy fan-out entirely.
+    const cwd = repo();
+    writeFileSync(join(cwd, '.omx', 'plans', 'team-dag-demo.json'), JSON.stringify({
+      schema_version: 1,
+      nodes: [
+        { id: 'one', subject: 'Adjust alpha', description: 'Alpha', filePaths: ['src/a.ts'] },
+        { id: 'two', subject: 'Adjust beta', description: 'Beta', filePaths: ['src/b.ts'] },
+        { id: 'three', subject: 'Adjust gamma', description: 'Gamma', filePaths: ['src/c.ts'] },
+      ],
+    }));
+    const plan = buildRepoAwareTeamExecutionPlan({
+      task: 'team', workerCount: 3, agentType: 'executor', explicitAgentType: false, explicitWorkerCount: false, cwd, buildLegacyPlan: legacy, allowDagHandoff: true,
+    });
+    assert.equal(plan.metadata?.ready_lane_count, 3);
+    assert.equal(plan.workerCount, 3);
+  });
+
+  it('raises a notice whenever lanes came from the task text rather than a plan', () => {
+    const cwd = repo();
+    const plan = buildRepoAwareTeamExecutionPlan({
+      task: 'fix tests', workerCount: 3, agentType: 'executor', explicitAgentType: false, explicitWorkerCount: false, cwd, buildLegacyPlan: legacy,
+    });
+    assert.equal(plan.decompositionNotice?.code, 'team_lanes_not_plan_derived');
+    assert.match(plan.decompositionNotice!.message, /dag_handoff_not_approved_for_invocation/);
+    assert.match(plan.decompositionNotice!.message, /ralplan/);
+  });
+
+  it('raises no notice when lanes came from the plan', () => {
+    const cwd = repo();
+    writeFileSync(join(cwd, '.omx', 'plans', 'team-dag-demo.json'), JSON.stringify({
+      schema_version: 1,
+      nodes: [{ id: 'one', subject: 'Adjust alpha', description: 'Alpha', filePaths: ['src/a.ts'] }],
+    }));
+    const plan = buildRepoAwareTeamExecutionPlan({
+      task: 'team', workerCount: 3, agentType: 'executor', explicitAgentType: false, explicitWorkerCount: false, cwd, buildLegacyPlan: legacy, allowDagHandoff: true,
+    });
+    assert.equal(plan.decompositionNotice, undefined);
+  });
 });

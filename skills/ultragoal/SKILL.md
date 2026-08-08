@@ -110,6 +110,55 @@ omx ultragoal checkpoint --goal-id <id> --status complete --evidence "<team evid
 
 Workers do not own ultragoal goal state, do not create worker ultragoal ledgers, and do not checkpoint Ultragoal. Team launch remains explicit; Ultragoal does not auto-launch Team and performs no hidden Codex goal mutation.
 
+### Getting the widest safe fan-out
+
+**Ultragoal on its own is sequential and always will be.** `goals.json` holds one
+`activeGoalId`, goals carry no dependency edges and no file scope, and `start-next`
+advances one goal at a time. It is a durable ledger, not a parallel engine. Every
+worker in a run comes from `team`, so an ultragoal story with no team is
+single-lane by construction — which is what it looks like when a long
+implementation takes hours and never opens a second pane.
+
+Width comes from the plan, not from the number you type:
+
+| lane source | where it comes from | file scope | safe to widen? |
+|---|---|---|---|
+| plan DAG | `.omx/plans/team-dag-<slug>.json`, or the `Team DAG handoff` block in the PRD | yes — `filePaths` + `depends_on` per node | yes, up to the ready-lane count |
+| task text | the string you passed to `omx team` | none | no — see below |
+
+With a DAG, `team` topologically sorts the nodes, counts how many ready nodes have
+non-overlapping file scopes, and sizes the run to that. Two lanes that share a file
+are one lane; the allocator then deliberately routes tasks sharing files to the
+*same* worker. That is what "max fan-out without overlap" means here, and it is the
+plan that decides the number.
+
+With no DAG, lanes are split out of the task string by regex, and an atomic task
+becomes `Implement X` / `Test X` / `Review and document X` — three workers on one
+body of code with nothing to keep them apart. `omx team` now warns
+`team_lanes_not_plan_derived` when it takes this path. **Treat that warning as a
+stop sign, not a note**: widening a text-split run is how you get merge conflicts
+instead of speed.
+
+So the order that actually fans out is:
+
+1. `$ralplan` — produces the PRD, the test spec, and the team DAG.
+2. `omx ultragoal create` — the run records the plan's slug, binding the story to
+   that plan.
+3. `omx team ...` — inside the run, lanes are inherited from the bound plan.
+
+Two things to know about step 3. The binding is the run's **own** recorded slug, so
+a run created before any plan existed, or one whose plan has since been superseded,
+falls back to the text path and says which (`ultragoal_run_has_no_bound_plan`,
+`ultragoal_bound_plan_mismatch:...`) — re-plan and create a fresh run rather than
+forcing a wider team. And an explicit `omx team N ...` still overrides the derived
+count, capped at `worker_policy.max_count` only when the plan sets
+`strict_max_count`; prefer letting the plan choose N, and reach for an explicit N
+only to go *narrower*.
+
+Autopilot reaches this same path through its own `deep-interview -> ralplan ->
+ultragoal` progression, so `autopilot` + `ultragoal` + `team` is a legal overlap and
+does fan out — provided the ralplan phase actually emitted a DAG.
+
 ## Mandatory final cleanup and review gate
 
 The final ultragoal story is not complete until the active agent has run the final quality gate:

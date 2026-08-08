@@ -16,6 +16,7 @@ import { parseWorktreeMode, type WorktreeMode } from '../team/worktree.js';
 import { classifyTaskSize } from '../hooks/task-size-detector.js';
 import {
   readApprovedExecutionLaunchHintOutcome,
+  readTeamDagArtifactResolution,
   type ApprovedExecutionLaunchHint,
   type ApprovedRepositoryContextSummary,
 } from '../planning/artifacts.js';
@@ -46,6 +47,7 @@ import {
   reconcilePersistedTeamUltragoalContext,
   readPersistedTeamUltragoalContext,
   renderUltragoalCheckpointGuidanceText,
+  resolveLeaderOwnedUltragoalContextOutcomeSync,
 } from '../team/ultragoal-context.js';
 import { resolveCodexHomeForLaunch } from './codex-home.js';
 import {
@@ -866,6 +868,41 @@ function renderTeamPaneStatus(
   }
 }
 
+/**
+ * A team launched from inside a leader-owned ultragoal run inherits that run's
+ * plan DAG — file-scoped, dependency-ordered lanes — instead of lanes split out
+ * of the task string.
+ *
+ * The binding is the ultragoal run's own recorded `planSlug`, not "whatever plan
+ * is newest". `.omx/plans` accumulates, so the latest plan is routinely a
+ * different task's file scope, and inheriting it would hand workers a scope that
+ * has nothing to do with the goal they are running. A run with no recorded slug,
+ * or one whose slug no longer matches the resolvable DAG, therefore stays on the
+ * text path — and says which of the two it was, because "no plan was ever bound"
+ * and "the plan moved" need opposite repairs.
+ */
+function resolveUltragoalHostedDagHandoff(cwd: string): { allowed: true } | { allowed: false; reason?: string } {
+  const outcome = resolveLeaderOwnedUltragoalContextOutcomeSync(cwd);
+  if (outcome.status === 'missing') return { allowed: false };
+  if (outcome.status !== 'valid' || !outcome.context) {
+    return { allowed: false, reason: `ultragoal_context_${outcome.status}` };
+  }
+  if (!outcome.context.planSlug) {
+    return { allowed: false, reason: 'ultragoal_run_has_no_bound_plan' };
+  }
+  const resolution = readTeamDagArtifactResolution(cwd);
+  if (resolution.source === 'none' || !resolution.planSlug) {
+    return { allowed: false, reason: 'ultragoal_bound_plan_dag_unresolvable' };
+  }
+  if (resolution.planSlug !== outcome.context.planSlug) {
+    return {
+      allowed: false,
+      reason: `ultragoal_bound_plan_mismatch:${outcome.context.planSlug}!=${resolution.planSlug}`,
+    };
+  }
+  return { allowed: true };
+}
+
 export function parseTeamArgs(args: string[], cwd: string = process.cwd()): ParsedTeamArgs {
   const tokens = [...args];
   let workerCount = 3;
@@ -943,8 +980,13 @@ export function parseTeamArgs(args: string[], cwd: string = process.cwd()): Pars
     && (approvedHint.workerCount == null || approvedHint.workerCount === workerCount)
     && (approvedHint.agentType == null || approvedHint.agentType === agentType)
     && Boolean(approvedHint.linkedRalph) === false;
-  const allowRepoAwareDagHandoff = followupContext != null || matchesApprovedLaunchHint;
-  const dagFallbackReason = undefined;
+  const ultragoalDag = followupContext != null || matchesApprovedLaunchHint
+    ? { allowed: true as const }
+    : resolveUltragoalHostedDagHandoff(cwd);
+  const allowRepoAwareDagHandoff = followupContext != null
+    || matchesApprovedLaunchHint
+    || ultragoalDag.allowed;
+  const dagFallbackReason = ultragoalDag.allowed ? undefined : ultragoalDag.reason;
   const approvedRepositoryContextSummary = allowRepoAwareDagHandoff
     ? approvedHint?.repositoryContextSummary
     : undefined;
@@ -1871,6 +1913,9 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
   );
   if (executionPlan.overOrchestrationNotice) {
     console.log(`${executionPlan.overOrchestrationNotice.code}: ${executionPlan.overOrchestrationNotice.message}`);
+  }
+  if (executionPlan.decompositionNotice) {
+    console.warn(`${executionPlan.decompositionNotice.code}: ${executionPlan.decompositionNotice.message}`);
   }
   await renderStartSummary(runtime, staffingPlan);
 }
