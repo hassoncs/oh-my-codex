@@ -1,5 +1,24 @@
 # Ultragoal
 
+## Importing an approved neutral plan
+
+`omx ultragoal import-plan --plan-dir <path> --json` imports an approved
+`.ch5/plan/<planId>/` directory containing `graph.json` and `consensus.json`.
+The importer fails closed unless:
+
+- `graph.json` has a unique, acyclic node graph with string IDs, declared
+  dependencies, intent, ownership, deliverables, and proofs.
+- The graph digest is the SHA-256 of canonical JSON with `digest` and
+  `graphDigest` omitted.
+- `consensus.json` is approved and matches both `planId` and graph digest.
+
+The source files are copied byte-for-byte to
+`.omx/ultragoal/runs/<namespace>/{graph.json,consensus.json}`. Node IDs and
+neutral fields are retained in the operational goals without renaming or
+rebuilding dependencies. The import appends a `plan_imported` record to the
+active Ultragoal ledger. Existing registry conflicts use the normal
+`--new-namespace` escape hatch; the old run is archived before projection.
+
 `ultragoal` is a durable, repo-native multi-goal workflow layered over Codex goal mode. It keeps the long-range plan in files while Codex goal mode tracks the active thread focus.
 
 ## Why this shape

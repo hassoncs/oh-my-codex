@@ -33,6 +33,7 @@ import {
   writeActiveRunPointer,
   type UltragoalRunOrigin,
 } from './registry.js';
+import { readValidatedNeutralPlan, type ValidatedNeutralPlan } from './plan-import.js';
 
 export {
   ULTRAGOAL_BRIEF,
@@ -172,6 +173,11 @@ export interface UltragoalItem {
     resolvedAt?: string;
     evidence?: string;
   };
+  dependencies?: string[];
+  intent?: unknown;
+  ownership?: unknown;
+  deliverables?: unknown;
+  proofs?: unknown;
 }
 
 export interface UltragoalAggregateCompletion {
@@ -216,6 +222,8 @@ export interface UltragoalPlan {
   codexGoalMode?: UltragoalCodexGoalMode;
   codexObjective?: string;
   codexObjectiveAliases?: string[];
+  neutralPlanId?: string;
+  neutralPlanDigest?: string;
   aggregateCompletion?: UltragoalAggregateCompletion;
   activeGoalId?: string;
   goals: UltragoalItem[];
@@ -239,7 +247,8 @@ export interface UltragoalLedgerEntry {
     | 'steering_accepted'
     | 'steering_rejected'
     | 'final_review_failed'
-    | 'goal_review_blocked';
+    | 'goal_review_blocked'
+    | 'plan_imported';
   goalId?: string;
   status?: UltragoalStatus;
   message?: string;
@@ -254,6 +263,8 @@ export interface UltragoalLedgerEntry {
   blockerSignature?: string;
   blockerOccurrenceCount?: number;
   requiredExternalDecision?: string;
+  planId?: string;
+  digest?: string;
 }
 
 export interface CreateUltragoalOptions {
@@ -269,6 +280,14 @@ export interface CreateUltragoalOptions {
   adoptExisting?: boolean;
   /** Start a fresh namespace, leaving the existing run registered but inactive. */
   newNamespace?: boolean;
+}
+
+export interface ImportUltragoalPlanOptions {
+  namespace?: string;
+  newNamespace?: boolean;
+  archiveExisting?: boolean;
+  adoptExisting?: boolean;
+  now?: Date;
 }
 
 export interface StartNextOptions {
@@ -1139,6 +1158,108 @@ export async function createUltragoalPlan(cwd: string, options: CreateUltragoalO
       + (disposition.archivedTo ? `; archived previous registry to ${disposition.archivedTo}` : ''),
   });
   return plan;
+  });
+}
+
+function importedRunId(planId: string, digest: string, namespace?: string): string {
+  const requested = namespace?.trim() || `plan-${planId}-${digest.slice(0, 12)}`;
+  const normalized = requested.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  if (!normalized) throw new UltragoalError('Neutral plan namespace must contain at least one safe identifier character.');
+  return normalized;
+}
+
+function importedBrief(graph: ValidatedNeutralPlan['graph']): string {
+  const candidate = [graph.title, graph.objective, graph.intent]
+    .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+  return candidate?.trim() ?? `Approved neutral plan ${graph.planId}`;
+}
+
+export async function importUltragoalPlan(
+  cwd: string,
+  planDir: string,
+  options: ImportUltragoalPlanOptions = {},
+): Promise<UltragoalPlan> {
+  const source = await readValidatedNeutralPlan(planDir);
+  return withUltragoalMutationLock(cwd, async () => {
+    const briefHash = computeUltragoalBriefHash(`${source.graph.planId}:${source.digest}`);
+    const disposition = await resolveRegistryDisposition(cwd, briefHash, {
+      brief: importedBrief(source.graph),
+      newNamespace: options.newNamespace,
+      archiveExisting: options.archiveExisting,
+      adoptExisting: options.adoptExisting,
+      now: options.now,
+    });
+    if (disposition.adopt) {
+      const existing = disposition.adopt.plan;
+      if (existing.neutralPlanId === source.graph.planId && existing.neutralPlanDigest === source.digest) return existing;
+      throw new UltragoalError(`Cannot import neutral plan ${source.graph.planId}: an existing registry already occupies this namespace.`);
+    }
+
+    const now = iso(options.now);
+    let runId = importedRunId(source.graph.planId, source.digest, options.namespace);
+    if (existsSync(join(ultragoalRunDir(cwd, runId), ULTRAGOAL_GOALS))) {
+      if (options.newNamespace && !options.namespace) {
+        runId = `${runId}-${Date.now().toString(36)}`;
+      } else {
+        throw new UltragoalError(`Cannot import neutral plan ${source.graph.planId}: namespace ${runId} already exists. Pass --new-namespace or choose --namespace.`);
+      }
+    }
+    const runDir = ultragoalRunDir(cwd, runId);
+    const goals: UltragoalItem[] = source.graph.nodes.map((node) => ({
+      id: node.id,
+      title: typeof node.title === 'string' && node.title.trim() ? node.title : node.id,
+      objective: typeof node.intent === 'string' && node.intent.trim() ? node.intent : node.id,
+      status: 'pending',
+      attempt: 0,
+      createdAt: now,
+      updatedAt: now,
+      dependencies: [...node.dependencies],
+      intent: node.intent,
+      ownership: node.ownership,
+      deliverables: node.deliverables,
+      proofs: node.proofs,
+    }));
+    const plan: UltragoalPlan = {
+      version: 1,
+      createdAt: now,
+      updatedAt: now,
+      runId,
+      briefHash,
+      origin: { worktreePath: cwd, createdAt: now },
+      briefPath: `${ULTRAGOAL_DIR}/${ULTRAGOAL_BRIEF}`,
+      goalsPath: `${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS}`,
+      ledgerPath: `${ULTRAGOAL_DIR}/${ULTRAGOAL_LEDGER}`,
+      codexGoalMode: 'aggregate',
+      codexObjective: `Execute approved neutral plan ${source.graph.planId}.`,
+      neutralPlanId: source.graph.planId,
+      neutralPlanDigest: source.digest,
+      goals,
+    };
+
+    await mkdir(ultragoalDir(cwd), { recursive: true });
+    await mkdir(runDir, { recursive: true });
+    const brief = importedBrief(source.graph);
+    await writeFile(ultragoalBriefPath(cwd), `${brief}\n`);
+    await writeFile(ultragoalLedgerPath(cwd), '');
+    await writeFile(join(runDir, ULTRAGOAL_BRIEF), `${brief}\n`);
+    await writeFile(join(runDir, 'graph.json'), source.graphBytes);
+    await writeFile(join(runDir, 'consensus.json'), source.consensusBytes);
+    await writeActiveRunPointer(cwd, {
+      version: 1,
+      runId,
+      briefHash,
+      updatedAt: now,
+      origin: plan.origin as UltragoalRunOrigin,
+    });
+    await writePlan(cwd, plan);
+    await appendLedger(cwd, {
+      ts: now,
+      event: 'plan_imported',
+      planId: source.graph.planId,
+      digest: source.digest,
+      message: `Imported approved neutral plan ${source.graph.planId} from ${planDir}.`,
+    });
+    return plan;
   });
 }
 

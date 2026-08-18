@@ -12,6 +12,7 @@ import {
   buildCodexGoalInstruction,
   checkpointUltragoal,
   createUltragoalPlan,
+  importUltragoalPlan,
   readUltragoalPlan,
   recordFinalReviewBlockers,
   startNextUltragoal,
@@ -28,11 +29,13 @@ import {
   UltragoalError,
   UltragoalRegistryConflictError,
 } from '../ultragoal/artifacts.js';
+import { NeutralPlanImportError } from '../ultragoal/plan-import.js';
 
 export const ULTRAGOAL_HELP = `omx ultragoal - Durable repo-native multi-goal workflow over Codex goal mode
 
 Usage:
   omx ultragoal create-goals [--brief <text> | --brief-file <path> | --from-stdin] [--goal <title::objective>] [--codex-goal-mode <aggregate|per-story>] [--archive-existing | --adopt-existing | --new-namespace] [--force] [--json]
+  omx ultragoal import-plan --plan-dir <path> [--namespace <name>] [--archive-existing | --adopt-existing | --new-namespace] [--json]
   omx ultragoal adopt-run [--json]
   omx ultragoal complete-goals [--retry-failed] [--json]
   omx ultragoal add-goal --title <title> --objective <text> [--evidence <text>] [--json]
@@ -327,6 +330,7 @@ const ULTRAGOAL_MUTATING_COMMANDS = new Set([
   'next',
   'start-next',
   'checkpoint',
+  'import-plan',
 ]);
 
 function readTeamWorkerIdentity(env: NodeJS.ProcessEnv = process.env): string | null {
@@ -416,6 +420,31 @@ export async function ultragoalCommand(args: string[]): Promise<void> {
         if (codexGoalFallback) console.log(`codex goal fallback: ${codexGoalFallback.message}`);
         if (reconciliation && !reconciliation.ok) console.log(`codex goal warning: ${formatCodexGoalReconciliation(reconciliation)}`);
         else if (reconciliation?.warnings.length) console.log(`codex goal warning: ${formatCodexGoalReconciliation(reconciliation)}`);
+      }
+      return;
+    }
+
+    if (command === 'import-plan') {
+      const planDir = readValue(rest, '--plan-dir');
+      if (!planDir?.trim()) throw new UltragoalError('Missing --plan-dir.');
+      const plan = await importUltragoalPlan(cwd, planDir, {
+        namespace: readValue(rest, '--namespace'),
+        archiveExisting: hasFlag(rest, '--archive-existing'),
+        adoptExisting: hasFlag(rest, '--adopt-existing'),
+        newNamespace: hasFlag(rest, '--new-namespace'),
+      });
+      if (json) {
+        printJson({
+          ok: true,
+          plan,
+          namespace: plan.runId,
+          neutralPlan: { planId: plan.neutralPlanId, digest: plan.neutralPlanDigest },
+          mirror: `.omx/ultragoal/runs/${plan.runId}/{graph.json,consensus.json}`,
+        });
+      } else {
+        console.log(`ultragoal neutral plan imported: ${plan.neutralPlanId}`);
+        console.log(`run: ${plan.runId}`);
+        console.log(`mirror: .omx/ultragoal/runs/${plan.runId}/{graph.json,consensus.json}`);
       }
       return;
     }
@@ -552,6 +581,12 @@ export async function ultragoalCommand(args: string[]): Promise<void> {
     if (error instanceof UltragoalRegistryConflictError) {
       console.error(`[ultragoal] ${error.message}`);
       if (json) printJson({ ok: false, error: 'registry_conflict', reason: error.reason, runId: error.runId, originWorktreePath: error.originWorktreePath, message: error.message });
+      process.exitCode = 1;
+      return;
+    }
+    if (error instanceof NeutralPlanImportError) {
+      console.error(`[ultragoal] ${error.message}`);
+      if (json) printJson({ ok: false, error: 'neutral_plan_import', code: error.code, message: error.message });
       process.exitCode = 1;
       return;
     }
