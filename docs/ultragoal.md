@@ -3,21 +3,28 @@
 ## Importing an approved neutral plan
 
 `omx ultragoal import-plan --plan-dir <path> --json` imports an approved
-`.ch5/plan/<planId>/` directory containing `graph.json` and `consensus.json`.
+`.ch5/plan/<planId>/` directory containing `graph.json`, `consensus.json`, and
+`graph-validation.json`.
 The importer fails closed unless:
 
-- `graph.json` has a unique, acyclic node graph with string IDs, declared
-  dependencies, intent, ownership, deliverables, and proofs.
-- The graph digest is the SHA-256 of canonical JSON with `digest` and
-  `graphDigest` omitted.
-- `consensus.json` is approved and matches both `planId` and graph digest.
+- `graph.json` matches `ch5.plan-graph.v1` with a unique, acyclic node graph,
+  strict Fabric intent objects, `dependsOn`, `repo`, `ownsPaths`,
+  `writeExclusions`, `deliverable`, and `proof`.
+- `consensus.json` is `ch5.plan-consensus.v1`, has `status: "approved"`, binds
+  `planId` and `planRevision`, proves semantic validation, and has a complete
+  Architect/Critic gate.
+- `consensus.artifacts` and `semanticValidation.receiptSha256` match the raw
+  SHA-256 bytes of `graph.json` and `graph-validation.json`.
 
 The source files are copied byte-for-byte to
-`.omx/ultragoal/runs/<namespace>/{graph.json,consensus.json}`. Node IDs and
-neutral fields are retained in the operational goals without renaming or
-rebuilding dependencies. The import appends a `plan_imported` record to the
-active Ultragoal ledger. Existing registry conflicts use the normal
-`--new-namespace` escape hatch; the old run is archived before projection.
+`.omx/ultragoal/runs/<namespace>/{graph.json,consensus.json,graph-validation.json}`.
+Node IDs and neutral fields are retained in the operational goals without
+renaming: `dependsOn` maps to `dependencies`, `intent` stays structured,
+ownership contains `repo`/`ownsPaths`/`writeExclusions`, `deliverable` maps to
+`deliverables`, and `proof` maps to `proofs`. The import appends a
+`plan_imported` record to the active Ultragoal ledger. Existing registry
+conflicts use the normal `--new-namespace` escape hatch; the old run is
+archived before projection.
 
 `ultragoal` is a durable, repo-native multi-goal workflow layered over Codex goal mode. It keeps the long-range plan in files while Codex goal mode tracks the active thread focus.
 

@@ -224,6 +224,7 @@ export interface UltragoalPlan {
   codexObjectiveAliases?: string[];
   neutralPlanId?: string;
   neutralPlanDigest?: string;
+  neutralPlanRevision?: string;
   aggregateCompletion?: UltragoalAggregateCompletion;
   activeGoalId?: string;
   goals: UltragoalItem[];
@@ -1169,9 +1170,9 @@ function importedRunId(planId: string, digest: string, namespace?: string): stri
 }
 
 function importedBrief(graph: ValidatedNeutralPlan['graph']): string {
-  const candidate = [graph.title, graph.objective, graph.intent]
-    .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
-  return candidate?.trim() ?? `Approved neutral plan ${graph.planId}`;
+  return typeof graph.planObjective === 'string' && graph.planObjective.trim()
+    ? graph.planObjective.trim()
+    : `Approved neutral plan ${graph.planId}`;
 }
 
 export async function importUltragoalPlan(
@@ -1181,7 +1182,7 @@ export async function importUltragoalPlan(
 ): Promise<UltragoalPlan> {
   const source = await readValidatedNeutralPlan(planDir);
   return withUltragoalMutationLock(cwd, async () => {
-    const briefHash = computeUltragoalBriefHash(`${source.graph.planId}:${source.digest}`);
+    const briefHash = computeUltragoalBriefHash(`${source.graph.planId}:${source.planRevision}`);
     const disposition = await resolveRegistryDisposition(cwd, briefHash, {
       brief: importedBrief(source.graph),
       newNamespace: options.newNamespace,
@@ -1191,12 +1192,12 @@ export async function importUltragoalPlan(
     });
     if (disposition.adopt) {
       const existing = disposition.adopt.plan;
-      if (existing.neutralPlanId === source.graph.planId && existing.neutralPlanDigest === source.digest) return existing;
+      if (existing.neutralPlanId === source.graph.planId && existing.neutralPlanRevision === source.planRevision) return existing;
       throw new UltragoalError(`Cannot import neutral plan ${source.graph.planId}: an existing registry already occupies this namespace.`);
     }
 
     const now = iso(options.now);
-    let runId = importedRunId(source.graph.planId, source.digest, options.namespace);
+    let runId = importedRunId(source.graph.planId, source.planRevision.slice(-12), options.namespace);
     if (existsSync(join(ultragoalRunDir(cwd, runId), ULTRAGOAL_GOALS))) {
       if (options.newNamespace && !options.namespace) {
         runId = `${runId}-${Date.now().toString(36)}`;
@@ -1208,16 +1209,20 @@ export async function importUltragoalPlan(
     const goals: UltragoalItem[] = source.graph.nodes.map((node) => ({
       id: node.id,
       title: typeof node.title === 'string' && node.title.trim() ? node.title : node.id,
-      objective: typeof node.intent === 'string' && node.intent.trim() ? node.intent : node.id,
-      status: 'pending',
-      attempt: 0,
+      objective: node.objective,
+      status: node.status === 'blocked' ? 'review_blocked' : node.status,
+      attempt: typeof node.attempt === 'number' ? node.attempt : 0,
       createdAt: now,
       updatedAt: now,
-      dependencies: [...node.dependencies],
+      dependencies: [...(node.dependsOn ?? [])],
       intent: node.intent,
-      ownership: node.ownership,
-      deliverables: node.deliverables,
-      proofs: node.proofs,
+      ownership: {
+        repo: node.repo,
+        ownsPaths: node.ownsPaths,
+        writeExclusions: node.writeExclusions,
+      },
+      deliverables: node.deliverable,
+      proofs: node.proof,
     }));
     const plan: UltragoalPlan = {
       version: 1,
@@ -1230,9 +1235,12 @@ export async function importUltragoalPlan(
       goalsPath: `${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS}`,
       ledgerPath: `${ULTRAGOAL_DIR}/${ULTRAGOAL_LEDGER}`,
       codexGoalMode: 'aggregate',
-      codexObjective: `Execute approved neutral plan ${source.graph.planId}.`,
+      codexObjective: typeof source.graph.planObjective === 'string'
+        ? source.graph.planObjective
+        : `Execute approved neutral plan ${source.graph.planId}.`,
       neutralPlanId: source.graph.planId,
-      neutralPlanDigest: source.digest,
+      neutralPlanDigest: source.graphDigest,
+      neutralPlanRevision: source.planRevision,
       goals,
     };
 
@@ -1244,6 +1252,7 @@ export async function importUltragoalPlan(
     await writeFile(join(runDir, ULTRAGOAL_BRIEF), `${brief}\n`);
     await writeFile(join(runDir, 'graph.json'), source.graphBytes);
     await writeFile(join(runDir, 'consensus.json'), source.consensusBytes);
+    await writeFile(join(runDir, 'graph-validation.json'), source.validationBytes);
     await writeActiveRunPointer(cwd, {
       version: 1,
       runId,
@@ -1256,7 +1265,7 @@ export async function importUltragoalPlan(
       ts: now,
       event: 'plan_imported',
       planId: source.graph.planId,
-      digest: source.digest,
+      digest: source.graphDigest,
       message: `Imported approved neutral plan ${source.graph.planId} from ${planDir}.`,
     });
     return plan;

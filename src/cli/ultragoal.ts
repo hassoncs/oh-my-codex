@@ -436,15 +436,17 @@ export async function ultragoalCommand(args: string[]): Promise<void> {
       if (json) {
         printJson({
           ok: true,
-          plan,
           namespace: plan.runId,
           neutralPlan: { planId: plan.neutralPlanId, digest: plan.neutralPlanDigest },
-          mirror: `.omx/ultragoal/runs/${plan.runId}/{graph.json,consensus.json}`,
+          planRevision: plan.neutralPlanRevision,
+          goalCount: plan.goals.length,
+          goalIds: plan.goals.map((goal) => goal.id),
+          mirror: `.omx/ultragoal/runs/${plan.runId}/{graph.json,consensus.json,graph-validation.json}`,
         });
       } else {
         console.log(`ultragoal neutral plan imported: ${plan.neutralPlanId}`);
         console.log(`run: ${plan.runId}`);
-        console.log(`mirror: .omx/ultragoal/runs/${plan.runId}/{graph.json,consensus.json}`);
+        console.log(`mirror: .omx/ultragoal/runs/${plan.runId}/{graph.json,consensus.json,graph-validation.json}`);
       }
       return;
     }
